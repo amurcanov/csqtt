@@ -15,9 +15,15 @@ data class ConnectionSource(
 )
 
 suspend fun resolveConnectionSource(store: SettingsStore): ConnectionSource? {
+    val invalidHashes = VkHashValidationCodec.decode(store.vkHashCheckResults.first())
+    fun activeHashes(raw: String): String = VkHashValidationCodec.active(
+        raw.split(Regex("[,\\s\\n]+")),
+        invalidHashes,
+    ).joinToString(",")
+
     if (store.csqttLinkMode.first()) {
         val link = parseCsqttLink(store.csqttLink.first()) ?: return null
-        val linkHashes = link.hashes.joinToString(",")
+        val linkHashes = activeHashes(link.hashes.joinToString(","))
         return ConnectionSource(
             peer = link.peerAddress(),
             password = link.password,
@@ -38,7 +44,7 @@ suspend fun resolveConnectionSource(store: SettingsStore): ConnectionSource? {
     return ConnectionSource(
         peer = peer,
         password = password,
-        hashes = store.vkHashes.first(),
+        hashes = activeHashes(store.vkHashes.first()),
         hashesFromLink = false,
     )
 }

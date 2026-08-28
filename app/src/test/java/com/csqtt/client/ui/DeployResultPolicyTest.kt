@@ -19,6 +19,47 @@ class DeployResultPolicyTest {
     }
 
     @Test
+    fun prepareRequiresItsOwnExactMarkerAndZeroExit() {
+        assertTrue(isSuccessfulPrepareResult(0, "done\nCSQTT_DEPLOY_READY_FOR_UPLOAD\n"))
+        assertFalse(isSuccessfulPrepareResult(1, "CSQTT_DEPLOY_READY_FOR_UPLOAD"))
+        assertFalse(isSuccessfulPrepareResult(0, "CSQTT_DEPLOY_OK"))
+        assertFalse(isSuccessfulPrepareResult(0, "prefix CSQTT_DEPLOY_READY_FOR_UPLOAD suffix"))
+    }
+
+    @Test
+    fun deployRollbackExitIsExplainedWithoutPretendingSuccess() {
+        assertEquals(
+            "Новый релиз не прошёл проверку; предыдущая установка восстановлена",
+            deployFailureMessage(30, "CSQTT_DEPLOY_ROLLED_BACK\n"),
+        )
+        assertEquals(
+            "Новый релиз не запустился, а автоматический rollback завершился с ошибкой — требуется проверка VPS",
+            deployFailureMessage(31, "CSQTT_DEPLOY_ROLLBACK_FAILED\n"),
+        )
+    }
+
+    @Test
+    fun rollbackKeepsConcreteServerReason() {
+        assertEquals(
+            "Новый релиз не прошёл проверку; предыдущая установка восстановлена " +
+                "Причина: Проверенный candidate-бинарник исчез после остановки старого runtime",
+            deployFailureMessage(
+                30,
+                "CSQTT_DEPLOY_ERROR|cutover|Проверенный candidate-бинарник исчез после остановки старого runtime\n" +
+                    "CSQTT_DEPLOY_ROLLED_BACK\n",
+            ),
+        )
+    }
+
+    @Test
+    fun preflightFailureExplainsThatLiveServiceWasNotStopped() {
+        assertEquals(
+            "Кандидат не прошёл предзапусковую проверку; работающий сервер не останавливался",
+            deployFailureMessage(20, "probe failed"),
+        )
+    }
+
+    @Test
     fun authFailureHasActionableMessage() {
         assertEquals(
             "SSH-аутентификация отклонена: проверьте логин, пароль и разрешение PasswordAuthentication на VPS",
@@ -37,6 +78,14 @@ class DeployResultPolicyTest {
     @Test
     fun timeoutHasShortMessage() {
         assertEquals("Истекло время ожидания SSH/SFTP", friendlyDeployError("connect timeout"))
+    }
+
+    @Test
+    fun exhaustedUploadHasNetworkSpecificMessage() {
+        assertTrue(
+            friendlyDeployError("SFTP/SCP upload failed for csqtt: SFTP: channel closed")
+                .contains("автоматического переподключения"),
+        )
     }
 
     @Test
@@ -70,8 +119,11 @@ class DeployResultPolicyTest {
     @Test
     fun protocolAndDecorationLinesAreHidden() {
         assertNull(parseDeployOutputLine("CSQTT_PROGRESS|0.6|Бинарник..."))
+        assertNull(parseDeployOutputLine("CSQTT_DEPLOY_ERROR|cutover|candidate disappeared"))
         assertNull(parseDeployOutputLine("════════════════════════════"))
         assertNull(parseDeployOutputLine("CSQTT_DEPLOY_OK"))
+        assertNull(parseDeployOutputLine("CSQTT_DEPLOY_ROLLED_BACK"))
+        assertNull(parseDeployOutputLine("CSQTT_DEPLOY_ROLLBACK_FAILED"))
     }
 
     @Test
@@ -80,5 +132,14 @@ class DeployResultPolicyTest {
         assertEquals("systemd", deployMode(false))
         assertEquals("a b#$\"\\c  d", deployEnvironmentValue("a b#$\"\\c\r\nd", true))
         assertEquals("\"a b#$\\\"\\\\c  d\"", deployEnvironmentValue("a b#$\"\\c\r\nd", false))
+    }
+
+    @Test
+    fun sshPasswordKeepsSpacesAndSpecialCharactersExactly() {
+        assertEquals(
+            "a !@#$%^&*()[]{};:,.?/\\|~+= b",
+            sanitizeSshPassword("a !@#$%^&*()[]{};:,.?/\\|~+= b"),
+        )
+        assertEquals("pa ssword", sanitizeSshPassword("pa\n ss\rword"))
     }
 }

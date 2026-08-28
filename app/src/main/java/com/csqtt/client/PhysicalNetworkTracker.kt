@@ -18,6 +18,13 @@ internal enum class PhysicalNetworkPauseReason {
 internal fun physicalNetworkPauseReason(airplaneModeOn: Boolean): PhysicalNetworkPauseReason =
     if (airplaneModeOn) PhysicalNetworkPauseReason.AIRPLANE_MODE else PhysicalNetworkPauseReason.OFFLINE
 
+internal fun isEligiblePhysicalNetwork(
+    hasInternet: Boolean,
+    notVpn: Boolean,
+    wifi: Boolean,
+    cellular: Boolean,
+): Boolean = hasInternet && notVpn && (wifi || cellular)
+
 internal class PhysicalNetworkTracker<T> {
     private val active = mutableSetOf<T>()
 

@@ -32,6 +32,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -65,7 +66,10 @@ import com.csqtt.client.ui.components.CsqttSettingRow
 import com.csqtt.client.ui.design.CsqttShapes
 import com.csqtt.client.ui.design.CsqttSizes
 import com.csqtt.client.ui.design.CsqttSpacing
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -88,8 +92,23 @@ fun ExceptionsTab(
     val context = LocalContext.current.applicationContext
     val focusManager = LocalFocusManager.current
     val scope = rememberCoroutineScope()
-    val selectedPackages = remember(savedExcluded) {
+    // Taps edit a local draft; the DataStore write (and VPN reload) is
+    // debounced so a burst of toggles costs one persist instead of one per tap.
+    val persistedSelection = remember(savedExcluded) {
         savedExcluded.split(',').filter(String::isNotBlank).toSet()
+    }
+    var selectedPackages by remember { mutableStateOf(persistedSelection) }
+    var lastSavedSelection by remember { mutableStateOf(persistedSelection) }
+    var saveJob by remember { mutableStateOf<Job?>(null) }
+
+    // Adopt persisted changes only when they came from outside (profile switch,
+    // another screen): our own writes set lastSavedSelection first, so the
+    // echo of our save never resets a draft that already moved past it.
+    LaunchedEffect(persistedSelection) {
+        if (persistedSelection != lastSavedSelection) {
+            selectedPackages = persistedSelection
+        }
+        lastSavedSelection = persistedSelection
     }
     var appsList by remember { mutableStateOf(AppCache.cachedList.orEmpty()) }
     var isLoading by remember { mutableStateOf(AppCache.cachedList == null) }
@@ -153,6 +172,31 @@ fun ExceptionsTab(
     val listState = rememberLazyListState()
     val routingMode = if (isWhitelist) RoutingMode.IncludeSelected else RoutingMode.ExcludeSelected
 
+    fun persistSelection(selection: Set<String>) {
+        lastSavedSelection = selection
+        saveJob?.cancel()
+        saveJob = scope.launch {
+            delay(250)
+            settingsStore.saveExcludedApps(selection.sorted().joinToString(","))
+            TunnelManager.reloadVpn()
+        }
+    }
+
+    DisposableEffect(Unit) {
+        onDispose {
+            // A burst still inside the debounce window must not be lost when
+            // the tab closes right after the last tap.
+            saveJob?.cancel()
+            val pending = selectedPackages
+            if (pending != persistedSelection) {
+                CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
+                    settingsStore.saveExcludedApps(pending.sorted().joinToString(","))
+                    TunnelManager.reloadVpn()
+                }
+            }
+        }
+    }
+
     CsqttScreen {
         OutlinedTextField(
             value = searchQuery,
@@ -195,7 +239,10 @@ fun ExceptionsTab(
                 onSelected = { mode ->
                     if (mode == routingMode) return@CsqttSegmentedControl
                     scope.launch {
-                        settingsStore.saveExceptionsMode("", mode == RoutingMode.IncludeSelected)
+                        settingsStore.saveExceptionsMode(
+                            selectedPackages.sorted().joinToString(","),
+                            mode == RoutingMode.IncludeSelected,
+                        )
                         delay(300)
                         TunnelManager.reloadVpn()
                     }
@@ -256,10 +303,8 @@ fun ExceptionsTab(
                                 } else {
                                     selectedPackages + app.packageName
                                 }
-                                scope.launch {
-                                    settingsStore.saveExcludedApps(newSelection.sorted().joinToString(","))
-                                    TunnelManager.reloadVpn()
-                                }
+                                selectedPackages = newSelection
+                                persistSelection(newSelection)
                             },
                         )
                     }

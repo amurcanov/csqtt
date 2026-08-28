@@ -9,7 +9,6 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.MaterialTheme
@@ -24,6 +23,7 @@ import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 
 import com.csqtt.client.CsqttConstants
+import com.csqtt.client.ui.design.CsqttShapes
 
 @Composable
 internal fun WorkModeInfoDialog(mode: String? = null, onDismiss: () -> Unit) {
@@ -36,11 +36,11 @@ internal fun WorkModeInfoDialog(mode: String? = null, onDismiss: () -> Unit) {
         CsqttConstants.VkAuth.MODE_CALLS -> "Режим «Авто»" to """
             • Получение TURN-сессий напрямую через протокол и гостевую цепочку VK Calls.
             • Обычно позволяет работать без капчи.
-            • Поддерживает масштабирование до 162 независимых воркеров.
+            • Поддерживает масштабирование до 126 независимых воркеров.
         """.trimIndent()
         CsqttConstants.VkAuth.MODE_AUTO_JS -> "Режим «Авто ВК»" to """
             • Один аккаунт создаёт и удерживает один звонок через метод vchat.startConversation.
-            • До 9 независимых Calls-сессий обслуживают до 18 потоков каждая (общий максимум — 162).
+            • До 7 независимых Calls-сессий обслуживают до 18 потоков каждая (общий максимум — 126).
             • Получает credentials через официальный метод get_conversation_params под авторизованным аккаунтом VK.
             • Анонимные звонки не используются. Режим хешей автоматически фиксируется на «Авто ВК».
             • Создатель удерживает звонок до отключения туннеля.
@@ -49,7 +49,7 @@ internal fun WorkModeInfoDialog(mode: String? = null, onDismiss: () -> Unit) {
         else -> "Режимы работы" to """
             • Капча — считается первым и самым старым методом получения credentials, не советуется к штатному использованию.
 
-            • Авто — уже очень хороший гостевой режим через VK Calls, почти всегда не требует капчи и работает без проблем (до 162 потоков).
+            • Авто — уже очень хороший гостевой режим через VK Calls, почти всегда не требует капчи и работает без проблем (до 126 потоков).
 
             • Авто ВК — новый режим получения credentials через get_conversation_params. Использует залогиненный аккаунт ВК, анонимные звонки не используются. Советуем использовать этот режим, когда с режимом «Авто» наблюдаются проблемы. Режим самый стабильный, работает только в паре с Авто ВК методом получения ВК хешей.
         """.trimIndent()
@@ -60,7 +60,7 @@ internal fun WorkModeInfoDialog(mode: String? = null, onDismiss: () -> Unit) {
         properties = DialogProperties(usePlatformDefaultWidth = false),
     ) {
         Surface(
-            shape = RoundedCornerShape(28.dp),
+            shape = CsqttShapes.Dialog,
             color = MaterialTheme.colorScheme.surface,
             contentColor = MaterialTheme.colorScheme.onSurface,
             tonalElevation = 6.dp,
@@ -81,7 +81,7 @@ internal fun WorkModeInfoDialog(mode: String? = null, onDismiss: () -> Unit) {
                 Button(
                     onClick = onDismiss,
                     modifier = Modifier.fillMaxWidth().height(48.dp),
-                    shape = RoundedCornerShape(16.dp),
+                    shape = CsqttShapes.Pill,
                     colors = ButtonDefaults.buttonColors(contentColor = MaterialTheme.colorScheme.onPrimary),
                 ) {
                     Text("Понятно", fontWeight = FontWeight.SemiBold)

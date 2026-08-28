@@ -56,14 +56,23 @@ if %errorlevel% neq 0 (
     exit /b 1
 )
 
+set "VERIFY_DEPLOY_ASSET=%PROJECT_ROOT%scripts\verify_apk_deploy_asset.ps1"
+set "APK_DIR=app\build\outputs\apk\release"
+for %%F in (
+    "%APK_DIR%\app-universal-release.apk"
+    "%APK_DIR%\app-arm64-v8a-release.apk"
+    "%APK_DIR%\app-armeabi-v7a-release.apk"
+) do (
+    powershell -NoProfile -ExecutionPolicy Bypass -File "%VERIFY_DEPLOY_ASSET%" -ApkPath "%%~fF"
+    if errorlevel 1 goto verify_failed
+)
+
 :: 4. Create release directory
 if not exist "app\release" mkdir "app\release"
 
 :: 5. Copy and rename all APK variants
 echo.
 echo Copying APKs to release folder...
-
-set "APK_DIR=app\build\outputs\apk\release"
 
 :: Universal APK (all architectures)
 if exist "%APK_DIR%\app-universal-release.apk" (
@@ -99,3 +108,9 @@ echo   CSQTT-armeabi-v7a.apk  - 32-bit ARM only
 echo.
 if not defined CI pause
 exit /b 0
+
+:verify_failed
+echo.
+echo APK deploy asset verification failed. Release files were not replaced.
+if not defined CI pause
+exit /b 1

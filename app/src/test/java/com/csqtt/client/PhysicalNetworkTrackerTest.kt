@@ -17,7 +17,7 @@ class PhysicalNetworkTrackerTest {
     }
 
     @Test
-    fun overlappingNetworksDoNotRestartTheTunnel() {
+    fun overlappingPhysicalNetworksSignalTransportChange() {
         val tracker = PhysicalNetworkTracker<String>()
         assertEquals(PhysicalNetworkTransition.AVAILABLE, tracker.update("mobile", true))
         assertEquals(PhysicalNetworkTransition.CHANGED, tracker.update("wifi", true))
@@ -57,5 +57,45 @@ class PhysicalNetworkTrackerTest {
         assertEquals(true, tracker.hasUsableNetwork())
         tracker.clear()
         assertEquals(false, tracker.hasUsableNetwork())
+    }
+
+    @Test
+    fun vpnAndNonPhysicalTransportsAreNotEligiblePhysicalNetworks() {
+        assertEquals(
+            true,
+            isEligiblePhysicalNetwork(
+                hasInternet = true,
+                notVpn = true,
+                wifi = true,
+                cellular = false,
+            ),
+        )
+        assertEquals(
+            true,
+            isEligiblePhysicalNetwork(
+                hasInternet = true,
+                notVpn = true,
+                wifi = false,
+                cellular = true,
+            ),
+        )
+        assertEquals(
+            false,
+            isEligiblePhysicalNetwork(
+                hasInternet = true,
+                notVpn = false,
+                wifi = true,
+                cellular = false,
+            ),
+        )
+        assertEquals(
+            false,
+            isEligiblePhysicalNetwork(
+                hasInternet = true,
+                notVpn = true,
+                wifi = false,
+                cellular = false,
+            ),
+        )
     }
 }

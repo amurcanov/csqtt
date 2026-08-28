@@ -47,6 +47,15 @@ object VkHashValidationCodec {
         .distinct()
         .filterNot(results::containsKey)
 
+    fun active(
+        hashes: List<String>,
+        results: Map<String, VkHashValidationStatus>,
+    ): List<String> = hashes
+        .map(String::trim)
+        .filter { it.length >= 16 }
+        .distinct()
+        .filter { results[it] != VkHashValidationStatus.Invalid }
+
     fun invalidate(
         results: Map<String, VkHashValidationStatus>,
         previousHash: String,

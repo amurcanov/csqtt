@@ -4,7 +4,28 @@
 #![allow(linker_messages)]
 #![recursion_limit = "256"]
 
+#[cfg(target_os = "linux")]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: snmalloc_rs::SnMalloc = snmalloc_rs::SnMalloc;
+
+pub const fn allocator_name() -> &'static str {
+    #[cfg(target_os = "linux")]
+    {
+        "snmalloc"
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        "system"
+    }
+}
+
+pub(crate) fn collect_allocator_thread_heap() -> bool {
+    false
+}
+
 mod dataplane;
+mod downlink_queue;
+mod memory_metrics;
 mod model;
 mod net_setup;
 mod packet;
@@ -13,21 +34,26 @@ mod protocol;
 mod proxy_route;
 #[path = "../shared/selective_fec.rs"]
 mod selective_fec;
+#[path = "../shared/striped_scheduler.rs"]
 mod striped_scheduler;
+mod tokio_io;
 mod tproxy;
 mod tun_device;
 #[cfg(test)]
 mod udp_supervisor;
-mod uring_io;
 mod web_panel;
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use dashmap::DashMap;
-use model::{Database, DatabasePersistence, load_database, now, random_password, save_database};
-use protocol::{DeviceEpochState, Session};
+use model::{
+    DEFAULT_AUTO_RESTART_INTERVAL_HOURS, Database, DatabasePersistence, load_database, now,
+    random_password, save_database,
+};
+use protocol::Session;
 use std::{
     collections::HashMap,
+    io::Read,
     net::SocketAddr,
     sync::{
         Arc,
@@ -35,7 +61,10 @@ use std::{
     },
     time::Duration,
 };
-use tokio::sync::RwLock;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    sync::RwLock,
+};
 
 #[derive(Parser, Debug)]
 #[command(name = "csqtt", version, about = "Сервер и консоль управления CSQTT")]
@@ -96,6 +125,15 @@ struct Args {
     )]
     secure_cookie: bool,
 
+    #[arg(
+        long,
+        env = "CSQTT_FEC",
+        value_enum,
+        default_value_t = protocol::FecProfile::Safe,
+        help = "Профиль selective FEC: safe или off"
+    )]
+    fec: protocol::FecProfile,
+
     #[arg(long, help = "Запустить службу CSQTT")]
     start: bool,
 
@@ -107,6 +145,15 @@ struct Args {
 
     #[arg(long, short = 'd', help = "Открыть DPI-монитор")]
     dpi: bool,
+
+    #[arg(long, hide = true)]
+    tproxy_child: bool,
+
+    #[arg(long, hide = true)]
+    tproxy_port: Option<u16>,
+
+    #[arg(long, hide = true)]
+    tproxy_status: Option<std::path::PathBuf>,
 
     #[arg(
         long,
@@ -156,10 +203,12 @@ pub struct App {
     pub web_user: String,
     pub web_pass: String,
     pub secure_cookie: bool,
-    pub sessions: DashMap<SocketAddr, Arc<Session>>,
-    pub device_epochs: DashMap<String, Arc<tokio::sync::Mutex<DeviceEpochState>>>,
+    pub fec_profile: protocol::FecProfile,
+    pub sessions: DashMap<u64, Arc<Session>>,
+    pub device_epochs: DashMap<String, Arc<protocol::DeviceEpochSlot>>,
     pub web_sessions: DashMap<String, i64>,
     pub login_limits: DashMap<String, (u32, i64)>,
+    pub web_auth_admission: std::sync::Mutex<()>,
     pub bytes_from_client: Arc<AtomicU64>,
     pub bytes_to_client: Arc<AtomicU64>,
     pub total_connections: AtomicU64,
@@ -176,6 +225,11 @@ pub struct App {
     pub proxy_trigger: tokio::sync::Notify,
     pub proxy_port_listening: std::sync::atomic::AtomicBool,
     pub proxy_health_error: std::sync::RwLock<Option<String>>,
+    pub memory_trim_gate: tokio::sync::Mutex<()>,
+    pub memory_trim_count: AtomicU64,
+    pub memory_trim_last_unix: AtomicU64,
+    pub auto_restart_interval_tx: tokio::sync::watch::Sender<u8>,
+    pub restart_pending: AtomicBool,
     pub dataplane: std::sync::OnceLock<dataplane::DataplaneHandle<protocol::ProtocolCommand>>,
 }
 
@@ -184,6 +238,76 @@ pub fn lock_unpoison<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_
     mutex
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[inline]
+pub fn read_unpoison<T>(lock: &std::sync::RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+    lock.read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[inline]
+pub fn write_unpoison<T>(lock: &std::sync::RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+    lock.write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+pub async fn trim_memory(app: &Arc<App>) -> Result<bool> {
+    let _trim_guard = app.memory_trim_gate.lock().await;
+    let allocator_collected = protocol::compact_memory(app).await?;
+    app.memory_trim_count.fetch_add(1, Ordering::Relaxed);
+    app.memory_trim_last_unix
+        .store(now().max(0) as u64, Ordering::Relaxed);
+    Ok(allocator_collected)
+}
+
+fn schedule_proxy_shutdown_compaction(app: &Arc<App>) {
+    let app = app.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        if app.proxy_route.read().await.is_none() {
+            let _ = trim_memory(&app).await;
+        }
+    });
+}
+
+pub(crate) const MAX_LOG_RECORD_BYTES: usize = 2_048;
+pub(crate) const LOG_RING_CAPACITY: usize = 600;
+const LOG_TRUNCATION_SUFFIX: &str = "...[truncated]";
+
+fn utf8_prefix(value: &str, max_bytes: usize) -> &str {
+    let mut end = value.len().min(max_bytes);
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
+}
+
+fn append_utf8_prefix(target: &mut String, value: &str) {
+    let remaining = MAX_LOG_RECORD_BYTES.saturating_sub(target.len());
+    target.push_str(utf8_prefix(value, remaining));
+}
+
+fn format_log_record(time_str: &str, level: &str, msg: &str) -> String {
+    let mut formatted = String::with_capacity(MAX_LOG_RECORD_BYTES);
+    append_utf8_prefix(&mut formatted, "[");
+    append_utf8_prefix(&mut formatted, time_str);
+    append_utf8_prefix(&mut formatted, "] [");
+    append_utf8_prefix(&mut formatted, level);
+    append_utf8_prefix(&mut formatted, "] ");
+
+    let remaining = MAX_LOG_RECORD_BYTES.saturating_sub(formatted.len());
+    if msg.len() <= remaining {
+        formatted.push_str(msg);
+    } else if remaining > LOG_TRUNCATION_SUFFIX.len() {
+        formatted.push_str(utf8_prefix(msg, remaining - LOG_TRUNCATION_SUFFIX.len()));
+        formatted.push_str(LOG_TRUNCATION_SUFFIX);
+    } else {
+        formatted.push_str(utf8_prefix(msg, remaining));
+    }
+
+    debug_assert!(formatted.len() <= MAX_LOG_RECORD_BYTES);
+    formatted
 }
 
 fn enqueue_log_write(path: std::path::PathBuf, line: String) {
@@ -220,15 +344,13 @@ pub fn log_event(app: &Arc<App>, level: &str, _module: &str, msg: &str) {
         return;
     }
     let time_str = chrono::Local::now().format("%d %b %y %H:%M").to_string();
-    let mut formatted = String::with_capacity(time_str.len() + level.len() + msg.len() + 8);
-    use std::fmt::Write;
-    let _ = write!(formatted, "[{}] [{}] {}", time_str, level, msg);
+    let formatted = format_log_record(&time_str, level, msg);
 
     eprintln!("{}", formatted);
 
     let mut logs = lock_unpoison(&app.logs);
     logs.push_back(formatted.clone());
-    if logs.len() > 600 {
+    if logs.len() > LOG_RING_CAPACITY {
         logs.pop_front();
     }
     drop(logs);
@@ -245,16 +367,15 @@ struct CpuSnapshot {
 }
 
 fn parse_cpu_total(line: &str) -> Option<u64> {
-    let parts: Vec<u64> = line
-        .split_whitespace()
-        .skip(1)
-        .map(str::parse)
-        .collect::<Result<_, _>>()
-        .ok()?;
-    if parts.len() < 4 {
-        return None;
+    let mut values = line.split_whitespace().skip(1);
+    let mut total = 0_u64;
+    for _ in 0..4 {
+        total = total.checked_add(values.next()?.parse().ok()?)?;
     }
-    Some(parts.iter().copied().sum())
+    for value in values {
+        total = total.checked_add(value.parse().ok()?)?;
+    }
+    Some(total)
 }
 
 fn parse_host_cpu(stat: &str) -> Option<(u64, u64)> {
@@ -277,13 +398,16 @@ fn parse_host_cpu(stat: &str) -> Option<(u64, u64)> {
 }
 
 fn parse_process_cpu(stat: &str) -> Option<u64> {
-    let fields: Vec<&str> = stat
-        .get(stat.rfind(')')? + 1..)?
-        .split_whitespace()
-        .collect();
-    let user: u64 = fields.get(11)?.parse().ok()?;
-    let system: u64 = fields.get(12)?.parse().ok()?;
+    let mut fields = stat.get(stat.rfind(')')? + 1..)?.split_whitespace();
+    let user: u64 = fields.nth(11)?.parse().ok()?;
+    let system: u64 = fields.next()?.parse().ok()?;
     Some(user.saturating_add(system))
+}
+
+fn read_proc_text<'a>(path: &str, buffer: &'a mut [u8]) -> Option<&'a str> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.read(buffer).ok()?;
+    std::str::from_utf8(&buffer[..len]).ok()
 }
 
 fn cpu_percentage(previous: CpuSnapshot, current: CpuSnapshot) -> Option<u64> {
@@ -300,17 +424,17 @@ fn cpu_percentage(previous: CpuSnapshot, current: CpuSnapshot) -> Option<u64> {
 async fn cpu_loop(app: Arc<App>) {
     let mut timer = tokio::time::interval(Duration::from_secs(1));
     let mut previous = None;
+    let mut host_stat_buffer = [0_u8; 8192];
+    let mut process_stat_buffer = [0_u8; 1024];
     loop {
         timer.tick().await;
         model::refresh_cached_now();
         protocol::refresh_monotonic_millis();
-        let (host_stat, process_stat) = tokio::join!(
-            tokio::fs::read_to_string("/proc/stat"),
-            tokio::fs::read_to_string("/proc/self/stat")
-        );
-        if let (Ok(host_stat), Ok(process_stat)) = (host_stat, process_stat)
-            && let Some((total, cores)) = parse_host_cpu(&host_stat)
-            && let Some(process) = parse_process_cpu(&process_stat)
+        if let (Some(host_stat), Some(process_stat)) = (
+            read_proc_text("/proc/stat", &mut host_stat_buffer),
+            read_proc_text("/proc/self/stat", &mut process_stat_buffer),
+        ) && let Some((total, cores)) = parse_host_cpu(host_stat)
+            && let Some(process) = parse_process_cpu(process_stat)
         {
             let current = CpuSnapshot {
                 total,
@@ -328,43 +452,40 @@ async fn cpu_loop(app: Arc<App>) {
     }
 }
 
-async fn stats_loop(app: Arc<App>) {
-    let path = app.config_dir.join("server.log");
-    let mut timer = tokio::time::interval(Duration::from_secs(60));
-    loop {
-        timer.tick().await;
-        let line = {
-            let db = app.db.read().await;
-            let line = serde_json::json!({
-                "timestamp": now(),
-                "uptime": now().saturating_sub(app.started),
-                "active": app.sessions.len(),
-                "total": app.total_connections.load(Ordering::Relaxed),
-                "up_bytes": app.bytes_from_client.load(Ordering::Relaxed),
-                "down_bytes": app.bytes_to_client.load(Ordering::Relaxed),
-                "passwords": db.passwords.len(),
-                "devices": db.devices.len(),
-                "tunnel": "userspace-tun",
-                "transport": "rtp-aead"
-            })
-            .to_string();
-            app.db_persistence.submit(db.clone());
-            line
-        };
+const DEVICE_EPOCH_IDLE_TTL_MS: u64 = 60 * 60 * 1_000;
+const DEVICE_EPOCH_SWEEP_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
-        let config_dir = app.config_dir.clone();
-        let stats_path = path.clone();
-        tokio::task::spawn_blocking(move || {
-            let temp = config_dir.join(".server.log.tmp");
-            if std::fs::write(&temp, format!("{line}\n")).is_ok() {
-                #[cfg(unix)]
+async fn device_epoch_sweeper(app: Arc<App>) {
+    let mut ticker = tokio::time::interval(DEVICE_EPOCH_SWEEP_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ticker.tick().await;
+    loop {
+        ticker.tick().await;
+        let now_ms = protocol::unix_time_ms();
+        let candidates: Vec<String> = app
+            .device_epochs
+            .iter()
+            .filter(|entry| {
+                now_ms.saturating_sub(entry.value().last_used_ms.load(Ordering::Relaxed))
+                    >= DEVICE_EPOCH_IDLE_TTL_MS
+            })
+            .map(|entry| entry.key().clone())
+            .collect();
+        for device_id in candidates {
+            app.device_epochs.remove_if(&device_id, |_, slot| {
+                if now_ms.saturating_sub(slot.last_used_ms.load(Ordering::Relaxed))
+                    < DEVICE_EPOCH_IDLE_TTL_MS
                 {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o640));
+                    return false;
                 }
-                let _ = std::fs::rename(&temp, &stats_path);
-            }
-        });
+                !app.sessions
+                    .iter()
+                    .any(|session| *lock_unpoison(&session.device_id) == device_id)
+            });
+        }
+        if app.device_epochs.len().saturating_mul(4) < app.device_epochs.capacity() {
+            app.device_epochs.shrink_to_fit();
+        }
     }
 }
 
@@ -391,6 +512,26 @@ async fn shutdown_signal() {
     }
 }
 
+#[cfg(unix)]
+async fn web_tls_reload_loop(
+    tls_config: axum_server::tls_rustls::RustlsConfig,
+    cert_path: std::path::PathBuf,
+    key_path: std::path::PathBuf,
+) {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let Ok(mut reload) = signal(SignalKind::user_defined1()) else {
+        eprintln!("[WEB] SIGUSR1 TLS reload handler unavailable");
+        return;
+    };
+    while reload.recv().await.is_some() {
+        match tls_config.reload_from_pem_file(&cert_path, &key_path).await {
+            Ok(()) => println!("[WEB] TLS certificate reloaded"),
+            Err(error) => eprintln!("[WEB] TLS certificate reload failed: {error}"),
+        }
+    }
+}
+
 fn run_systemctl(action: &str) -> Result<()> {
     if std::env::var("CSQTT_SERVICE_MANAGER").is_ok_and(|value| value == "docker") {
         if action != "restart" {
@@ -414,9 +555,11 @@ fn run_systemctl(action: &str) -> Result<()> {
         }
     }
     println!("[CLI] Выполняется systemctl {action} csqtt...");
-    let status = std::process::Command::new("systemctl")
-        .args([action, "csqtt"])
-        .status();
+    let mut command = std::process::Command::new("systemctl");
+    if action == "restart" {
+        command.arg("--no-block");
+    }
+    let status = command.args([action, "csqtt"]).status();
     match status {
         Ok(s) if s.success() => {
             println!("[CLI] Готово");
@@ -431,17 +574,132 @@ fn run_systemctl(action: &str) -> Result<()> {
     }
 }
 
+const PANEL_RESTART_DELAY_MILLIS: u64 = 750;
+static PANEL_RESTART_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
 pub(crate) fn request_service_restart() -> Result<()> {
-    #[cfg(unix)]
-    {
-        let pid = unsafe { libc::getpid() };
-        if unsafe { libc::kill(pid, libc::SIGTERM) } == 0 {
+    if std::env::var("CSQTT_SERVICE_MANAGER").is_ok_and(|value| value == "systemd") {
+        let sequence = PANEL_RESTART_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let unit = format!("csqtt-panel-restart-{}-{sequence}", std::process::id());
+        let status = std::process::Command::new("systemd-run")
+            .arg("--quiet")
+            .arg(format!("--unit={unit}"))
+            .arg(format!("--on-active={PANEL_RESTART_DELAY_MILLIS}ms"))
+            .arg("--timer-property=AccuracySec=100ms")
+            .arg("--collect")
+            .arg("/usr/bin/systemctl")
+            .args(["--no-block", "restart", "csqtt"])
+            .status()
+            .context("schedule delayed systemd restart with systemd-run")?;
+        if status.success() {
             return Ok(());
         }
-        Err(std::io::Error::last_os_error().into())
+        bail!("systemd-run delayed restart failed: {status}");
+    }
+    #[cfg(unix)]
+    {
+        std::thread::Builder::new()
+            .name("csqtt-panel-restart".to_owned())
+            .spawn(|| {
+                std::thread::sleep(Duration::from_millis(PANEL_RESTART_DELAY_MILLIS));
+                let pid = unsafe { libc::getpid() };
+                if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
+                    eprintln!(
+                        "[SYSTEM] delayed self-restart signal failed: {}",
+                        std::io::Error::last_os_error()
+                    );
+                }
+            })
+            .context("schedule delayed self restart")?;
+        Ok(())
     }
     #[cfg(not(unix))]
     bail!("managed restart is supported only on Unix");
+}
+
+pub(crate) fn request_managed_restart(app: &Arc<App>, source: &str) -> Result<()> {
+    if let Err(error) = protocol::notify_panel_restart(app) {
+        log_event(
+            app,
+            "WARN",
+            "SYSTEM",
+            &format!("Restart notification was not queued: {error:#}"),
+        );
+    }
+
+    match request_service_restart() {
+        Ok(()) => {
+            log_event(
+                app,
+                "INFO",
+                "SYSTEM",
+                &format!("Managed restart scheduled from {source}"),
+            );
+            Ok(())
+        }
+        Err(error) => {
+            log_event(
+                app,
+                "ERROR",
+                "SYSTEM",
+                &format!("Managed restart request from {source} failed: {error:#}"),
+            );
+            Err(error)
+        }
+    }
+}
+
+async fn auto_restart_loop(app: Arc<App>, mut interval_rx: tokio::sync::watch::Receiver<u8>) {
+    const RETRY_DELAY: Duration = Duration::from_secs(5 * 60);
+
+    loop {
+        let hours = *interval_rx.borrow_and_update();
+        if hours == 0 {
+            if interval_rx.changed().await.is_err() {
+                return;
+            }
+            continue;
+        }
+
+        let interval = Duration::from_secs(u64::from(hours) * 60 * 60);
+        let uptime_seconds = now().saturating_sub(app.started) as u64;
+        let wait = interval.saturating_sub(Duration::from_secs(uptime_seconds));
+
+        tokio::select! {
+            _ = tokio::time::sleep(wait) => {
+                if app.restart_pending.swap(true, Ordering::AcqRel) {
+                    return;
+                }
+
+                log_event(
+                    &app,
+                    "INFO",
+                    "SYSTEM",
+                    &format!(
+                        "Automatic restart interval reached: {hours}h uptime target"
+                    ),
+                );
+                if request_managed_restart(&app, "automatic uptime interval").is_ok() {
+                    return;
+                }
+
+                app.restart_pending.store(false, Ordering::Release);
+                tokio::select! {
+                    _ = tokio::time::sleep(RETRY_DELAY) => {}
+                    changed = interval_rx.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+            changed = interval_rx.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
+        }
+    }
 }
 
 fn acquire_instance_lock(config_dir: &std::path::Path) -> Result<std::fs::File> {
@@ -465,7 +723,30 @@ fn acquire_instance_lock(config_dir: &std::path::Path) -> Result<std::fs::File> 
     Ok(file)
 }
 
+fn diagnostic_heartbeat(
+    mut writer: tokio::net::tcp::OwnedWriteHalf,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt;
+
+        let mut timer = tokio::time::interval_at(
+            tokio::time::Instant::now() + Duration::from_secs(60),
+            Duration::from_secs(60),
+        );
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            timer.tick().await;
+            if writer.write_all(b"PING\n").await.is_err() {
+                break;
+            }
+        }
+    })
+}
+
 async fn run_dpi_client(samples: usize) -> Result<()> {
+    if !cfg!(feature = "diagnostics") {
+        bail!("csqtt was built without diagnostics; rebuild with --diagnostics");
+    }
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     println!(
@@ -490,7 +771,8 @@ async fn run_dpi_client(samples: usize) -> Result<()> {
     let req = format!("GET_DPI:{samples}\n");
     stream.write_all(req.as_bytes()).await?;
 
-    let (reader, _) = stream.into_split();
+    let (reader, writer) = stream.into_split();
+    let _heartbeat = diagnostic_heartbeat(writer);
     let mut buf_reader = BufReader::new(reader);
     let mut line = String::new();
     loop {
@@ -548,13 +830,14 @@ async fn run_dpi_client(samples: usize) -> Result<()> {
 }
 
 async fn syscalls_broadcast_loop() {
-    let mut last_counters = *crate::protocol::GLOBAL_IO_COUNTERS.read().unwrap();
+    if !cfg!(feature = "diagnostics") {
+        return;
+    }
+    let mut last_counters = *read_unpoison(&crate::protocol::GLOBAL_IO_COUNTERS);
     let mut last_crypto = crate::protocol::CRYPTO_OPS_COUNTER.load(Ordering::Relaxed);
-    let mut last_crypto_perf = *crate::protocol::GLOBAL_CRYPTO_PERF.read().unwrap();
-    let mut last_all_perf = crate::perf::GLOBAL_DATAPLANE
-        .read()
-        .unwrap()
-        .merge(*crate::perf::GLOBAL_PROTOCOL.read().unwrap());
+    let mut last_crypto_perf = *read_unpoison(&crate::protocol::GLOBAL_CRYPTO_PERF);
+    let mut last_all_perf = read_unpoison(&crate::perf::GLOBAL_DATAPLANE)
+        .merge(*read_unpoison(&crate::perf::GLOBAL_PROTOCOL));
     let mut last_process_cpu = perf::process_cpu_time_ns();
     let (mut last_process_user_cpu, mut last_process_system_cpu) = perf::process_cpu_split_ns();
     let mut last_dataplane_cpu = perf::DATAPLANE_CPU_NS.load(Ordering::Acquire);
@@ -577,13 +860,13 @@ async fn syscalls_broadcast_loop() {
 
         let all_active = perf::ALL_CLIENTS.load(Ordering::Acquire) != 0;
         if !monitoring {
-            last_counters = *crate::protocol::GLOBAL_IO_COUNTERS.read().unwrap();
+            last_counters = *read_unpoison(&crate::protocol::GLOBAL_IO_COUNTERS);
             last_crypto = crate::protocol::CRYPTO_OPS_COUNTER.load(Ordering::Relaxed);
-            last_crypto_perf = *crate::protocol::GLOBAL_CRYPTO_PERF.read().unwrap();
+            last_crypto_perf = *read_unpoison(&crate::protocol::GLOBAL_CRYPTO_PERF);
             last_all_perf = crate::perf::GLOBAL_DATAPLANE
                 .read()
                 .unwrap()
-                .merge(*crate::perf::GLOBAL_PROTOCOL.read().unwrap());
+                .merge(*read_unpoison(&crate::perf::GLOBAL_PROTOCOL));
             last_process_cpu = perf::process_cpu_time_ns();
             (last_process_user_cpu, last_process_system_cpu) = perf::process_cpu_split_ns();
             last_dataplane_cpu = perf::DATAPLANE_CPU_NS.load(Ordering::Acquire);
@@ -651,14 +934,14 @@ async fn syscalls_broadcast_loop() {
             0
         };
 
-        let current_counters = *crate::protocol::GLOBAL_IO_COUNTERS.read().unwrap();
+        let current_counters = *read_unpoison(&crate::protocol::GLOBAL_IO_COUNTERS);
         let current_crypto = crate::protocol::CRYPTO_OPS_COUNTER.load(Ordering::Relaxed);
-        let current_crypto_perf = *crate::protocol::GLOBAL_CRYPTO_PERF.read().unwrap();
+        let current_crypto_perf = *read_unpoison(&crate::protocol::GLOBAL_CRYPTO_PERF);
         let crypto_perf = current_crypto_perf.delta(last_crypto_perf);
         let current_all_perf = crate::perf::GLOBAL_DATAPLANE
             .read()
             .unwrap()
-            .merge(*crate::perf::GLOBAL_PROTOCOL.read().unwrap());
+            .merge(*read_unpoison(&crate::perf::GLOBAL_PROTOCOL));
         let all_perf = current_all_perf.delta(last_all_perf);
         let active_sessions = crate::protocol::ACTIVE_SESSIONS_GAUGE.load(Ordering::Relaxed);
 
@@ -716,37 +999,35 @@ async fn syscalls_broadcast_loop() {
             tun_tx_drops_s: current_counters
                 .tun_tx_drops
                 .saturating_sub(last_counters.tun_tx_drops),
-            sqe_per_sec: current_counters
-                .sqe_submissions
-                .saturating_sub(last_counters.sqe_submissions),
-            cqe_per_sec: current_counters
-                .cqe_completions
-                .saturating_sub(last_counters.cqe_completions),
-            udp_rx_rearms_s: current_counters
-                .udp_rx_rearms
-                .saturating_sub(last_counters.udp_rx_rearms),
-            tun_rx_rearms_s: current_counters
-                .tun_rx_rearms
-                .saturating_sub(last_counters.tun_rx_rearms),
+            readiness_wakeups_s: current_counters
+                .readiness_wakeups
+                .saturating_sub(last_counters.readiness_wakeups),
+            recv_syscalls_s: current_counters
+                .udp_recv_syscalls
+                .saturating_sub(last_counters.udp_recv_syscalls),
+            send_syscalls_s: current_counters
+                .udp_send_syscalls
+                .saturating_sub(last_counters.udp_send_syscalls),
+            rx_eagain_s: current_counters
+                .udp_rx_eagain
+                .saturating_sub(last_counters.udp_rx_eagain),
+            tx_eagain_s: current_counters
+                .udp_tx_eagain
+                .saturating_sub(last_counters.udp_tx_eagain),
+            partial_sendmmsg_s: current_counters
+                .partial_sendmmsg
+                .saturating_sub(last_counters.partial_sendmmsg),
             crypto_ops_s: current_crypto.saturating_sub(last_crypto),
             active_sessions,
             free_udp_tx_slots: current_counters.free_udp_tx_slots,
             free_tun_tx_slots: current_counters.free_tun_tx_slots,
-            cq_min_wait_usec: current_counters.cq_min_wait_usec,
-            cq_wait_batch: current_counters.cq_wait_batch,
-            cq_capacity: current_counters.cq_capacity,
-            cq_overflow_s: current_counters
-                .cq_overflow
-                .saturating_sub(last_counters.cq_overflow),
+            recv_batch_max: current_counters.udp_recv_batch_max,
             udp_rx_enobufs_s: current_counters
                 .udp_rx_enobufs
                 .saturating_sub(last_counters.udp_rx_enobufs),
-            udp_rx_multishot: current_counters.udp_rx_multishot,
-            udp_rx_buffer_count: current_counters.udp_rx_buffer_count,
-            tun_fixed_buffers: current_counters.tun_fixed_buffers,
-            iowq_bounded_limit: current_counters.iowq_bounded_limit,
-            iowq_unbounded_limit: current_counters.iowq_unbounded_limit,
-            uring_mode: current_counters.uring_mode,
+            udp_tx_enobufs_s: current_counters
+                .udp_tx_enobufs
+                .saturating_sub(last_counters.udp_tx_enobufs),
             total_udp_rx_packets: current_counters.udp_rx_packets,
             total_udp_tx_packets: current_counters.udp_tx_packets,
             total_tun_rx_packets: current_counters.tun_rx_packets,
@@ -778,6 +1059,9 @@ async fn syscalls_broadcast_loop() {
 }
 
 async fn run_syscalls_client() -> Result<()> {
+    if !cfg!(feature = "diagnostics") {
+        bail!("csqtt was built without diagnostics; rebuild with --diagnostics");
+    }
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     println!(
@@ -801,7 +1085,8 @@ async fn run_syscalls_client() -> Result<()> {
 
     stream.write_all(b"SUBSCRIBE\n").await?;
 
-    let (reader, _) = stream.into_split();
+    let (reader, writer) = stream.into_split();
+    let _heartbeat = diagnostic_heartbeat(writer);
     let mut buf_reader = BufReader::new(reader);
     let mut line = String::new();
     loop {
@@ -840,12 +1125,16 @@ async fn run_syscalls_client() -> Result<()> {
                     );
                     println!();
                     println!(
-                        "\x1b[1;35m  io_uring  \x1b[0m SQE/s: {:>8}  CQE/s: {:>8}",
-                        f.sqe_per_sec, f.cqe_per_sec
+                        "\x1b[1;35m  syscalls  \x1b[0m recv/s: {:>8}  send/s: {:>8}",
+                        f.recv_syscalls_s, f.send_syscalls_s
                     );
                     println!(
-                        "\x1b[1;35m  rearms/s  \x1b[0m UDP RX: {:>8}  TUN RX: {:>8}",
-                        f.udp_rx_rearms_s, f.tun_rx_rearms_s
+                        "\x1b[1;35m  wakeups   \x1b[0m {:>8}  max batch: {:>8}",
+                        f.readiness_wakeups_s, f.recv_batch_max
+                    );
+                    println!(
+                        "\x1b[1;35m  eagain    \x1b[0m RX: {:>8}  TX: {:>8}  partial: {}",
+                        f.rx_eagain_s, f.tx_eagain_s, f.partial_sendmmsg_s
                     );
                     println!("\x1b[1;35m  crypto/s  \x1b[0m {:>8}", f.crypto_ops_s);
                     println!();
@@ -877,7 +1166,13 @@ fn perf_estimated_ns(counters: perf::Counters) -> f64 {
     counters.sampled_ns as f64 / counters.samples as f64 * counters.operations as f64
 }
 
-fn print_all_perf_row(name: &str, counters: perf::Counters, sample_window_ns: u64) {
+fn write_all_perf_row(
+    out: &mut String,
+    name: &str,
+    counters: perf::Counters,
+    sample_window_ns: u64,
+) {
+    use std::fmt::Write;
     let estimated_ns = perf_estimated_ns(counters);
     let average_ns = if counters.operations == 0 {
         0.0
@@ -886,7 +1181,8 @@ fn print_all_perf_row(name: &str, counters: perf::Counters, sample_window_ns: u6
     };
     let operations_per_sec =
         counters.operations as f64 * 1_000_000_000.0 / sample_window_ns.max(1) as f64;
-    println!(
+    let _ = writeln!(
+        out,
         "{name:<24} {:>9.0} оп/с  {:>9.0} нс/оп  {:>7.2}% ядра  выборок: {}",
         operations_per_sec,
         average_ns,
@@ -895,37 +1191,22 @@ fn print_all_perf_row(name: &str, counters: perf::Counters, sample_window_ns: u6
     );
 }
 
-fn print_io_timing_row(name: &str, counters: perf::Counters, sample_window_ns: u64) {
-    let estimated_cpu_ns = perf_estimated_ns(counters);
-    let average_cpu_ns = if counters.samples == 0 {
-        0.0
-    } else {
-        counters.sampled_ns as f64 / counters.samples as f64
-    };
-    let average_wall_ns = if counters.samples == 0 {
-        0.0
-    } else {
-        counters.sampled_wall_ns as f64 / counters.samples as f64
-    };
-    let operations_per_sec =
-        counters.operations as f64 * 1_000_000_000.0 / sample_window_ns.max(1) as f64;
-    println!(
-        "{name:<24} {:>9.0} оп/с  CPU {:>8.0} нс/оп  WALL {:>8.1} мкс/оп  {:>7.2}% ядра",
-        operations_per_sec,
-        average_cpu_ns,
-        average_wall_ns / 1_000.0,
-        estimated_cpu_ns * 100.0 / sample_window_ns.max(1) as f64
-    );
-}
-
-fn print_derived_perf_row(name: &str, operations: u64, estimated_ns: f64, sample_window_ns: u64) {
+fn write_derived_perf_row(
+    out: &mut String,
+    name: &str,
+    operations: u64,
+    estimated_ns: f64,
+    sample_window_ns: u64,
+) {
+    use std::fmt::Write;
     let average_ns = if operations == 0 {
         0.0
     } else {
         estimated_ns / operations as f64
     };
     let operations_per_sec = operations as f64 * 1_000_000_000.0 / sample_window_ns.max(1) as f64;
-    println!(
+    let _ = writeln!(
+        out,
         "{name:<24} {:>9.0} оп/с  {:>9.0} нс/оп  {:>7.2}% ядра  расчёт",
         operations_per_sec,
         average_ns,
@@ -933,10 +1214,12 @@ fn print_derived_perf_row(name: &str, operations: u64, estimated_ns: f64, sample
     );
 }
 
-fn print_perf_all(frame: &protocol::SyscallsFrame) {
+fn render_perf_all(frame: &protocol::SyscallsFrame) -> String {
+    use std::fmt::Write;
+
+    let mut out = String::with_capacity(4096);
     let all = frame.all;
-    let io_wait_ns = perf_estimated_ns(all.io_wait);
-    let cqe_ns = perf_estimated_ns(all.cqe_processing);
+    let dispatch_ns = perf_estimated_ns(all.dispatch);
     let flush_ns = perf_estimated_ns(all.flush);
     let bookkeeping_ns = perf_estimated_ns(all.bookkeeping);
     let wrap_ns = if frame.wrap_crypto.samples == 0 {
@@ -952,7 +1235,7 @@ fn print_perf_all(frame: &protocol::SyscallsFrame) {
             * frame.unwrap_crypto.operations as f64
     };
     let udp_queue_ns = perf_estimated_ns(all.udp_queue);
-    let total_ns = io_wait_ns + cqe_ns + flush_ns + bookkeeping_ns;
+    let total_ns = dispatch_ns + flush_ns + bookkeeping_ns;
     let sample_window_ns = frame.sample_window_ns.max(1);
     let process_percent = frame.process_cpu_ns as f64 * 100.0 / sample_window_ns as f64;
     let sampled_top_percent = total_ns * 100.0 / sample_window_ns as f64;
@@ -974,8 +1257,12 @@ fn print_perf_all(frame: &protocol::SyscallsFrame) {
     let other_threads_percent = other_threads_ns as f64 * 100.0 / sample_window_ns as f64;
     let unattributed_percent = unattributed_ns as f64 * 100.0 / sample_window_ns as f64;
 
-    println!("CSQTT PERF ALL — профиль dataplane за последнюю секунду");
-    println!(
+    let _ = writeln!(
+        out,
+        "CSQTT PERF ALL — профиль dataplane за последнюю секунду"
+    );
+    let _ = writeln!(
+        out,
         "Сессий: {} · UDP RX/TX: {}/{} pps · TUN RX/TX: {}/{} pps · выборка 1/{}\n",
         frame.active_sessions,
         frame.udp_rx_pps,
@@ -984,47 +1271,25 @@ fn print_perf_all(frame: &protocol::SyscallsFrame) {
         frame.tun_tx_pps,
         frame.all_sample_interval
     );
-    let cqe_per_cycle = if all.cqe_processing.operations == 0 {
-        0.0
-    } else {
-        frame.cqe_per_sec as f64 / all.cqe_processing.operations as f64
-    };
-    println!(
-        "CQE за проход: {:.2} · адаптивное окно: {} мкс · цель: до {} CQE\n",
-        cqe_per_cycle, frame.cq_min_wait_usec, frame.cq_wait_batch
+    let _ = writeln!(
+        out,
+        "epoll wakeups: {}/с · recvmmsg: {}/с · sendmmsg: {}/с · макс батч: {}\n",
+        frame.readiness_wakeups_s,
+        frame.recv_syscalls_s,
+        frame.send_syscalls_s,
+        frame.recv_batch_max
     );
-    println!(
-        "UDP multishot: {} · provided buffers: {} · CQ: {} · overflow: +{}/с · ENOBUFS: +{}/с\n",
-        if frame.udp_rx_multishot != 0 {
-            "активен"
-        } else {
-            "fallback"
-        },
-        frame.udp_rx_buffer_count,
-        frame.cq_capacity,
-        frame.cq_overflow_s,
-        frame.udp_rx_enobufs_s
+    let _ = writeln!(
+        out,
+        "EAGAIN RX/TX: {}/{} · частичных sendmmsg: +{}/с · ENOBUFS RX/TX: {}/{}\n",
+        frame.rx_eagain_s,
+        frame.tx_eagain_s,
+        frame.partial_sendmmsg_s,
+        frame.udp_rx_enobufs_s,
+        frame.udp_tx_enobufs_s
     );
-    let uring_mode = match frame.uring_mode {
-        5 => "single+coop+defer",
-        4 => "single+coop+taskrun",
-        3 => "coop",
-        2 => "single",
-        1 => "basic",
-        _ => "неизвестен",
-    };
-    println!(
-        "io_uring mode: {uring_mode} · TUN I/O: nonblock+poll · io-wq B/U: {}\n",
-        if frame.iowq_bounded_limit != 0 || frame.iowq_unbounded_limit != 0 {
-            format!(
-                "{}/{}",
-                frame.iowq_bounded_limit, frame.iowq_unbounded_limit
-            )
-        } else {
-            "не поддерживается ядром".to_owned()
-        }
-    );
-    println!(
+    let _ = writeln!(
+        out,
         "I/O ошибки: UDP RX/TX {}/{} · TUN RX/TX {}/{} · drops UDP/TUN {}/{}\n",
         frame.udp_rx_errors_s,
         frame.udp_tx_errors_s,
@@ -1033,42 +1298,53 @@ fn print_perf_all(frame: &protocol::SyscallsFrame) {
         frame.udp_tx_drops_s,
         frame.tun_tx_drops_s
     );
-    println!("Верхний уровень, независимая sampled-оценка:");
-    print_all_perf_row("I/O cycle inclusive", all.io_wait, sample_window_ns);
-    print_all_perf_row("CQE dispatch (всего)", all.cqe_processing, sample_window_ns);
-    print_all_perf_row("sendmmsg/flush", all.flush, sample_window_ns);
-    print_all_perf_row("loop bookkeeping", all.bookkeeping, sample_window_ns);
-    println!(
+    let _ = writeln!(out, "Верхний уровень, независимая sampled-оценка:");
+    write_all_perf_row(&mut out, "Dispatch (всего)", all.dispatch, sample_window_ns);
+    write_all_perf_row(&mut out, "sendmmsg/flush", all.flush, sample_window_ns);
+    write_all_perf_row(
+        &mut out,
+        "loop bookkeeping",
+        all.bookkeeping,
+        sample_window_ns,
+    );
+    let _ = writeln!(
+        out,
         "{:<24} {:>31.2}% ядра",
         "СУММА SAMPLED СТАДИЙ", sampled_top_percent
     );
-    println!(
+    let _ = writeln!(
+        out,
         "{:<24} {:>31.2}% ядра",
         "DATAPLANE THREAD ТОЧНО", dataplane_percent
     );
-    println!(
+    let _ = writeln!(
+        out,
         "{:<24} {:>31.2}% ядра",
         "ПРОЦЕСС CSQTT ТОЧНО", process_percent
     );
-    println!(
+    let _ = writeln!(
+        out,
         "{:<24} {:>20.2}% user · {:>6.2}% system",
         "ПРОЦЕСС CPU SPLIT", user_percent, system_percent
     );
-    println!(
+    let _ = writeln!(
+        out,
         "{:<24} {:>31.2}% ядра",
         "ПРОЧИЕ ПОТОКИ CSQTT", other_threads_percent
     );
-    println!(
+    let _ = writeln!(
+        out,
         "{:<24} {:>31.2}% ядра\n",
         "НЕ АТРИБУТИРОВАНО /PROC", unattributed_percent
     );
 
     if !frame.threads.is_empty() {
-        println!("Стабильная разбивка живых потоков по /proc:");
+        let _ = writeln!(out, "Стабильная разбивка живых потоков по /proc:");
         for thread in frame.threads.iter().take(16) {
             let thread_user = thread.user_cpu_ns as f64 * 100.0 / sample_window_ns as f64;
             let thread_system = thread.system_cpu_ns as f64 * 100.0 / sample_window_ns as f64;
-            println!(
+            let _ = writeln!(
+                out,
                 "{:<18} tid {:>7} {:>7.2}% · {:>6.2}% user · {:>6.2}% system",
                 thread.name,
                 thread.tid,
@@ -1078,51 +1354,361 @@ fn print_perf_all(frame: &protocol::SyscallsFrame) {
             );
         }
         if frame.threads.len() > 16 {
-            println!("ещё потоков: {}", frame.threads.len() - 16);
+            let _ = writeln!(out, "ещё потоков: {}", frame.threads.len() - 16);
         }
-        println!();
+        let _ = writeln!(out);
     }
 
     if dataplane_percent > 0.0 && sampled_top_percent > dataplane_percent * 1.25 {
-        println!(
+        let _ = writeln!(
+            out,
             "Sampled-оценка смещена периодической выборкой; для итога используй точные строки процесса и потоков.\n"
         );
     }
 
-    println!("Разложение I/O cycle, CPU и wall измеряются отдельно:");
-    print_io_timing_row("io_uring enter/wait", all.io_enter, sample_window_ns);
-    print_io_timing_row("SQ submit", all.sq_submit, sample_window_ns);
-    print_io_timing_row("CQ shared-memory drain", all.cq_drain, sample_window_ns);
-
-    println!("\nПриблизительная sampled-атрибуция внутри CQE dispatch:");
-    print_all_perf_row("UDP RX overhead", all.udp_rx, sample_window_ns);
-    print_derived_perf_row(
+    let _ = writeln!(out, "\nПриблизительная sampled-атрибуция внутри Dispatch:");
+    write_all_perf_row(&mut out, "UDP RX overhead", all.udp_rx, sample_window_ns);
+    write_derived_perf_row(
+        &mut out,
         "parse+unwrap+crypto",
         frame.unwrap_crypto.operations,
         unwrap_ns,
         sample_window_ns,
     );
-    print_all_perf_row("route/replay", all.route_replay, sample_window_ns);
-    print_all_perf_row("TUN write", all.tun_write, sample_window_ns);
-    print_all_perf_row("TUN RX overhead", all.tun_rx, sample_window_ns);
-    print_derived_perf_row(
+    write_all_perf_row(&mut out, "route/replay", all.route_replay, sample_window_ns);
+    write_all_perf_row(&mut out, "TUN write", all.tun_write, sample_window_ns);
+    write_all_perf_row(&mut out, "TUN RX overhead", all.tun_rx, sample_window_ns);
+    write_derived_perf_row(
+        &mut out,
         "prepare+wrap+crypto",
         frame.wrap_crypto.operations,
         wrap_ns,
         sample_window_ns,
     );
-    print_derived_perf_row(
+    write_derived_perf_row(
+        &mut out,
         "UDP queue inclusive",
         all.udp_queue.operations,
         udp_queue_ns,
         sample_window_ns,
     );
-    println!(
+    let _ = writeln!(
+        out,
         "\nВнутренние строки sampled независимо и не складываются в точный итог. Истинный общий расход показывает «DATAPLANE THREAD ТОЧНО»; CPU ожидания не включает wall-сон."
     );
+    out
+}
+
+fn format_metric_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0usize;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else if value >= 100.0 {
+        format!("{value:.0} {}", UNITS[unit])
+    } else if value >= 10.0 {
+        format!("{value:.1} {}", UNITS[unit])
+    } else {
+        format!("{value:.2} {}", UNITS[unit])
+    }
+}
+
+fn format_metric_kib(kib: u64) -> String {
+    format_metric_bytes(kib.saturating_mul(1024))
+}
+
+fn format_metric_limit(limit: Option<u64>) -> String {
+    limit
+        .map(format_metric_bytes)
+        .unwrap_or_else(|| "без лимита / н/д".to_owned())
+}
+
+fn render_metric_all(frame: &memory_metrics::MetricFrame) -> String {
+    use std::fmt::Write;
+
+    let mut out = String::with_capacity(12_288);
+    let _ = writeln!(
+        out,
+        "CSQTT METRIC ALL — снимок памяти сервера (PID {})",
+        frame.pid
+    );
+    let _ = writeln!(
+        out,
+        "Обновление раз в 2 с. RSS/PSS, cgroup и kernel socket memory пересекаются — их нельзя складывать.\n"
+    );
+
+    if frame.process.available {
+        let _ = writeln!(out, "[Процесс /proc/self/status]");
+        let _ = writeln!(
+            out,
+            "RSS {} · пик VmHWM {} · потоки {} · swap {}",
+            format_metric_kib(frame.process.rss_kib),
+            format_metric_kib(frame.process.peak_rss_kib),
+            frame.process.threads,
+            format_metric_kib(frame.process.swap_kib)
+        );
+        let _ = writeln!(
+            out,
+            "RSS-состав: anon {} · file {} · shmem {}\n",
+            format_metric_kib(frame.process.anonymous_kib),
+            format_metric_kib(frame.process.file_kib),
+            format_metric_kib(frame.process.shmem_kib)
+        );
+    } else {
+        let _ = writeln!(out, "[Процесс] /proc/self/status недоступен\n");
+    }
+
+    if frame.smaps_rollup.available {
+        let rollup = &frame.smaps_rollup;
+        let _ = writeln!(out, "[smaps_rollup — более честная доля памяти процесса]");
+        let _ = writeln!(
+            out,
+            "Rss {} · Pss {} · private {} · shared {} · Swap {} / SwapPss {}",
+            format_metric_kib(rollup.rss_kib),
+            format_metric_kib(rollup.pss_kib),
+            format_metric_kib(rollup.private_kib),
+            format_metric_kib(rollup.shared_kib),
+            format_metric_kib(rollup.swap_kib),
+            format_metric_kib(rollup.swap_pss_kib)
+        );
+        let _ = writeln!(
+            out,
+            "PSS-состав: anon {} · file {} · shmem {} · Anonymous RSS-like {}\n",
+            format_metric_kib(rollup.pss_anon_kib),
+            format_metric_kib(rollup.pss_file_kib),
+            format_metric_kib(rollup.pss_shmem_kib),
+            format_metric_kib(rollup.anonymous_kib)
+        );
+    } else {
+        let _ = writeln!(out, "[smaps_rollup] недоступен\n");
+    }
+
+    if frame.mappings.available {
+        let _ = writeln!(out, "[Карта отображений smaps, top по RSS]");
+        for mapping in frame.mappings.categories.iter().take(12) {
+            let _ = writeln!(
+                out,
+                "{:<24} RSS {:>10} · PSS {:>10} · private {:>10} · shared {:>10}",
+                mapping.category,
+                format_metric_kib(mapping.rss_kib),
+                format_metric_kib(mapping.pss_kib),
+                format_metric_kib(mapping.private_kib),
+                format_metric_kib(mapping.shared_kib)
+            );
+        }
+        let _ = writeln!(out);
+    }
+
+    if frame.cgroup.available {
+        let cgroup = &frame.cgroup;
+        let _ = writeln!(
+            out,
+            "[cgroup memory.{} — группа, не только Rust heap]",
+            cgroup.version
+        );
+        let _ = writeln!(
+            out,
+            "current {} · peak {} · max {} · swap current {} · swap max {}",
+            format_metric_bytes(cgroup.current_bytes),
+            format_metric_bytes(cgroup.peak_bytes),
+            format_metric_limit(cgroup.max_bytes),
+            format_metric_limit(cgroup.swap_current_bytes),
+            format_metric_limit(cgroup.swap_max_bytes)
+        );
+        let _ = writeln!(
+            out,
+            "anon {} · file {} · shmem {} · sock {} · kernel_stack {} · pagetables {} · percpu {}",
+            format_metric_bytes(cgroup.anon_bytes),
+            format_metric_bytes(cgroup.file_bytes),
+            format_metric_bytes(cgroup.shmem_bytes),
+            format_metric_bytes(cgroup.sock_bytes),
+            format_metric_bytes(cgroup.kernel_stack_bytes),
+            format_metric_bytes(cgroup.pagetables_bytes),
+            format_metric_bytes(cgroup.percpu_bytes)
+        );
+        let _ = writeln!(
+            out,
+            "slab reclaimable {} · slab unreclaimable {} · file_mapped {} · file_dirty {}\n",
+            format_metric_bytes(cgroup.slab_reclaimable_bytes),
+            format_metric_bytes(cgroup.slab_unreclaimable_bytes),
+            format_metric_bytes(cgroup.file_mapped_bytes),
+            format_metric_bytes(cgroup.file_dirty_bytes)
+        );
+    } else {
+        let _ = writeln!(out, "[cgroup memory] недоступна\n");
+    }
+
+    if frame.sockets.available {
+        let sockets = &frame.sockets;
+        let _ = writeln!(out, "[Сокеты процесса — только текущие очереди payload]");
+        let _ = writeln!(
+            out,
+            "FD socket {} · UDP {} (TX {} / RX {}) · TCP {} (TX {} / RX {})",
+            sockets.socket_fds,
+            sockets.udp_sockets,
+            format_metric_bytes(sockets.udp_tx_queue_bytes),
+            format_metric_bytes(sockets.udp_rx_queue_bytes),
+            sockets.tcp_sockets,
+            format_metric_bytes(sockets.tcp_tx_queue_bytes),
+            format_metric_bytes(sockets.tcp_rx_queue_bytes)
+        );
+        let _ = writeln!(
+            out,
+            "Полное kernel socket allocation смотри выше в cgroup `sock`, а не в этой очереди.\n"
+        );
+    }
+
+    let buffers = &frame.fixed_buffers;
+    let _ = writeln!(out, "[Пул пакетов CSQTT — live payload, не утечка]");
+    let _ = writeln!(
+        out,
+        "Packet pool capacity {} · выделено {} ({}) · удерживается {}",
+        buffers.packet_pool_capacity_slots,
+        buffers.packet_pool_allocated_slots,
+        format_metric_bytes(buffers.packet_pool_allocated_payload_bytes),
+        buffers.packet_pool_retained_slots
+    );
+    let _ = writeln!(
+        out,
+        "UDP TX capacity {} × {} = {} · занято {}/{}",
+        buffers.udp_tx_slots,
+        format_metric_bytes(buffers.packet_capacity_bytes),
+        format_metric_bytes(buffers.udp_tx_payload_bytes),
+        buffers.udp_tx_in_use_slots,
+        buffers.udp_tx_slots
+    );
+    let _ = writeln!(
+        out,
+        "TUN TX capacity {} × {} = {} · занято {}/{}",
+        buffers.tun_tx_slots,
+        format_metric_bytes(buffers.packet_capacity_bytes),
+        format_metric_bytes(buffers.tun_tx_payload_bytes),
+        buffers.tun_tx_in_use_slots,
+        buffers.tun_tx_slots
+    );
+    let _ = writeln!(
+        out,
+        "UDP RX {}: {} × {} = {} · TUN RX {} · всего payload {}",
+        buffers.udp_rx_mode,
+        buffers.udp_rx_slots,
+        format_metric_bytes(buffers.udp_rx_slot_bytes),
+        format_metric_bytes(buffers.udp_rx_payload_bytes),
+        format_metric_bytes(buffers.tun_rx_payload_bytes),
+        format_metric_bytes(buffers.fixed_payload_bytes)
+    );
+    let _ = writeln!(
+        out,
+        "UDP SO_RCVBUF request {} · SO_SNDBUF request {}\n",
+        format_metric_bytes(buffers.udp_socket_rcvbuf_request_bytes),
+        format_metric_bytes(buffers.udp_socket_sndbuf_request_bytes)
+    );
+
+    let runtime = &frame.runtime;
+    let _ = writeln!(
+        out,
+        "[Удерживаемые структуры runtime — allocator {}]",
+        runtime.allocator
+    );
+    let _ = writeln!(
+        out,
+        "hot transport sessions {}/{} (жёсткий {}) · public sessions {} / capacity {} · streams/device до {}",
+        runtime.hot_sessions,
+        runtime.hot_session_capacity,
+        runtime.hot_session_limit,
+        runtime.public_sessions,
+        runtime.public_session_capacity,
+        runtime.max_stream_workers_per_device
+    );
+    let _ = writeln!(
+        out,
+        "epochs engine/device {}/{} (capacity {}) · derived keys {} (key strings {})",
+        runtime.engine_epochs,
+        runtime.device_epochs,
+        runtime.device_epoch_capacity,
+        runtime.derived_keys,
+        format_metric_bytes(runtime.derived_key_string_capacity_bytes)
+    );
+    let _ = writeln!(
+        out,
+        "web sessions {}/{} (keys {}) · login limits {}/{} (keys {})",
+        runtime.web_sessions,
+        runtime.web_session_limit,
+        format_metric_bytes(runtime.web_session_key_capacity_bytes),
+        runtime.login_limits,
+        runtime.login_limit_limit,
+        format_metric_bytes(runtime.login_limit_key_capacity_bytes)
+    );
+    let _ = writeln!(
+        out,
+        "logs {}/{} (strings {}, metadata {}) · DPI {}/{} (retained {})",
+        runtime.log_entries,
+        runtime.log_entry_limit,
+        format_metric_bytes(runtime.log_string_capacity_bytes),
+        format_metric_bytes(runtime.log_ring_metadata_capacity_bytes),
+        runtime.dpi_entries,
+        runtime.dpi_entry_capacity,
+        format_metric_bytes(runtime.dpi_retained_bytes)
+    );
+    let _ = writeln!(
+        out,
+        "stream repair/inventory {}/{} · dataplane commands {}/{} · memory trim {}",
+        runtime.stream_repairs,
+        runtime.stream_inventory,
+        runtime.dataplane_commands_queued,
+        runtime.dataplane_command_capacity,
+        runtime.memory_trim_count
+    );
+    let _ = writeln!(out);
+
+    let _ = writeln!(out, "[Local SOCKS / TPROXY]");
+    let _ = writeln!(
+        out,
+        "{} · TCP {}/{} · UDP {}/{} · payload выделено {} · удерживается {}",
+        if runtime.local_proxy_active {
+            "активен"
+        } else {
+            "не активен"
+        },
+        runtime.local_proxy_tcp_sessions,
+        runtime.local_proxy_tcp_limit,
+        runtime.local_proxy_udp_flows,
+        runtime.local_proxy_udp_limit,
+        format_metric_bytes(runtime.local_proxy_payload_allocated_bytes),
+        format_metric_bytes(runtime.local_proxy_payload_retained_bytes)
+    );
+    let _ = writeln!(
+        out,
+        "opening buffers {} · payload upper bound на полном лимите {} · kernel TCP/UDP buffers — cgroup sock выше\n",
+        format_metric_bytes(runtime.local_proxy_opening_buffer_allocated_bytes),
+        format_metric_bytes(runtime.local_proxy_payload_upper_bound_at_limit_bytes)
+    );
+
+    let storage = &frame.storage;
+    let _ = writeln!(out, "[Persistent storage — диск, не RSS]");
+    let _ = writeln!(
+        out,
+        "SQLite db {} · WAL {} · SHM {} · log {}",
+        format_metric_bytes(storage.sqlite_db_bytes),
+        format_metric_bytes(storage.sqlite_wal_bytes),
+        format_metric_bytes(storage.sqlite_shm_bytes),
+        format_metric_bytes(storage.log_file_bytes)
+    );
+    let _ = writeln!(
+        out,
+        "\nИнтерпретация: растут VmRSS/PSS/RssAnon — ищем удержание в процессе; RSS низкий, а cgroup sock/slab/file высокий — это ядро/cache/другие PID той же группы."
+    );
+    out
 }
 
 async fn run_perf_client() -> Result<()> {
+    if !cfg!(feature = "diagnostics") {
+        bail!("csqtt was built without diagnostics; rebuild with --diagnostics");
+    }
     use std::io::Write;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -1133,7 +1719,8 @@ async fn run_perf_client() -> Result<()> {
         )?;
     stream.write_all(b"PERF ALL\n").await?;
 
-    let (reader, _) = stream.into_split();
+    let (reader, writer) = stream.into_split();
+    let _heartbeat = diagnostic_heartbeat(writer);
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
     loop {
@@ -1144,10 +1731,65 @@ async fn run_perf_client() -> Result<()> {
         let Ok(frame) = serde_json::from_str::<protocol::SyscallsFrame>(&line) else {
             continue;
         };
-        print!("\x1b[2J\x1b[H");
-        print_perf_all(&frame);
-        println!("Ctrl+C — выход.");
-        std::io::stdout().flush()?;
+        let mut output = String::with_capacity(8192);
+        output.push_str("\x1b[2J\x1b[H");
+        output.push_str(&render_perf_all(&frame));
+        output.push_str("Ctrl+C — выход.\n");
+        let mut stdout = std::io::stdout();
+        if let Err(error) = stdout
+            .write_all(output.as_bytes())
+            .and_then(|_| stdout.flush())
+        {
+            if error.kind() == std::io::ErrorKind::BrokenPipe {
+                return Ok(());
+            }
+            return Err(error.into());
+        }
+    }
+    Ok(())
+}
+
+async fn run_metric_client() -> Result<()> {
+    use std::io::Write;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let mut stream = tokio::net::TcpStream::connect("127.0.0.1:46004")
+        .await
+        .with_context(
+            || "не удалось подключиться к CSQTT на 127.0.0.1:46004; убедитесь, что служба запущена",
+        )?;
+    stream.write_all(b"METRIC ALL\n").await?;
+
+    let (reader, writer) = stream.into_split();
+    let _heartbeat = diagnostic_heartbeat(writer);
+    let mut reader = BufReader::new(reader);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line).await? == 0 {
+            break;
+        }
+        let Ok(frame) = serde_json::from_str::<memory_metrics::MetricFrame>(&line) else {
+            continue;
+        };
+        if !frame.error.is_empty() {
+            println!("CSQTT METRIC ALL: {}", frame.error);
+            return Ok(());
+        }
+        let mut output = String::with_capacity(16_384);
+        output.push_str("\x1b[2J\x1b[H");
+        output.push_str(&render_metric_all(&frame));
+        output.push_str("Ctrl+C — выход.\n");
+        let mut stdout = std::io::stdout();
+        if let Err(error) = stdout
+            .write_all(output.as_bytes())
+            .and_then(|_| stdout.flush())
+        {
+            if error.kind() == std::io::ErrorKind::BrokenPipe {
+                return Ok(());
+            }
+            return Err(error.into());
+        }
     }
     Ok(())
 }
@@ -1163,6 +1805,7 @@ fn print_cli_help() {
   csqtt dpi s 50              Показать последние 50 DPI-записей и выйти\n  \
   csqtt syscalls              Открыть монитор I/O и системных вызовов\n  \
   csqtt perf all              Разложить весь dataplane по этапам\n  \
+  csqtt metric all            Подробный live-снимок памяти сервера\n  \
   csqtt help                  Показать эту справку\n\n\
 Ручной запуск сервера:\n  \
   --listen АДРЕС              UDP-адрес, по умолчанию 0.0.0.0:46000\n  \
@@ -1173,27 +1816,28 @@ fn print_cli_help() {
   --web-user ЛОГИН            Логин веб-панели\n  \
   --web-pass ПАРОЛЬ           Пароль веб-панели\n  \
   --dns IP[,IP]               Один или два DNS IPv4-адреса\n  \
-  --secure-cookie             Выдавать cookie только по HTTPS\n\n\
-Диагностика io_uring:\n  \
-  --io-uring-probe             Проверить setup/enter/CQE и вывести выбранный режим\n  \
-  CSQTT_URING_MODE=defer      SINGLE_ISSUER + COOP_TASKRUN + DEFER_TASKRUN\n  \
-  CSQTT_URING_MODE=coop       SINGLE_ISSUER + COOP_TASKRUN + TASKRUN_FLAG\n  \
-  CSQTT_URING_MODE=single     Только SINGLE_ISSUER\n  \
-  CSQTT_URING_MODE=basic      Совместимый режим без дополнительных флагов\n"
+  --secure-cookie             Выдавать cookie только по HTTPS\n"
     );
 }
 
-#[tokio::main(flavor = "multi_thread")]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .context("create tokio runtime")?;
+    let result = runtime.block_on(async_main());
+    runtime.shutdown_timeout(Duration::from_secs(1));
+    result
+}
+
+async fn async_main() -> Result<()> {
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .ok();
 
     let args_vec: Vec<String> = std::env::args().collect();
-    if args_vec.len() == 2 && args_vec[1] == "--io-uring-probe" {
-        println!("{}", uring_io::probe_compatibility()?);
-        return Ok(());
-    }
     if args_vec.len() == 1
         || (args_vec.len() == 2 && matches!(args_vec[1].as_str(), "help" | "--help" | "-h"))
     {
@@ -1224,11 +1868,18 @@ async fn main() -> Result<()> {
                 }
                 return run_perf_client().await;
             }
+            "metric" => {
+                if args_vec.get(2).map(String::as_str) != Some("all") {
+                    println!("Использование:\n  csqtt metric all");
+                    return Ok(());
+                }
+                return run_metric_client().await;
+            }
             _ => {}
         }
     }
 
-    let mut args = Args::parse();
+    let args = Args::parse();
 
     if args.start {
         return run_systemctl("start");
@@ -1248,12 +1899,17 @@ async fn main() -> Result<()> {
         bail!("csqtt-server must run as root");
     }
 
-    if args.config_dir == std::path::Path::new("/etc/csqtt")
-        && !args.config_dir.exists()
-        && std::path::Path::new("/etc/wdttq").exists()
-    {
-        args.config_dir = std::path::PathBuf::from("/etc/wdttq");
-        println!("[INIT] legacy config dir /etc/wdttq в использовании");
+    if args.tproxy_child {
+        let tproxy_status = args.tproxy_status.clone();
+        return match run_tproxy_child(args.tproxy_port, args.tproxy_status).await {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                if let Some(path) = tproxy_status.as_deref() {
+                    proxy_route::write_tproxy_child_error(path, &format!("{error:#}"));
+                }
+                Err(error)
+            }
+        };
     }
 
     tokio::fs::create_dir_all(&args.config_dir).await?;
@@ -1265,9 +1921,16 @@ async fn main() -> Result<()> {
     }
 
     let _instance_lock = acquire_instance_lock(&args.config_dir)?;
-    proxy_route::ProxyRoute::cleanup_orphaned_policy()
-        .await
-        .context("cleanup orphaned CSQTT proxy policy")?;
+    match tokio::time::timeout(
+        Duration::from_secs(1),
+        proxy_route::ProxyRoute::cleanup_orphaned_policy(),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => eprintln!("[PROXY] startup policy cleanup: {error:#}"),
+        Err(_) => eprintln!("[PROXY] startup policy cleanup timed out"),
+    }
 
     let mut db = load_database(&args.config_dir)?;
     db.admin_id.clear();
@@ -1315,6 +1978,9 @@ async fn main() -> Result<()> {
         None => "1.1.1.1".to_owned(),
     };
     db.dns = runtime_dns.clone();
+    if !matches!(db.auto_restart_interval_hours(), 0 | 12 | 24 | 48 | 72) {
+        db.set_auto_restart_interval_hours(DEFAULT_AUTO_RESTART_INTERVAL_HOURS);
+    }
 
     let web_pass = if args.web_pass.is_empty() {
         let value = random_password() + &random_password();
@@ -1337,20 +2003,12 @@ async fn main() -> Result<()> {
     let web_sessions = DashMap::new();
 
     let logging_active_val = db.logging_active.unwrap_or(true);
-    let device_epochs = DashMap::new();
-    for (device_id, device) in &db.devices {
-        device_epochs.insert(
-            device_id.clone(),
-            Arc::new(tokio::sync::Mutex::new(DeviceEpochState::new(
-                device.last_generation_id,
-                device.last_session_salt.clone(),
-            ))),
-        );
-    }
+    let (auto_restart_interval_tx, auto_restart_interval_rx) =
+        tokio::sync::watch::channel(db.auto_restart_interval_hours());
     let startup_main_password = db.main_password.clone();
     let startup_dns = runtime_dns.clone();
     let app = Arc::new(App {
-        db_persistence: DatabasePersistence::new(args.config_dir.clone()),
+        db_persistence: DatabasePersistence::new(args.config_dir.clone())?,
         db: RwLock::new(db),
         dns: RwLock::new(runtime_dns),
         startup_main_password,
@@ -1361,10 +2019,12 @@ async fn main() -> Result<()> {
         web_user: args.web_user,
         web_pass,
         secure_cookie: args.secure_cookie,
+        fec_profile: args.fec,
         sessions: DashMap::new(),
-        device_epochs,
+        device_epochs: DashMap::new(),
         web_sessions,
         login_limits: DashMap::new(),
+        web_auth_admission: std::sync::Mutex::new(()),
         bytes_from_client: Arc::new(AtomicU64::new(0)),
         bytes_to_client: Arc::new(AtomicU64::new(0)),
         total_connections: AtomicU64::new(0),
@@ -1372,7 +2032,7 @@ async fn main() -> Result<()> {
         cpu_cores: AtomicU64::new(1),
         started: now(),
         derived_keys: DashMap::new(),
-        logs: std::sync::Mutex::new(std::collections::VecDeque::with_capacity(600)),
+        logs: std::sync::Mutex::new(std::collections::VecDeque::with_capacity(LOG_RING_CAPACITY)),
         logging_active: std::sync::atomic::AtomicBool::new(logging_active_val),
         stream_debug_active: Arc::new(AtomicBool::new(false)),
         log_file_path: args.config_dir.join("csqtt.log"),
@@ -1381,10 +2041,15 @@ async fn main() -> Result<()> {
         proxy_trigger: tokio::sync::Notify::new(),
         proxy_port_listening: std::sync::atomic::AtomicBool::new(true),
         proxy_health_error: std::sync::RwLock::new(None),
+        memory_trim_gate: tokio::sync::Mutex::new(()),
+        memory_trim_count: AtomicU64::new(0),
+        memory_trim_last_unix: AtomicU64::new(0),
+        auto_restart_interval_tx,
+        restart_pending: AtomicBool::new(false),
         dataplane: std::sync::OnceLock::new(),
     });
 
-    log_event(&app, "INFO", "SYSTEM", " CSQTT Server 2.0.0");
+    log_event(&app, "INFO", "SYSTEM", " CSQTT Server 2.1.5");
     log_event(
         &app,
         "INFO",
@@ -1400,7 +2065,7 @@ async fn main() -> Result<()> {
     );
 
     let web_app = app.clone();
-    let stats_app = app.clone();
+    let diagnostic_app = app.clone();
 
     tokio::spawn(async move {
         if let Err(e) = protocol::run_dpi_server().await {
@@ -1409,16 +2074,17 @@ async fn main() -> Result<()> {
     });
 
     tokio::spawn(async move {
-        if let Err(e) = protocol::run_syscalls_server().await {
+        if let Err(e) = protocol::run_syscalls_server(diagnostic_app).await {
             eprintln!("[SYSCALLS] Server listener error: {e}");
         }
     });
 
     tokio::spawn(syscalls_broadcast_loop());
+    tokio::spawn(auto_restart_loop(app.clone(), auto_restart_interval_rx));
 
     let cert_path = app.config_dir.join("web_cert.pem");
     let key_path = app.config_dir.join("web_key.pem");
-    if !cert_path.exists() || !key_path.exists() {
+    if !cert_path.exists() && !key_path.exists() {
         let mut subject_alt_names = vec!["localhost".to_string(), "127.0.0.1".to_string()];
         if let Ok(hostname) = std::fs::read_to_string("/etc/hostname") {
             let hostname = hostname.trim().to_string();
@@ -1448,21 +2114,32 @@ async fn main() -> Result<()> {
                         .await;
             }
         }
+    } else if !cert_path.exists() || !key_path.exists() {
+        anyhow::bail!(
+            "incomplete WEB TLS certificate pair in {}; restore both web_cert.pem and web_key.pem",
+            app.config_dir.display()
+        );
     }
 
     let tls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert_path, &key_path)
         .await
         .context("load web cert")?;
 
+    #[cfg(unix)]
+    tokio::spawn(web_tls_reload_loop(
+        tls_config.clone(),
+        cert_path.clone(),
+        key_path.clone(),
+    ));
+
     let protocol_runtime = protocol::start(app.clone()).await?;
     let mut protocol_status = protocol_runtime.status_receiver();
     let mut web_task = tokio::spawn(async move { web_panel::run(web_app, tls_config).await });
     tokio::spawn(protocol::session_janitor(app.clone()));
     tokio::spawn(protocol::password_janitor(app.clone()));
+    tokio::spawn(device_epoch_sweeper(app.clone()));
 
-    let cpu_app = stats_app.clone();
-    tokio::spawn(cpu_loop(cpu_app));
-    tokio::spawn(stats_loop(stats_app));
+    tokio::spawn(cpu_loop(app.clone()));
 
     let monitor_app = app.clone();
     tokio::spawn(local_proxy_monitor_loop(monitor_app));
@@ -1485,8 +2162,8 @@ async fn main() -> Result<()> {
                     .borrow()
                     .clone()
                     .map(anyhow::Error::msg)
-                    .unwrap_or_else(|| anyhow::anyhow!("io_uring dataplane stopped unexpectedly")),
-                Err(_) => anyhow::anyhow!("io_uring dataplane status channel closed"),
+                    .unwrap_or_else(|| anyhow::anyhow!("tokio dataplane stopped unexpectedly")),
+                Err(_) => anyhow::anyhow!("tokio dataplane status channel closed"),
             });
         }
     }
@@ -1503,23 +2180,34 @@ async fn main() -> Result<()> {
 
     log_event(&app, "INFO", "SHUTDOWN", "Stopping server...");
 
-    let _proxy_operation = app.proxy_operation.lock().await;
-    let proxy_route = app.proxy_route.write().await.take();
-    if let Some(route) = proxy_route {
-        route.deactivate().await;
-    }
-    if let Err(error) = proxy_route::ProxyRoute::cleanup_orphaned_policy().await
-        && terminal_error.is_none()
+    let proxy_cleanup = async {
+        let _proxy_operation = app.proxy_operation.lock().await;
+        let proxy_route = app.proxy_route.write().await.take();
+        if let Some(route) = proxy_route {
+            route.deactivate().await;
+        }
+    };
+    if tokio::time::timeout(Duration::from_secs(6), proxy_cleanup)
+        .await
+        .is_err()
     {
-        terminal_error = Some(error.context("cleanup CSQTT proxy policy during shutdown"));
+        eprintln!("[PROXY] shutdown cleanup timed out");
     }
 
+    protocol::flush_traffic(&app).await;
     let final_revision = {
         let db = app.db.read().await;
         app.db_persistence.submit(db.clone())
     };
-    if let Err(error) = app.db_persistence.wait(final_revision).await {
-        eprintln!("[DB] final save: {error:#}");
+    match tokio::time::timeout(
+        Duration::from_secs(1),
+        app.db_persistence.wait(final_revision),
+    )
+    .await
+    {
+        Ok(Err(error)) => eprintln!("[DB] final save: {error:#}"),
+        Err(_) => eprintln!("[DB] final save timed out"),
+        Ok(Ok(())) => {}
     }
 
     protocol::drop_all_sessions(&app);
@@ -1527,6 +2215,134 @@ async fn main() -> Result<()> {
         Some(error) => Err(error),
         None => Ok(()),
     }
+}
+
+async fn run_tproxy_child(
+    port: Option<u16>,
+    status_path: Option<std::path::PathBuf>,
+) -> Result<()> {
+    let port = port.context("TPROXY child port is missing")?;
+    let status_path = status_path.context("TPROXY child status path is missing")?;
+    let mut payload = String::new();
+    std::io::stdin()
+        .read_to_string(&mut payload)
+        .context("read TPROXY child bootstrap")?;
+    let profile: model::LocalProxyProfile =
+        serde_json::from_str(&payload).context("decode TPROXY child bootstrap")?;
+    proxy_route::validate_config(&profile)?;
+    arm_tproxy_child_parent_death()?;
+    let sockets =
+        tproxy::bind_sockets(port).with_context(|| format!("bind TPROXY child {port}"))?;
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let child_log: proxy_route::LogFn = Arc::new(|level: &str, message: &str| {
+        eprintln!("[TPROXY] [{level}] {message}");
+    });
+    let stats = Arc::new(tproxy::TproxyStats::default());
+    let quotas = tproxy::DeviceQuotaRegistry::new();
+    let mut status = tokio::spawn(serve_tproxy_status(
+        status_path,
+        cancel.clone(),
+        stats.clone(),
+    ));
+    let engine = tproxy::run(
+        sockets,
+        Arc::new(profile),
+        cancel.clone(),
+        child_log,
+        stats,
+        quotas,
+    );
+    tokio::pin!(engine);
+    let result = tokio::select! {
+        result = &mut engine => {
+            cancel.cancel();
+            let _ = (&mut status).await;
+            result
+        },
+        result = &mut status => {
+            cancel.cancel();
+            let _ = engine.await;
+            result.context("TPROXY child status worker")??;
+            bail!("TPROXY child status worker stopped")
+        },
+        _ = shutdown_signal() => {
+            cancel.cancel();
+            let result = engine.await;
+            let _ = (&mut status).await;
+            result
+        }
+    };
+    let (tcp_sessions, udp_flows, udp_datagrams) = result;
+    eprintln!(
+        "[TPROXY] child exited ({tcp_sessions} TCP sessions, {udp_flows} UDP flows, {udp_datagrams} UDP datagrams served)"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn serve_tproxy_status(
+    path: std::path::PathBuf,
+    cancel: tokio_util::sync::CancellationToken,
+    stats: Arc<tproxy::TproxyStats>,
+) -> Result<()> {
+    let _ = std::fs::remove_file(&path);
+    let listener = tokio::net::UnixListener::bind(&path).context("bind TPROXY status socket")?;
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            accepted = listener.accept() => {
+                let Ok((mut stream, _)) = accepted else {
+                    continue;
+                };
+                let mut request = [0u8; 1];
+                let received = tokio::time::timeout(Duration::from_millis(100), stream.read_exact(&mut request)).await;
+                if !matches!(received, Ok(Ok(_))) || request[0] != 0x53 {
+                    continue;
+                }
+                let Ok(payload) = serde_json::to_vec(&stats.snapshot()) else {
+                    continue;
+                };
+                let _ = tokio::time::timeout(Duration::from_millis(100), stream.write_all(&payload)).await;
+            }
+        }
+    }
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn serve_tproxy_status(
+    _path: std::path::PathBuf,
+    _cancel: tokio_util::sync::CancellationToken,
+    _stats: Arc<tproxy::TproxyStats>,
+) -> Result<()> {
+    bail!("TPROXY status socket is supported only on Unix")
+}
+
+#[cfg(target_os = "linux")]
+fn arm_tproxy_child_parent_death() -> Result<()> {
+    let result = unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error()).context("arm TPROXY parent-death signal");
+    }
+    let docker_mode = std::env::var("CSQTT_SERVICE_MANAGER").is_ok_and(|value| value == "docker");
+    if tproxy_parent_exited_during_startup(unsafe { libc::getppid() }, docker_mode) {
+        bail!("TPROXY parent exited before child startup");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn tproxy_parent_exited_during_startup(parent_pid: libc::pid_t, docker_mode: bool) -> bool {
+    // In a container csqtt itself is normally PID 1, so its healthy TPROXY
+    // child legitimately sees PPID=1. PR_SET_PDEATHSIG above still handles
+    // real parent termination in both service-manager modes.
+    parent_pid == 1 && !docker_mode
+}
+
+#[cfg(not(target_os = "linux"))]
+fn arm_tproxy_child_parent_death() -> Result<()> {
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -1544,24 +2360,26 @@ unsafe fn libc_geteuid() -> u32 {
 
 async fn local_proxy_monitor_loop(app: Arc<App>) {
     const PORT_CHECK: Duration = Duration::from_secs(3);
-    const HEALTH_INTERVAL: Duration = Duration::from_secs(10);
-    const IDLE_INTERVAL: Duration = Duration::from_secs(5);
     const STRIKES_BEFORE_PAUSE: u32 = 5;
     const PAUSE_SCHEDULE: [u64; 4] = [30, 90, 120, 120];
 
     let mut port_failures: u32 = 0;
     let mut pause_round: u32 = 0;
-    let mut health_failures: u8 = 0;
-    let mut wait = Duration::from_secs(2);
+    let mut wait = Some(Duration::from_millis(200));
 
     loop {
-        tokio::select! {
-            _ = tokio::time::sleep(wait) => {}
-            _ = app.proxy_trigger.notified() => {
-                port_failures = 0;
-                pause_round = 0;
-                health_failures = 0;
+        if let Some(delay) = wait {
+            tokio::select! {
+                _ = tokio::time::sleep(delay) => {}
+                _ = app.proxy_trigger.notified() => {
+                    port_failures = 0;
+                    pause_round = 0;
+                }
             }
+        } else {
+            app.proxy_trigger.notified().await;
+            port_failures = 0;
+            pause_round = 0;
         }
 
         let _operation = app.proxy_operation.lock().await;
@@ -1571,7 +2389,7 @@ async fn local_proxy_monitor_loop(app: Arc<App>) {
         };
 
         let Some(profile) = profile else {
-            *app.proxy_health_error.write().unwrap() = None;
+            *write_unpoison(&app.proxy_health_error) = None;
             let old = app.proxy_route.write().await.take();
             if let Some(route) = old {
                 route.deactivate().await;
@@ -1581,13 +2399,11 @@ async fn local_proxy_monitor_loop(app: Arc<App>) {
                     "PROXY",
                     "Local SOCKS5 routing disabled; direct VPS route restored",
                 );
-            } else {
-                proxy_route::ProxyRoute::cleanup_stale_policy().await;
+                schedule_proxy_shutdown_compaction(&app);
             }
             port_failures = 0;
             pause_round = 0;
-            health_failures = 0;
-            wait = IDLE_INTERVAL;
+            wait = None;
             continue;
         };
 
@@ -1598,7 +2414,8 @@ async fn local_proxy_monitor_loop(app: Arc<App>) {
         if let Some(route) = current {
             if route.is_alive() && route.matches(&profile) {
                 if !proxy_route::port_is_listening(profile.port).await {
-                    *app.proxy_health_error.write().unwrap() = Some(format!("Порт {} не отвечает", profile.port));
+                    *write_unpoison(&app.proxy_health_error) =
+                        Some(format!("Порт {} не отвечает", profile.port));
                     app.proxy_port_listening
                         .store(false, std::sync::atomic::Ordering::Release);
                     let failed = app.proxy_route.write().await.take();
@@ -1614,48 +2431,17 @@ async fn local_proxy_monitor_loop(app: Arc<App>) {
                             profile.port
                         ),
                     );
+                    schedule_proxy_shutdown_compaction(&app);
                     port_failures = 1;
                     pause_round = 0;
-                    health_failures = 0;
-                    wait = PORT_CHECK;
+                    wait = Some(PORT_CHECK);
                 } else {
                     app.proxy_port_listening
                         .store(true, std::sync::atomic::Ordering::Release);
-                    match proxy_route::probe_proxy(&profile).await {
-                        Ok(()) => {
-                            *app.proxy_health_error.write().unwrap() = None;
-                            health_failures = 0;
-                            port_failures = 0;
-                            pause_round = 0;
-                            wait = HEALTH_INTERVAL;
-                        }
-                        Err(error) => {
-                            *app.proxy_health_error.write().unwrap() = Some(format!("{error:#}"));
-                            health_failures = health_failures.saturating_add(1);
-                            log_event(
-                                &app,
-                                "WARNING",
-                                "PROXY",
-                                &format!(
-                                    "Local SOCKS5 health check failed ({health_failures}/2): {error:#}"
-                                ),
-                            );
-                            if health_failures >= 2 {
-                                let failed = app.proxy_route.write().await.take();
-                                if let Some(failed) = failed {
-                                    failed.deactivate().await;
-                                }
-                                log_event(
-                                    &app,
-                                    "WARNING",
-                                    "PROXY",
-                                    "SOCKS5 route removed; clients continue through the main VPS",
-                                );
-                                health_failures = 0;
-                            }
-                            wait = PORT_CHECK;
-                        }
-                    }
+                    *write_unpoison(&app.proxy_health_error) = None;
+                    port_failures = 0;
+                    pause_round = 0;
+                    wait = Some(PORT_CHECK);
                 }
                 continue;
             }
@@ -1663,8 +2449,9 @@ async fn local_proxy_monitor_loop(app: Arc<App>) {
             let stale = app.proxy_route.write().await.take();
             if let Some(stale) = stale {
                 stale.deactivate().await;
+                schedule_proxy_shutdown_compaction(&app);
             }
-            wait = Duration::from_millis(100);
+            wait = Some(Duration::from_millis(100));
             continue;
         }
 
@@ -1672,7 +2459,8 @@ async fn local_proxy_monitor_loop(app: Arc<App>) {
         app.proxy_port_listening
             .store(listening, std::sync::atomic::Ordering::Release);
         if !listening {
-            *app.proxy_health_error.write().unwrap() = Some(format!("Порт {} не отвечает", profile.port));
+            *write_unpoison(&app.proxy_health_error) =
+                Some(format!("Порт {} не отвечает", profile.port));
             if port_failures == 0 {
                 log_event(
                     &app,
@@ -1689,16 +2477,15 @@ async fn local_proxy_monitor_loop(app: Arc<App>) {
                 port_failures = 0;
                 let pause = PAUSE_SCHEDULE[(pause_round as usize).min(PAUSE_SCHEDULE.len() - 1)];
                 pause_round = pause_round.saturating_add(1);
-                wait = Duration::from_secs(pause);
+                wait = Some(Duration::from_secs(pause));
             } else {
-                wait = PORT_CHECK;
+                wait = Some(PORT_CHECK);
             }
             continue;
         }
 
         port_failures = 0;
         pause_round = 0;
-        health_failures = 0;
         log_event(
             &app,
             "INFO",
@@ -1714,7 +2501,7 @@ async fn local_proxy_monitor_loop(app: Arc<App>) {
         });
         match proxy_route::ProxyRoute::connect(&profile, proxy_log).await {
             Ok(route) => {
-                *app.proxy_health_error.write().unwrap() = None;
+                *write_unpoison(&app.proxy_health_error) = None;
                 app.proxy_route.write().await.replace(route);
                 log_event(
                     &app,
@@ -1725,11 +2512,10 @@ async fn local_proxy_monitor_loop(app: Arc<App>) {
                         profile.port
                     ),
                 );
-                wait = HEALTH_INTERVAL;
+                wait = Some(PORT_CHECK);
             }
             Err(error) => {
-                *app.proxy_health_error.write().unwrap() = Some(format!("{error:#}"));
-                proxy_route::ProxyRoute::cleanup_stale_policy().await;
+                *write_unpoison(&app.proxy_health_error) = Some(format!("{error:#}"));
                 log_event(
                     &app,
                     "ERROR",
@@ -1738,7 +2524,7 @@ async fn local_proxy_monitor_loop(app: Arc<App>) {
                         "Local SOCKS5 is not ready: {error:#}. Direct VPS route is active; retry in 3s"
                     ),
                 );
-                wait = PORT_CHECK;
+                wait = Some(PORT_CHECK);
             }
         }
     }
@@ -1746,7 +2532,36 @@ async fn local_proxy_monitor_loop(app: Arc<App>) {
 
 #[cfg(test)]
 mod lock_tests {
-    use super::{CpuSnapshot, cpu_percentage, normalize_dns, parse_host_cpu, parse_process_cpu};
+    use super::{
+        CpuSnapshot, LOG_TRUNCATION_SUFFIX, MAX_LOG_RECORD_BYTES, cpu_percentage,
+        format_log_record, normalize_dns, parse_host_cpu, parse_process_cpu,
+    };
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn docker_tproxy_child_accepts_a_healthy_pid_one_parent() {
+        assert!(super::tproxy_parent_exited_during_startup(1, false));
+        assert!(!super::tproxy_parent_exited_during_startup(1, true));
+        assert!(!super::tproxy_parent_exited_during_startup(42, false));
+    }
+
+    #[test]
+    fn log_record_is_utf8_safe_and_byte_bounded() {
+        let record =
+            format_log_record("22 Aug 26 12:00", "INFO", &"\u{0451}\u{0436}".repeat(2_000));
+
+        assert!(record.len() <= MAX_LOG_RECORD_BYTES);
+        assert!(std::str::from_utf8(record.as_bytes()).is_ok());
+        assert!(record.ends_with(LOG_TRUNCATION_SUFFIX));
+    }
+
+    #[test]
+    fn log_record_caps_an_oversized_level() {
+        let record = format_log_record("22 Aug 26 12:00", &"\u{041b}".repeat(2_000), "ok");
+
+        assert!(record.len() <= MAX_LOG_RECORD_BYTES);
+        assert!(std::str::from_utf8(record.as_bytes()).is_ok());
+    }
 
     #[test]
     fn dns_override_accepts_one_or_two_ipv4_addresses() {

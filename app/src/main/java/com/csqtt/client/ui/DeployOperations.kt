@@ -12,7 +12,6 @@ import net.schmizz.sshj.xfer.FileSystemFile
 import net.schmizz.sshj.transport.verification.PromiscuousVerifier
 import net.schmizz.sshj.userauth.UserAuthException
 import net.schmizz.sshj.userauth.method.AuthKeyboardInteractive
-import net.schmizz.sshj.userauth.method.AuthPassword
 import net.schmizz.sshj.userauth.method.PasswordResponseProvider
 import net.schmizz.sshj.userauth.password.PasswordUtils
 import org.bouncycastle.jce.provider.BouncyCastleProvider
@@ -30,9 +29,50 @@ import org.json.JSONObject
 
 private const val CMD_TIMEOUT = CsqttConstants.Timeouts.DEPLOY_CMD_TIMEOUT_MS
 private const val SFTP_UPLOAD_ATTEMPTS = 2
+private const val UPLOAD_RECONNECT_ATTEMPTS = 1
+
+/**
+ * SSH passwords are protocol data, not shell text. Spaces and punctuation are
+ * valid and must arrive at SSHJ unchanged; only pasted line breaks are removed
+ * because neither password SSH nor sudo can represent them as one prompt.
+ */
+internal fun sanitizeSshPassword(value: String): String =
+    value.replace("\r", "").replace("\n", "")
 
 internal fun isSuccessfulDeployResult(exitStatus: Int, output: String): Boolean =
     exitStatus == 0 && output.lineSequence().any { it.trim() == "CSQTT_DEPLOY_OK" }
+
+internal fun isSuccessfulPrepareResult(exitStatus: Int, output: String): Boolean =
+    exitStatus == 0 && output.lineSequence().any { it.trim() == "CSQTT_DEPLOY_READY_FOR_UPLOAD" }
+
+private fun deployFailureDetail(output: String): String? =
+    output.lineSequence()
+        .map(String::trim)
+        .lastOrNull { it.startsWith("CSQTT_DEPLOY_ERROR|") }
+        ?.split("|", limit = 3)
+        ?.getOrNull(2)
+        ?.trim()
+        ?.takeIf(String::isNotEmpty)
+        ?.take(360)
+
+internal fun deployFailureMessage(exitStatus: Int, output: String): String {
+    val detail = deployFailureDetail(output)
+    fun withDetail(message: String): String =
+        if (detail == null) message else "$message Причина: $detail"
+
+    return when {
+        output.lineSequence().any { it.trim() == "CSQTT_DEPLOY_ROLLED_BACK" } || exitStatus == 30 ->
+            withDetail("Новый релиз не прошёл проверку; предыдущая установка восстановлена")
+        output.lineSequence().any { it.trim() == "CSQTT_DEPLOY_ROLLBACK_FAILED" } || exitStatus == 31 ->
+            withDetail("Новый релиз не запустился, а автоматический rollback завершился с ошибкой — требуется проверка VPS")
+        exitStatus == 20 ->
+            withDetail("Кандидат не прошёл предзапусковую проверку; работающий сервер не останавливался")
+        exitStatus == 2 ->
+            withDetail("Установщик отклонил параметры развёртывания")
+        else ->
+            detail ?: "Установщик завершился с кодом $exitStatus; подробности сохранены в errors.log"
+    }
+}
 
 internal fun friendlyDeployError(message: String?): String {
     val text = message.orEmpty()
@@ -44,6 +84,8 @@ internal fun friendlyDeployError(message: String?): String {
             "SSH-аутентификация отклонена: проверьте логин, пароль и разрешение PasswordAuthentication на VPS"
         text.contains("authentication", ignoreCase = true) ->
             "SSH-аутентификация отклонена: проверьте логин, пароль и разрешение PasswordAuthentication на VPS"
+        text.contains("SFTP/SCP upload failed", ignoreCase = true) ->
+            "Загрузка на VPS оборвалась даже после автоматического переподключения SSH; проверьте стабильность Wi-Fi и подробную причину в errors.log"
         text.contains("reject HostKey", ignoreCase = true) ||
             text.contains("HostKey", ignoreCase = true) ||
             text.contains("host key", ignoreCase = true) ->
@@ -76,7 +118,14 @@ private val DEPLOY_STATUS_PREFIX = Regex("^\\[(?:OK|ERR|LOG|WARN|✓|!|✗|►)]
 
 internal fun parseDeployOutputLine(rawLine: String): DeployOutputLine? {
     val raw = rawLine.replace(ANSI_ESCAPE, "").trim()
-    if (raw.isEmpty() || raw.startsWith("CSQTT_PROGRESS|") || raw == "CSQTT_DEPLOY_OK") return null
+    if (
+        raw.isEmpty() ||
+            raw.startsWith("CSQTT_PROGRESS|") ||
+            raw.startsWith("CSQTT_DEPLOY_ERROR|") ||
+            raw == "CSQTT_DEPLOY_OK" ||
+            raw == "CSQTT_DEPLOY_ROLLED_BACK" ||
+            raw == "CSQTT_DEPLOY_ROLLBACK_FAILED"
+    ) return null
 
     val warning = raw.startsWith("[WARN]", ignoreCase = true) || raw.startsWith("[!]") || raw.startsWith("⚠")
     val explicitError = raw.startsWith("[ERR]", ignoreCase = true) || raw.startsWith("[✗]") || raw.startsWith("✗")
@@ -135,13 +184,37 @@ private fun readableFileSize(bytes: Long): String = when {
 
 private data class SSHExecResult(val output: String, val exitStatus: Int)
 
-private class DeploySSHClient(private val ssh: SshjClient, private val sudoPass: String) {
+private class DeploySSHClient(
+    private var ssh: SshjClient,
+    private val sudoPass: String,
+    private val reconnect: ((String) -> SshjClient)? = null,
+) {
+
+    private fun reconnectFor(stage: String): Boolean {
+        val factory = reconnect ?: return false
+        return try {
+            runCatching { ssh.disconnect() }
+            TunnelManager.addDeployInfoLog("SSH-соединение восстановление: $stage")
+            ssh = factory(stage)
+            DeployManager.activeSession = ssh
+            TunnelManager.addDeploySuccessLog("SSH-соединение восстановлено")
+            true
+        } catch (error: Exception) {
+            DeployManager.writeError(
+                "SSH reconnect failed during $stage (${error.javaClass.simpleName}): ${error.message}",
+            )
+            false
+        }
+    }
+
+    private fun ensureConnected(stage: String): Boolean =
+        ssh.isConnected || reconnectFor(stage)
 
     fun exec(command: String, timeout: Long = CMD_TIMEOUT): String =
         execResult(command, timeout).output
 
     fun execResult(command: String, timeout: Long = CMD_TIMEOUT): SSHExecResult {
-        if (!ssh.isConnected) {
+        if (!ensureConnected("команда")) {
             DeployManager.writeError("SSH exec: клиент отключён перед командой: ${command.take(80)}")
             return SSHExecResult("error: session is down", -1)
         }
@@ -233,16 +306,21 @@ private class DeploySSHClient(private val ssh: SshjClient, private val sudoPass:
     }
 
     fun upload(localFile: File, remotePath: String) {
+        uploadInternal(localFile, remotePath, UPLOAD_RECONNECT_ATTEMPTS)
+    }
+
+    private fun uploadInternal(localFile: File, remotePath: String, reconnectsLeft: Int) {
         if (!localFile.isFile || !localFile.canRead()) {
             throw IOException("Local deploy file is unavailable: ${localFile.name}")
         }
-        if (!ssh.isConnected) {
+        if (!ensureConnected("загрузка ${deployAssetLabel(localFile.name)}")) {
             throw IOException("SSH client disconnected before upload: ${localFile.name}")
         }
 
         val label = deployAssetLabel(localFile.name)
         TunnelManager.addDeployInfoLog("Загрузка: $label (${readableFileSize(localFile.length())})")
         var sftpSuccess = false
+        var lastError = "SFTP channel did not accept the file"
         repeat(SFTP_UPLOAD_ATTEMPTS) { attempt ->
             try {
                 ssh.newSFTPClient().use { sftp ->
@@ -255,6 +333,7 @@ private class DeploySSHClient(private val ssh: SshjClient, private val sudoPass:
                     }
                 }
             } catch (e: Exception) {
+                lastError = "SFTP: ${e.message ?: e.javaClass.simpleName}"
                 DeployManager.writeError(
                     "SFTP upload attempt ${attempt + 1}/$SFTP_UPLOAD_ATTEMPTS failed: " +
                         "${e.message} | file: ${localFile.name}"
@@ -272,6 +351,7 @@ private class DeploySSHClient(private val ssh: SshjClient, private val sudoPass:
                 TunnelManager.addDeploySuccessLog("Загружено (SCP): $label")
                 return
             } catch (e: Exception) {
+                lastError = "SCP: ${e.message ?: e.javaClass.simpleName}"
                 DeployManager.writeError("SCP upload failed: ${e.message} | file: ${localFile.name}")
             }
         }
@@ -281,36 +361,43 @@ private class DeploySSHClient(private val ssh: SshjClient, private val sudoPass:
                 DeployManager.writeError("Falling back to chunked stream upload for ${localFile.name}...")
                 val tempRemote = "$remotePath.tmp"
                 execResult(rootCommand("rm -f '$tempRemote'"), 30000L)
-                val inputStream = localFile.inputStream().buffered(64 * 1024)
-                val buffer = ByteArray(64 * 1024)
-                var bytesRead: Int
-                var totalUploaded = 0L
-                val totalLength = localFile.length()
-                while (inputStream.read(buffer).also { bytesRead = it } != -1) {
-                    val chunk = if (bytesRead == buffer.size) buffer else buffer.copyOf(bytesRead)
-                    val base64 = android.util.Base64.encodeToString(chunk, android.util.Base64.NO_WRAP)
-                    val cmd = "printf '%s' '$base64' | base64 -d >> '$tempRemote'"
-                    val res = execResult(rootCommand(cmd), 60000L)
-                    if (res.exitStatus != 0) {
-                        throw IOException("Chunk upload failed at offset $totalUploaded")
+                localFile.inputStream().buffered(64 * 1024).use { inputStream ->
+                    val buffer = ByteArray(64 * 1024)
+                    var bytesRead: Int
+                    var totalUploaded = 0L
+                    val totalLength = localFile.length()
+                    while (inputStream.read(buffer).also { bytesRead = it } != -1) {
+                        val chunk = if (bytesRead == buffer.size) buffer else buffer.copyOf(bytesRead)
+                        val base64 = android.util.Base64.encodeToString(chunk, android.util.Base64.NO_WRAP)
+                        val cmd = "printf '%s' '$base64' | base64 -d >> '$tempRemote'"
+                        val res = execResult(rootCommand(cmd), 60000L)
+                        if (res.exitStatus != 0) {
+                            throw IOException("Chunk upload failed at offset $totalUploaded")
+                        }
+                        totalUploaded += bytesRead
+                        val percent = (totalUploaded.toFloat() / totalLength.toFloat().coerceAtLeast(1f)).coerceIn(0f, 1f)
+                        DeployManager.updateProgress(percent * 0.5f, "Загрузка: $label (${(percent * 100).toInt()}%)")
                     }
-                    totalUploaded += bytesRead
-                    val percent = (totalUploaded.toFloat() / totalLength.toFloat().coerceAtLeast(1f)).coerceIn(0f, 1f)
-                    DeployManager.updateProgress(percent * 0.5f, "Загрузка: $label (${(percent * 100).toInt()}%)")
                 }
-                inputStream.close()
                 val moveRes = execResult(rootCommand("mv -f '$tempRemote' '$remotePath' && chmod 0755 '$remotePath'"), 30000L)
                 if (moveRes.exitStatus == 0) {
                     TunnelManager.addDeploySuccessLog("Загружено (Stream): $label")
                     return
                 }
             } catch (e: Exception) {
+                lastError = "stream: ${e.message ?: e.javaClass.simpleName}"
                 DeployManager.writeError("Stream upload failed: ${e.message} | file: ${localFile.name}")
             }
         }
 
-        TunnelManager.addDeployErrorLog("Не удалось загрузить $label")
-        throw IOException("SFTP/SCP upload failed for ${localFile.name}")
+        if (reconnectsLeft > 0 && reconnectFor("повторная загрузка $label")) {
+            uploadInternal(localFile, remotePath, reconnectsLeft - 1)
+            return
+        }
+
+        val message = "SFTP/SCP upload failed for ${localFile.name}: $lastError"
+        TunnelManager.addDeployErrorLog("Не удалось загрузить $label: $lastError")
+        throw IOException(message)
     }
 }
 
@@ -370,15 +457,31 @@ private fun createSSHClient(
         }
     } else {
         try {
-            val passChars = pass.toCharArray()
-            val authMethods = listOf(
-                AuthPassword(PasswordUtils.createOneOff(passChars)),
-                AuthKeyboardInteractive(PasswordResponseProvider(PasswordUtils.createOneOff(passChars)))
-            )
-            ssh.auth(user, authMethods)
-        } catch (e: UserAuthException) {
-            DeployManager.writeError("SSH auth failed: ${e.message}")
-            throw IOException("Auth fail (password): ${e.message}", e)
+            // `authPassword` carries the exact Kotlin String to SSHJ, which
+            // is important for passwords containing spaces or punctuation.
+            ssh.authPassword(user, pass)
+        } catch (passwordError: UserAuthException) {
+            try {
+                // Some hosting panels expose password auth only through the
+                // keyboard-interactive method. Use a fresh character array;
+                // a one-off provider may consume its input while answering.
+                ssh.auth(
+                    user,
+                    listOf(
+                        AuthKeyboardInteractive(
+                            PasswordResponseProvider(
+                                PasswordUtils.createOneOff(pass.toCharArray()),
+                            ),
+                        ),
+                    ),
+                )
+            } catch (keyboardError: UserAuthException) {
+                DeployManager.writeError(
+                    "SSH password auth failed: password=${passwordError.message}; " +
+                        "keyboard-interactive=${keyboardError.message}",
+                )
+                throw IOException("Auth fail (password): ${keyboardError.message}", keyboardError)
+            }
         }
     }
 
@@ -444,15 +547,17 @@ internal suspend fun performDeploy(
         TunnelManager.beginDeployLog("Начало установки на $host:$port")
         onProgress(0.02f, "Подключение...")
 
-        // Stop the VPN so SSH traffic doesn't get routed to a dying tunnel
-        TunnelManager.addDeployInfoLog("Подготовка сети Android и остановка активного VPN")
-        TunnelManager.stop()
-        kotlinx.coroutines.delay(1500) // Wait for Android routing to settle
-
+        TunnelManager.addDeployInfoLog("SSH/SFTP используют текущий системный маршрут")
         TunnelManager.addDeployInfoLog("Подключение к VPS по SSH")
-        ssh = createSSHClient(host, user, pass, port, privateKey, keyPassphrase)
-        DeployManager.activeSession = ssh
-        val sshClient = DeploySSHClient(ssh, pass)
+        val initialSsh = createSSHClient(host, user, pass, port, privateKey, keyPassphrase)
+        ssh = initialSsh
+        DeployManager.activeSession = initialSsh
+        val sshClient = DeploySSHClient(initialSsh, pass) { stage ->
+            TunnelManager.addDeployInfoLog("Повторное SSH-подключение: $stage")
+            createSSHClient(host, user, pass, port, privateKey, keyPassphrase).also {
+                ssh = it
+            }
+        }
         TunnelManager.addDeploySuccessLog("SSH-соединение установлено")
 
         onProgress(0.05f, "Подготовка файлов...")
@@ -497,19 +602,37 @@ internal suspend fun performDeploy(
         }
         TunnelManager.addDeploySuccessLog("Файлы установки подготовлены")
 
-        onProgress(0.06f, "Загрузка на сервер...")
+        onProgress(0.06f, "Подготовка сервера...")
         sshClient.upload(scriptFile, "/tmp/deploy.sh")
-        sshClient.upload(serverFile, "/tmp/csqtt")
-        sshClient.upload(environmentFile, "/tmp/csqtt.env")
-        sshClient.upload(overridesFile, "/tmp/csqtt-deploy.json")
 
-        onProgress(0.08f, "Установка...")
+        TunnelManager.addDeployInfoLog("Остановка старого CSQTT и очистка runtime с сохранением SQLite")
+        val deployEnvironment =
+            "env CSQTT_PEER_PORT=$peerPort CSQTT_SSH_PORT=$port CSQTT_WEB_PORT=$webPort " +
+                "CSQTT_DEPLOY_MODE=${deployMode(installInDocker)}"
+        val prepareResult = sshClient.execResult(
+            rootCommand("$deployEnvironment bash /tmp/deploy.sh prepare"),
+            timeout = CMD_TIMEOUT,
+        )
+        if (!isSuccessfulPrepareResult(prepareResult.exitStatus, prepareResult.output)) {
+            DeployManager.writeError(
+                "Deploy prepare failed: exit=${prepareResult.exitStatus}" +
+                    "\n${prepareResult.output.takeLast(1200)}"
+            )
+            val failureMessage = deployFailureMessage(prepareResult.exitStatus, prepareResult.output)
+            TunnelManager.addDeployErrorLog(failureMessage)
+            DeployManager.stopDeploy(failureMessage)
+            return@withContext false
+        }
+
+        onProgress(0.14f, "Загрузка нового сервера...")
+        sshClient.upload(serverFile, "/tmp/.csqtt-upload-server")
+        sshClient.upload(environmentFile, "/tmp/.csqtt-upload-web.env")
+        sshClient.upload(overridesFile, "/tmp/.csqtt-upload-overrides.json")
+
+        onProgress(0.18f, "Установка нового сервера...")
         TunnelManager.addDeployInfoLog("Запуск установщика на VPS")
         val deployResult = sshClient.execResult(
-            rootCommand(
-                "env CSQTT_PEER_PORT=$peerPort CSQTT_SSH_PORT=$port CSQTT_WEB_PORT=$webPort " +
-                    "CSQTT_DEPLOY_MODE=${deployMode(installInDocker)} bash /tmp/deploy.sh"
-            ),
+            rootCommand("$deployEnvironment bash /tmp/deploy.sh install"),
             timeout = CMD_TIMEOUT
         )
         val output = deployResult.output
@@ -529,10 +652,9 @@ internal suspend fun performDeploy(
                 "Deploy failed: exit=${deployResult.exitStatus}, success marker=${output.contains("CSQTT_DEPLOY_OK")}" +
                     "\n${output.takeLast(1200)}"
             )
-            TunnelManager.addDeployErrorLog(
-                "Установщик завершился с кодом ${deployResult.exitStatus}; подробности сохранены в errors.log"
-            )
-            DeployManager.stopDeploy("Ошибка выполнения скрипта (см. errors.log)")
+            val failureMessage = deployFailureMessage(deployResult.exitStatus, output)
+            TunnelManager.addDeployErrorLog(failureMessage)
+            DeployManager.stopDeploy(failureMessage)
             return@withContext false
         }
     } catch (e: CancellationException) {
@@ -569,6 +691,7 @@ internal suspend fun performUninstall(
     try {
         TunnelManager.beginDeployLog("Начало удаления с $host:$port")
         onProgress(0.05f, "Подключение...")
+        TunnelManager.addDeployInfoLog("SSH/SFTP используют текущий системный маршрут")
         TunnelManager.addDeployInfoLog("Подключение к VPS по SSH")
         ssh = createSSHClient(host, user, pass, port, privateKey, keyPassphrase)
         DeployManager.activeSession = ssh
@@ -581,7 +704,7 @@ internal suspend fun performUninstall(
             rootCommand(
                 "if command -v docker >/dev/null 2>&1; then " +
                     "docker rm -f csqtt >/dev/null 2>&1 || true; " +
-                    "docker image rm csqtt:2.0.0 >/dev/null 2>&1 || true; fi; " +
+                    "docker image rm csqtt:2.0.6 >/dev/null 2>&1 || true; fi; " +
                     "systemctl unmask csqtt 2>/dev/null || true; " +
                 "systemctl stop csqtt 2>/dev/null || true; " +
                     "systemctl disable csqtt 2>/dev/null || true; " +
@@ -624,8 +747,9 @@ internal suspend fun performUninstall(
         sshClient.exec(
             rootCommand(
                 "ip link show csqtt1 >/dev/null 2>&1 && ip link del csqtt1 2>/dev/null || true; " +
-                    "[ -d /etc/csqtt ] && find /etc/csqtt -mindepth 1 -maxdepth 1 ! -name passwords.json -exec rm -rf {} + 2>/dev/null || true; " +
-                    "[ -f /etc/csqtt/passwords.json ] && chmod 600 /etc/csqtt/passwords.json 2>/dev/null || true"
+                    "if [ -d /etc/csqtt ]; then chmod 700 /etc/csqtt 2>/dev/null || true; " +
+                    "for f in csqtt.db csqtt.db-wal csqtt.db-shm; do [ -f /etc/csqtt/\$f ] && chmod 600 /etc/csqtt/\$f 2>/dev/null || true; done; " +
+                    "fi"
             ),
             timeout = 10000L
         )

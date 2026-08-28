@@ -70,54 +70,113 @@ fn pick_weighted(pool: &[WeightedProfile]) -> (Impersonate, ImpersonateOS) {
     (last.impersonate, last.os)
 }
 
+fn weighted_browser_pool(
+    versions: &[(Impersonate, u32)],
+    operating_systems: &[(ImpersonateOS, u32)],
+) -> Vec<WeightedProfile> {
+    versions
+        .iter()
+        .flat_map(|(impersonate, version_weight)| {
+            operating_systems
+                .iter()
+                .map(move |(os, os_weight)| wp(*impersonate, *os, version_weight * os_weight))
+        })
+        .collect()
+}
+
 fn chrome_pool() -> Vec<WeightedProfile> {
-    vec![
-        wp(Impersonate::ChromeV148, ImpersonateOS::Windows, 25),
-        wp(Impersonate::ChromeV148, ImpersonateOS::MacOS, 12),
-        wp(Impersonate::ChromeV148, ImpersonateOS::Linux, 5),
-        wp(Impersonate::ChromeV147, ImpersonateOS::Windows, 18),
-        wp(Impersonate::ChromeV147, ImpersonateOS::MacOS, 8),
-        wp(Impersonate::ChromeV147, ImpersonateOS::Linux, 3),
-        wp(Impersonate::ChromeV146, ImpersonateOS::Windows, 10),
-        wp(Impersonate::ChromeV146, ImpersonateOS::MacOS, 5),
-        wp(Impersonate::ChromeV146, ImpersonateOS::Linux, 2),
-        wp(Impersonate::ChromeV145, ImpersonateOS::Windows, 5),
-        wp(Impersonate::ChromeV145, ImpersonateOS::MacOS, 3),
-        wp(Impersonate::ChromeV145, ImpersonateOS::Linux, 1),
-        wp(Impersonate::ChromeV144, ImpersonateOS::Windows, 2),
-        wp(Impersonate::ChromeV144, ImpersonateOS::MacOS, 1),
-    ]
+    weighted_browser_pool(
+        &[
+            (Impersonate::ChromeV148, 35),
+            (Impersonate::ChromeV147, 25),
+            (Impersonate::ChromeV146, 18),
+            (Impersonate::ChromeV145, 12),
+            (Impersonate::ChromeV144, 10),
+        ],
+        &[
+            (ImpersonateOS::Android, 55),
+            (ImpersonateOS::Windows, 20),
+            (ImpersonateOS::MacOS, 10),
+            (ImpersonateOS::Linux, 10),
+            (ImpersonateOS::IOS, 5),
+        ],
+    )
 }
 
 fn firefox_pool() -> Vec<WeightedProfile> {
-    vec![
-        wp(Impersonate::FirefoxV148, ImpersonateOS::Windows, 20),
-        wp(Impersonate::FirefoxV148, ImpersonateOS::MacOS, 8),
-        wp(Impersonate::FirefoxV148, ImpersonateOS::Linux, 10),
-        wp(Impersonate::FirefoxV147, ImpersonateOS::Windows, 14),
-        wp(Impersonate::FirefoxV147, ImpersonateOS::MacOS, 6),
-        wp(Impersonate::FirefoxV147, ImpersonateOS::Linux, 8),
-        wp(Impersonate::FirefoxV146, ImpersonateOS::Windows, 8),
-        wp(Impersonate::FirefoxV146, ImpersonateOS::MacOS, 4),
-        wp(Impersonate::FirefoxV146, ImpersonateOS::Linux, 6),
-        wp(Impersonate::FirefoxV140, ImpersonateOS::Windows, 5),
-        wp(Impersonate::FirefoxV140, ImpersonateOS::MacOS, 3),
-        wp(Impersonate::FirefoxV140, ImpersonateOS::Linux, 8),
-    ]
+    weighted_browser_pool(
+        &[
+            (Impersonate::FirefoxV148, 40),
+            (Impersonate::FirefoxV147, 28),
+            (Impersonate::FirefoxV146, 20),
+            (Impersonate::FirefoxV140, 12),
+        ],
+        &[
+            (ImpersonateOS::Android, 55),
+            (ImpersonateOS::Windows, 20),
+            (ImpersonateOS::MacOS, 10),
+            (ImpersonateOS::Linux, 10),
+            (ImpersonateOS::IOS, 5),
+        ],
+    )
 }
 
 fn safari_pool() -> Vec<WeightedProfile> {
-    vec![
-        wp(Impersonate::SafariV26_3, ImpersonateOS::MacOS, 40),
-        wp(Impersonate::SafariV26, ImpersonateOS::MacOS, 35),
-        wp(Impersonate::SafariV18_5, ImpersonateOS::MacOS, 25),
-    ]
+    weighted_browser_pool(
+        &[
+            (Impersonate::SafariV26_3, 40),
+            (Impersonate::SafariV26, 35),
+            (Impersonate::SafariV18_5, 25),
+        ],
+        &[(ImpersonateOS::IOS, 70), (ImpersonateOS::MacOS, 30)],
+    )
+}
+
+fn edge_pool() -> Vec<WeightedProfile> {
+    weighted_browser_pool(
+        &[
+            (Impersonate::EdgeV148, 35),
+            (Impersonate::EdgeV147, 25),
+            (Impersonate::EdgeV146, 18),
+            (Impersonate::EdgeV145, 12),
+            (Impersonate::EdgeV144, 10),
+        ],
+        &[
+            (ImpersonateOS::Android, 60),
+            (ImpersonateOS::Windows, 20),
+            (ImpersonateOS::MacOS, 8),
+            (ImpersonateOS::Linux, 7),
+            (ImpersonateOS::IOS, 5),
+        ],
+    )
+}
+
+fn opera_pool() -> Vec<WeightedProfile> {
+    weighted_browser_pool(
+        &[
+            (Impersonate::OperaV131, 30),
+            (Impersonate::OperaV130, 24),
+            (Impersonate::OperaV129, 18),
+            (Impersonate::OperaV128, 13),
+            (Impersonate::OperaV127, 9),
+            (Impersonate::OperaV126, 6),
+        ],
+        &[
+            (ImpersonateOS::Android, 60),
+            (ImpersonateOS::Windows, 20),
+            (ImpersonateOS::MacOS, 8),
+            (ImpersonateOS::Linux, 7),
+            (ImpersonateOS::IOS, 5),
+        ],
+    )
 }
 
 pub fn random_profile(fingerprint: &str) -> Profile {
     let (impersonate, os) = match fingerprint {
         "safari" => pick_weighted(&safari_pool()),
         "firefox" => pick_weighted(&firefox_pool()),
+        "edge" => pick_weighted(&edge_pool()),
+        "opera" => pick_weighted(&opera_pool()),
         _ => pick_weighted(&chrome_pool()),
     };
     Profile {
@@ -147,8 +206,9 @@ mod tests {
 
     #[test]
     fn chrome_profiles_produce_diverse_versions_and_os_combinations() {
+        assert_eq!(chrome_pool().len(), 25);
         let mut seen = HashSet::new();
-        for _ in 0..200 {
+        for _ in 0..1_000 {
             let profile = random_profile("chrome");
             seen.insert(format!("{:?}/{:?}", profile.impersonate, profile.os));
         }
@@ -162,8 +222,9 @@ mod tests {
 
     #[test]
     fn firefox_profiles_produce_diverse_combinations() {
+        assert_eq!(firefox_pool().len(), 20);
         let mut seen = HashSet::new();
-        for _ in 0..200 {
+        for _ in 0..1_000 {
             let profile = random_profile("firefox");
             seen.insert(format!("{:?}/{:?}", profile.impersonate, profile.os));
         }
@@ -176,11 +237,54 @@ mod tests {
     }
 
     #[test]
-    fn safari_profiles_are_always_macos() {
-        for _ in 0..100 {
+    fn safari_profiles_are_limited_to_apple_platforms() {
+        assert_eq!(safari_pool().len(), 6);
+        for _ in 0..1_000 {
             let profile = random_profile("safari");
-            assert_eq!(profile.os, ImpersonateOS::MacOS);
+            assert!(matches!(
+                profile.os,
+                ImpersonateOS::MacOS | ImpersonateOS::IOS
+            ));
         }
+    }
+
+    #[test]
+    fn edge_profiles_produce_diverse_combinations() {
+        assert_eq!(edge_pool().len(), 25);
+        let mut seen = HashSet::new();
+        for _ in 0..1_000 {
+            let profile = random_profile("edge");
+            assert!(matches!(
+                profile.impersonate,
+                Impersonate::EdgeV144
+                    | Impersonate::EdgeV145
+                    | Impersonate::EdgeV146
+                    | Impersonate::EdgeV147
+                    | Impersonate::EdgeV148
+            ));
+            seen.insert(format!("{:?}/{:?}", profile.impersonate, profile.os));
+        }
+        assert!(seen.len() >= 8, "Edge diversity too low: {seen:?}");
+    }
+
+    #[test]
+    fn opera_profiles_produce_diverse_combinations() {
+        assert_eq!(opera_pool().len(), 30);
+        let mut seen = HashSet::new();
+        for _ in 0..1_000 {
+            let profile = random_profile("opera");
+            assert!(matches!(
+                profile.impersonate,
+                Impersonate::OperaV126
+                    | Impersonate::OperaV127
+                    | Impersonate::OperaV128
+                    | Impersonate::OperaV129
+                    | Impersonate::OperaV130
+                    | Impersonate::OperaV131
+            ));
+            seen.insert(format!("{:?}/{:?}", profile.impersonate, profile.os));
+        }
+        assert!(seen.len() >= 8, "Opera diversity too low: {seen:?}");
     }
 
     #[test]

@@ -18,9 +18,9 @@ pub(crate) const RESULT_BUFFER_TOO_SMALL: i32 = -2;
 pub(crate) const RESULT_INVALID_ARGUMENT: i32 = -3;
 pub(crate) const RESULT_CLOSED: i32 = -4;
 pub(crate) const RESULT_NOT_CONTROL: i32 = -5;
-const RESULT_TIMEOUT: i32 = -6;
-const RESULT_AUTHENTICATION: i32 = -7;
-const RESULT_PROTOCOL: i32 = -8;
+pub(crate) const RESULT_TIMEOUT: i32 = -6;
+pub(crate) const RESULT_AUTHENTICATION: i32 = -7;
+pub(crate) const RESULT_PROTOCOL: i32 = -8;
 
 pub(crate) const EVENT_STATE: u32 = 1;
 pub(crate) const EVENT_REQUEST_COMPLETE: u32 = 2;
@@ -30,6 +30,8 @@ pub(crate) const EVENT_CONTROL_OVERFLOW: u32 = 5;
 pub(crate) const EVENT_DATA_REJECTED: u32 = 6;
 pub(crate) const EVENT_FORCED_DESTROY: u32 = 7;
 pub(crate) const EVENT_EVENT_OVERFLOW: u32 = 8;
+pub(crate) const EVENT_STUN_RESPONSE_ERROR: u32 = 9;
+pub(crate) const EVENT_CHANNEL_REBIND_EXHAUSTED: u32 = 10;
 
 pub(crate) const METHOD_ALLOCATE: u32 = 3;
 pub(crate) const METHOD_REFRESH: u32 = 4;
@@ -52,7 +54,6 @@ const ATTR_ERROR_CODE: u16 = 0x0009;
 const ATTR_CHANNEL_NUMBER: u16 = 0x000c;
 const ATTR_LIFETIME: u16 = 0x000d;
 const ATTR_XOR_PEER_ADDRESS: u16 = 0x0012;
-const ATTR_DATA: u16 = 0x0013;
 const ATTR_REALM: u16 = 0x0014;
 const ATTR_NONCE: u16 = 0x0015;
 const ATTR_XOR_RELAYED_ADDRESS: u16 = 0x0016;
@@ -66,29 +67,35 @@ const EVENT_CAPACITY: usize = 64;
 const INITIAL_RTO: Duration = Duration::from_millis(200);
 const MAX_RTO: Duration = Duration::from_millis(1600);
 const MAX_TRANSMISSIONS: u8 = 7;
-const PERMISSION_REFRESH: Duration = Duration::from_secs(240);
-const CHANNEL_REFRESH: Duration = Duration::from_secs(240);
-const ALLOCATION_REFRESH_MARGIN: Duration = Duration::from_secs(60);
+const STREAM_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(12);
+const REQUESTED_ALLOCATION_LIFETIME_SECS: u32 = 600;
+const ALLOCATION_REFRESH: Duration = Duration::from_secs(300);
+const MAINTENANCE_REFRESH: Duration = Duration::from_secs(175);
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
-const MAX_NONCE_RETRIES: u8 = 8;
+const MAINTENANCE_RETRY_BASE: Duration = Duration::from_secs(1);
+const MAINTENANCE_RETRY_MAX: Duration = Duration::from_secs(30);
+const MAX_CHANNEL_MAINTENANCE_FAILURES: u8 = 4;
+const MAX_NONCE_RETRIES: u8 = 3;
 const CHANNEL_NUMBER: u16 = 0x4000;
 
-const SEND_INDICATION_KIND: u16 = 0x0016;
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum TurnControlTransport {
+    Datagram,
+    Stream,
+}
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CsqttTurnProfile {
-    pub(crate) allocation_refresh_margin: Duration,
-    pub(crate) permission_refresh: Duration,
-    pub(crate) channel_refresh: Duration,
+    pub(crate) allocation_refresh: Duration,
+    pub(crate) maintenance_refresh: Duration,
     pub(crate) keepalive_interval: Duration,
     pub(crate) max_nonce_retries: u8,
 }
 
 impl CsqttTurnProfile {
     pub(crate) const PJNATH_COMPAT: Self = Self {
-        allocation_refresh_margin: ALLOCATION_REFRESH_MARGIN,
-        permission_refresh: PERMISSION_REFRESH,
-        channel_refresh: CHANNEL_REFRESH,
+        allocation_refresh: ALLOCATION_REFRESH,
+        maintenance_refresh: MAINTENANCE_REFRESH,
         keepalive_interval: KEEPALIVE_INTERVAL,
         max_nonce_retries: MAX_NONCE_RETRIES,
     };
@@ -198,12 +205,18 @@ struct Inner {
     events: VecDeque<NativeEvent>,
     pending: Vec<Pending>,
     allocation_refresh: Option<Instant>,
-    permission_refresh: Option<Instant>,
-    channel_refresh: Option<Instant>,
+    allocation_expires_at: Option<Instant>,
+    maintenance_refresh: Option<Instant>,
+    permission_retry: Option<Instant>,
+    channel_retry: Option<Instant>,
+    refresh_failures: u8,
+    permission_failures: u8,
+    channel_failures: u8,
     keepalive: Option<Instant>,
     shutting_down: bool,
     destroyed: bool,
     profile: CsqttTurnProfile,
+    transport: TurnControlTransport,
 }
 
 pub(crate) struct NativeCore {
@@ -211,6 +224,7 @@ pub(crate) struct NativeCore {
 }
 
 impl NativeCore {
+    #[cfg(test)]
     pub(crate) fn create(
         server: SocketAddr,
         username: &str,
@@ -226,12 +240,48 @@ impl NativeCore {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn create_with_profile(
         server: SocketAddr,
         username: &str,
         password: &str,
         peer: SocketAddr,
         profile: CsqttTurnProfile,
+    ) -> Result<Arc<Self>> {
+        Self::create_with_profile_and_transport(
+            server,
+            username,
+            password,
+            peer,
+            profile,
+            TurnControlTransport::Datagram,
+        )
+    }
+
+    pub(crate) fn create_with_transport(
+        server: SocketAddr,
+        username: &str,
+        password: &str,
+        peer: SocketAddr,
+        transport: TurnControlTransport,
+    ) -> Result<Arc<Self>> {
+        Self::create_with_profile_and_transport(
+            server,
+            username,
+            password,
+            peer,
+            CsqttTurnProfile::PJNATH_COMPAT,
+            transport,
+        )
+    }
+
+    fn create_with_profile_and_transport(
+        server: SocketAddr,
+        username: &str,
+        password: &str,
+        peer: SocketAddr,
+        profile: CsqttTurnProfile,
+        transport: TurnControlTransport,
     ) -> Result<Arc<Self>> {
         if server.port() == 0 || peer.port() == 0 {
             bail!(
@@ -265,12 +315,18 @@ impl NativeCore {
                 events: VecDeque::with_capacity(EVENT_CAPACITY),
                 pending: Vec::with_capacity(4),
                 allocation_refresh: None,
-                permission_refresh: None,
-                channel_refresh: None,
+                allocation_expires_at: None,
+                maintenance_refresh: None,
+                permission_retry: None,
+                channel_retry: None,
+                refresh_failures: 0,
+                permission_failures: 0,
+                channel_failures: 0,
                 keepalive: None,
                 shutting_down: false,
                 destroyed: false,
                 profile,
+                transport,
             }),
         }))
     }
@@ -289,17 +345,17 @@ impl NativeCore {
         Ok(())
     }
 
-    pub(crate) fn start_permission(&self) -> Result<()> {
-        let mut inner = self.lock();
-        inner.require_ready("TURN CreatePermission start")?;
-        inner.start_operation(Operation::Permission, true, 0)?;
-        Ok(())
-    }
-
     pub(crate) fn start_channel(&self) -> Result<()> {
         let mut inner = self.lock();
         inner.require_ready("TURN ChannelBind start")?;
         inner.start_operation(Operation::Channel, true, 0)?;
+        Ok(())
+    }
+
+    pub(crate) fn start_permission(&self) -> Result<()> {
+        let mut inner = self.lock();
+        inner.require_ready("TURN CreatePermission start")?;
+        inner.start_operation(Operation::Permission, true, 0)?;
         Ok(())
     }
 
@@ -322,21 +378,59 @@ impl NativeCore {
         }) else {
             return RESULT_NOT_CONTROL;
         };
+        let authenticated = inner.pending[index].authenticated;
+        if authenticated
+            && response_requires_integrity(&message)
+            && !verify_integrity(packet, &message, inner.key.as_ref())
+            && !is_fingerprinted_allocation_mismatch(&message)
+        {
+            if message.class() == Class::Error
+                && let Some(code) = error_code(&message)
+            {
+                let state = inner.state;
+                inner.push_event(NativeEvent {
+                    kind: EVENT_STUN_RESPONSE_ERROR,
+                    method,
+                    status: RESULT_AUTHENTICATION,
+                    stun_code: i32::from(code),
+                    state,
+                    ..NativeEvent::default()
+                });
+            }
+            return RESULT_AUTHENTICATION;
+        }
         let pending = inner.pending.remove(index);
         inner.remove_queued_transaction(transaction);
-        if pending.authenticated && !verify_integrity(packet, &message, inner.key.as_ref()) {
-            inner.complete_failure(pending.operation, RESULT_AUTHENTICATION, 0);
-            return RESULT_AUTHENTICATION;
-        }
-        if message.class() == Class::Success && !pending.authenticated {
-            inner.complete_failure(pending.operation, RESULT_AUTHENTICATION, 0);
-            return RESULT_AUTHENTICATION;
-        }
         let now = Instant::now();
+        if message.class() == Class::Success && !authenticated {
+            inner.complete_failure(pending.operation, RESULT_AUTHENTICATION, 0, now);
+            return RESULT_AUTHENTICATION;
+        }
         if message.class() == Class::Error {
             let code = error_code(&message).unwrap_or(0);
+            let state = inner.state;
             if code == 0 {
-                inner.complete_failure(pending.operation, RESULT_PROTOCOL, 0);
+                inner.push_event(NativeEvent {
+                    kind: EVENT_STUN_RESPONSE_ERROR,
+                    method,
+                    status: RESULT_PROTOCOL,
+                    stun_code: 0,
+                    state,
+                    ..NativeEvent::default()
+                });
+                inner.complete_failure(pending.operation, RESULT_PROTOCOL, 0, now);
+                return 0;
+            }
+            if requires_allocation_recreate(pending.operation, code) {
+                inner.push_event(NativeEvent {
+                    kind: EVENT_STUN_RESPONSE_ERROR,
+                    method,
+                    status: 0,
+                    stun_code: i32::from(code),
+                    state,
+                    ..NativeEvent::default()
+                });
+                inner.destroy_allocation(pending.operation, RESULT_PROTOCOL, i32::from(code));
                 return 0;
             }
             let realm = message
@@ -358,25 +452,20 @@ impl NativeCore {
                     return 0;
                 }
             }
-            match pending.operation {
-                Operation::Channel => {
-                    inner.channel = None;
-                    inner.channel_refresh = None;
-                    inner.complete(pending.operation, RESULT_PROTOCOL, i32::from(code));
-                }
-                Operation::Permission => {
-                    inner.permission_refresh = None;
-                    inner.complete(pending.operation, RESULT_PROTOCOL, i32::from(code));
-                }
-                Operation::Allocate | Operation::Refresh | Operation::Deallocate => {
-                    inner.complete_failure(pending.operation, RESULT_PROTOCOL, i32::from(code));
-                }
-            }
+            inner.push_event(NativeEvent {
+                kind: EVENT_STUN_RESPONSE_ERROR,
+                method,
+                status: 0,
+                stun_code: i32::from(code),
+                state,
+                ..NativeEvent::default()
+            });
+            inner.complete_failure(pending.operation, RESULT_PROTOCOL, i32::from(code), now);
             return 0;
         }
         let result = inner.complete_success(pending.operation, &message, now);
         if result.is_err() {
-            inner.complete_failure(pending.operation, RESULT_PROTOCOL, 0);
+            inner.complete_failure(pending.operation, RESULT_PROTOCOL, 0, now);
             return RESULT_PROTOCOL;
         }
         0
@@ -389,8 +478,23 @@ impl NativeCore {
             return Ok(None);
         }
         inner.expire_transactions(now);
+        if !inner.shutting_down
+            && inner.state == STATE_READY
+            && inner
+                .allocation_expires_at
+                .is_some_and(|deadline| now >= deadline)
+        {
+            inner.destroy_allocation(Operation::Refresh, RESULT_TIMEOUT, 0);
+        }
         if !inner.shutting_down && inner.state == STATE_READY {
             let mut control_started = false;
+            let maintenance_due = inner
+                .maintenance_refresh
+                .is_some_and(|deadline| now >= deadline);
+            let permission_retry_due = inner
+                .permission_retry
+                .is_some_and(|deadline| now >= deadline);
+            let channel_retry_due = inner.channel_retry.is_some_and(|deadline| now >= deadline);
             if inner
                 .allocation_refresh
                 .is_some_and(|deadline| now >= deadline)
@@ -400,21 +504,18 @@ impl NativeCore {
                 inner.start_operation(Operation::Refresh, true, 0)?;
                 control_started = true;
             }
-            if inner
-                .permission_refresh
-                .is_some_and(|deadline| now >= deadline)
+            if maintenance_due {
+                inner.maintenance_refresh = Some(now + inner.profile.maintenance_refresh);
+            }
+            if (maintenance_due || permission_retry_due)
                 && !inner.has_operation(Operation::Permission)
             {
-                inner.permission_refresh = None;
+                inner.permission_retry = None;
                 inner.start_operation(Operation::Permission, true, 0)?;
                 control_started = true;
             }
-            if inner
-                .channel_refresh
-                .is_some_and(|deadline| now >= deadline)
-                && !inner.has_operation(Operation::Channel)
-            {
-                inner.channel_refresh = None;
+            if (maintenance_due || channel_retry_due) && !inner.has_operation(Operation::Channel) {
+                inner.channel_retry = None;
                 inner.start_operation(Operation::Channel, true, 0)?;
                 control_started = true;
             }
@@ -422,10 +523,7 @@ impl NativeCore {
             if inner.keepalive.is_some_and(|deadline| now >= deadline) {
                 inner.keepalive = Some(now + inner.profile.keepalive_interval);
                 if !control_started {
-                    let packet = MessageBuilder::new(SEND_INDICATION_KIND)
-                        .attribute(ATTR_DATA, &[])
-                        .finish();
-                    inner.push_control(packet);
+                    inner.queue_keepalive();
                 }
             }
         }
@@ -469,11 +567,14 @@ impl NativeCore {
         }
         inner.shutting_down = true;
         inner.channel = None;
-        inner.permission_refresh = None;
-        inner.channel_refresh = None;
+        inner.maintenance_refresh = None;
+        inner.permission_retry = None;
+        inner.channel_retry = None;
         inner.keepalive = None;
         inner.controls.clear();
-        if inner.state == STATE_READY {
+        if inner.state == STATE_READY
+            || (inner.state == STATE_DESTROYING && inner.allocation_expires_at.is_some())
+        {
             inner.pending.clear();
             inner.set_state(STATE_DEALLOCATING);
             inner.start_operation(Operation::Deallocate, true, 0)?;
@@ -590,7 +691,7 @@ impl Inner {
             operation,
             transaction,
             packet,
-            next_attempt: Instant::now() + INITIAL_RTO,
+            next_attempt: Instant::now() + self.transaction_timeout(),
             rto: INITIAL_RTO,
             transmissions: 1,
             nonce_retries,
@@ -611,8 +712,17 @@ impl Inner {
                 builder = builder.attribute(ATTR_REQUESTED_TRANSPORT, &[17, 0, 0, 0]);
                 let family = if self.peer.is_ipv4() { 1 } else { 2 };
                 builder = builder.attribute(ATTR_REQUESTED_ADDRESS_FAMILY, &[family, 0, 0, 0]);
+                builder = builder.attribute(
+                    ATTR_LIFETIME,
+                    &REQUESTED_ALLOCATION_LIFETIME_SECS.to_be_bytes(),
+                );
             }
-            Operation::Refresh => {}
+            Operation::Refresh => {
+                builder = builder.attribute(
+                    ATTR_LIFETIME,
+                    &REQUESTED_ALLOCATION_LIFETIME_SECS.to_be_bytes(),
+                );
+            }
             Operation::Deallocate => {
                 builder = builder.attribute(ATTR_LIFETIME, &0u32.to_be_bytes());
             }
@@ -636,7 +746,7 @@ impl Inner {
                     .context("TURN authentication key missing")?,
             )
         } else {
-            Ok(builder.finish())
+            builder.finish()
         }
     }
 
@@ -648,6 +758,24 @@ impl Inner {
 
     fn push_control(&mut self, packet: Vec<u8>) {
         self.queue_packet(packet);
+    }
+
+    fn queue_keepalive(&mut self) {
+        let Some(channel) = self.channel else {
+            return;
+        };
+        let mut packet = Vec::with_capacity(8);
+        packet.extend_from_slice(&channel.to_be_bytes());
+        packet.extend_from_slice(&1u16.to_be_bytes());
+        packet.extend_from_slice(&[0xff, 0, 0, 0]);
+        self.queue_packet(packet);
+    }
+
+    fn transaction_timeout(&self) -> Duration {
+        match self.transport {
+            TurnControlTransport::Datagram => INITIAL_RTO,
+            TurnControlTransport::Stream => STREAM_TRANSACTION_TIMEOUT,
+        }
     }
 
     fn queue_packet(&mut self, packet: Vec<u8>) {
@@ -695,7 +823,13 @@ impl Inner {
             if self.pending[index].transmissions >= MAX_TRANSMISSIONS {
                 let pending = self.pending.remove(index);
                 self.remove_queued_transaction(pending.transaction);
-                self.complete_failure(pending.operation, RESULT_TIMEOUT, 0);
+                self.complete_failure(pending.operation, RESULT_TIMEOUT, 0, now);
+                continue;
+            }
+            if self.transport == TurnControlTransport::Stream {
+                let pending = self.pending.remove(index);
+                self.remove_queued_transaction(pending.transaction);
+                self.complete_failure(pending.operation, RESULT_TIMEOUT, 0, now);
                 continue;
             }
             let packet = self.pending[index].packet.clone();
@@ -726,16 +860,20 @@ impl Inner {
                 if relay.is_ipv4() != self.peer.is_ipv4() || relay.port() == 0 {
                     bail!("TURN Allocate response has invalid relayed address");
                 }
-                let lifetime = attribute_u32(message, ATTR_LIFETIME).unwrap_or(600);
+                let returned_lifetime = attribute_u32(message, ATTR_LIFETIME);
+                let lifetime = returned_lifetime.unwrap_or(REQUESTED_ALLOCATION_LIFETIME_SECS);
                 if lifetime == 0 {
                     bail!("TURN Allocate response lifetime is zero");
                 }
                 self.relay = Some(relay);
-                self.allocation_refresh = Some(refresh_deadline(
+                self.allocation_refresh = Some(allocation_refresh_deadline(
                     now,
-                    lifetime,
-                    self.profile.allocation_refresh_margin,
+                    returned_lifetime,
+                    self.profile.allocation_refresh,
                 ));
+                self.allocation_expires_at = Some(now + Duration::from_secs(u64::from(lifetime)));
+                self.refresh_failures = 0;
+                self.maintenance_refresh = Some(now + self.profile.maintenance_refresh);
                 self.keepalive = Some(now + self.profile.keepalive_interval);
                 self.push_event(NativeEvent {
                     kind: EVENT_RELAY_ADDRESS,
@@ -751,15 +889,18 @@ impl Inner {
                 self.complete(operation, 0, 0);
             }
             Operation::Refresh => {
-                let lifetime = attribute_u32(message, ATTR_LIFETIME).unwrap_or(600);
+                let returned_lifetime = attribute_u32(message, ATTR_LIFETIME);
+                let lifetime = returned_lifetime.unwrap_or(REQUESTED_ALLOCATION_LIFETIME_SECS);
                 if lifetime == 0 {
                     bail!("TURN Refresh response lifetime is zero");
                 }
-                self.allocation_refresh = Some(refresh_deadline(
+                self.allocation_refresh = Some(allocation_refresh_deadline(
                     now,
-                    lifetime,
-                    self.profile.allocation_refresh_margin,
+                    returned_lifetime,
+                    self.profile.allocation_refresh,
                 ));
+                self.allocation_expires_at = Some(now + Duration::from_secs(u64::from(lifetime)));
+                self.refresh_failures = 0;
                 self.complete(operation, 0, 0);
             }
             Operation::Deallocate => {
@@ -768,17 +909,17 @@ impl Inner {
                 }
                 self.relay = None;
                 self.allocation_refresh = None;
+                self.allocation_expires_at = None;
                 self.complete(operation, 0, 0);
                 self.set_state(STATE_DEALLOCATED);
             }
             Operation::Permission => {
-                self.permission_refresh = Some(now + self.profile.permission_refresh);
+                self.permission_failures = 0;
                 self.complete(operation, 0, 0);
             }
             Operation::Channel => {
                 self.channel = Some(CHANNEL_NUMBER);
-                self.permission_refresh = Some(now + self.profile.permission_refresh);
-                self.channel_refresh = Some(now + self.profile.channel_refresh);
+                self.channel_failures = 0;
                 self.push_event(NativeEvent {
                     kind: EVENT_CHANNEL_BOUND,
                     channel: CHANNEL_NUMBER,
@@ -791,14 +932,41 @@ impl Inner {
         Ok(())
     }
 
-    fn complete_failure(&mut self, operation: Operation, status: i32, stun_code: i32) {
+    fn complete_failure(
+        &mut self,
+        operation: Operation,
+        status: i32,
+        stun_code: i32,
+        now: Instant,
+    ) {
+        if matches!(
+            operation,
+            Operation::Refresh | Operation::Permission | Operation::Channel
+        ) && self.state == STATE_READY
+            && self
+                .allocation_expires_at
+                .is_some_and(|deadline| now < deadline)
+        {
+            self.complete(operation, status, stun_code);
+            if self.schedule_maintenance_retry(operation, now) {
+                return;
+            }
+            self.destroy_after_channel_rebind_exhausted();
+            return;
+        }
+        self.destroy_allocation(operation, status, stun_code);
+    }
+
+    fn destroy_allocation(&mut self, operation: Operation, status: i32, stun_code: i32) {
         self.complete(operation, status, stun_code);
         self.controls.clear();
         self.pending.clear();
         self.channel = None;
         self.allocation_refresh = None;
-        self.permission_refresh = None;
-        self.channel_refresh = None;
+        self.allocation_expires_at = None;
+        self.maintenance_refresh = None;
+        self.permission_retry = None;
+        self.channel_retry = None;
         self.keepalive = None;
         self.relay = None;
         if operation == Operation::Deallocate {
@@ -806,6 +974,55 @@ impl Inner {
         } else {
             self.set_state(STATE_DESTROYING);
         }
+    }
+
+    fn destroy_after_channel_rebind_exhausted(&mut self) {
+        self.controls.clear();
+        self.pending.clear();
+        self.channel = None;
+        self.maintenance_refresh = None;
+        self.permission_retry = None;
+        self.channel_retry = None;
+        self.keepalive = None;
+        self.push_event(NativeEvent {
+            kind: EVENT_CHANNEL_REBIND_EXHAUSTED,
+            status: RESULT_TIMEOUT,
+            state: STATE_DESTROYING,
+            ..NativeEvent::default()
+        });
+        self.set_state(STATE_DESTROYING);
+    }
+
+    fn schedule_maintenance_retry(&mut self, operation: Operation, now: Instant) -> bool {
+        let failures = match operation {
+            Operation::Refresh => {
+                self.refresh_failures = self.refresh_failures.saturating_add(1);
+                self.refresh_failures
+            }
+            Operation::Permission => {
+                self.permission_failures = self.permission_failures.saturating_add(1);
+                self.permission_failures
+            }
+            Operation::Channel => {
+                self.channel_failures = self.channel_failures.saturating_add(1);
+                self.channel_failures
+            }
+            Operation::Allocate | Operation::Deallocate => return true,
+        };
+        if operation == Operation::Channel && failures >= MAX_CHANNEL_MAINTENANCE_FAILURES {
+            return false;
+        }
+        let shift = u32::from(failures.saturating_sub(1).min(5));
+        let delay = MAINTENANCE_RETRY_BASE
+            .saturating_mul(1u32 << shift)
+            .min(MAINTENANCE_RETRY_MAX);
+        match operation {
+            Operation::Refresh => self.allocation_refresh = Some(now + delay),
+            Operation::Permission => self.permission_retry = Some(now + delay),
+            Operation::Channel => self.channel_retry = Some(now + delay),
+            Operation::Allocate | Operation::Deallocate => {}
+        }
+        true
     }
 
     fn complete(&mut self, operation: Operation, status: i32, stun_code: i32) {
@@ -829,8 +1046,9 @@ impl Inner {
             .iter()
             .map(|pending| pending.next_attempt)
             .chain(self.allocation_refresh)
-            .chain(self.permission_refresh)
-            .chain(self.channel_refresh)
+            .chain(self.maintenance_refresh)
+            .chain(self.permission_retry)
+            .chain(self.channel_retry)
             .chain(self.keepalive)
             .min()
     }
@@ -841,11 +1059,16 @@ struct MessageBuilder {
     transaction: [u8; 12],
 }
 
-impl MessageBuilder {
-    fn new(kind: u16) -> Self {
-        Self::with_transaction(kind, rand::random())
-    }
+fn set_message_length(bytes: &mut [u8], trailing: usize) -> Result<()> {
+    // The STUN length field is u16; a silent `as u16` truncation would
+    // corrupt the packet header instead of failing the build attempt.
+    let length = u16::try_from(bytes.len() - 20 + trailing)
+        .context("STUN message too large for u16 length")?;
+    bytes[2..4].copy_from_slice(&length.to_be_bytes());
+    Ok(())
+}
 
+impl MessageBuilder {
     fn with_transaction(kind: u16, transaction: [u8; 12]) -> Self {
         let mut bytes = Vec::with_capacity(256);
         bytes.extend_from_slice(&kind.to_be_bytes());
@@ -872,22 +1095,20 @@ impl MessageBuilder {
     }
 
     fn finish_authenticated(mut self, key: &[u8; 16]) -> Result<Vec<u8>> {
-        let signed_length = (self.bytes.len() - 20 + 24) as u16;
-        self.bytes[2..4].copy_from_slice(&signed_length.to_be_bytes());
+        set_message_length(&mut self.bytes, 24)?;
         let mut mac = <Hmac<Sha1> as hmac::digest::KeyInit>::new_from_slice(key)
             .context("HMAC-SHA1 accepts a 16-byte key")?;
         mac.update(&self.bytes);
         let integrity = mac.finalize().into_bytes();
         self = self.attribute(ATTR_MESSAGE_INTEGRITY, &integrity);
-        Ok(self.finish())
+        self.finish()
     }
 
-    fn finish(mut self) -> Vec<u8> {
-        let final_length = (self.bytes.len() - 20 + 8) as u16;
-        self.bytes[2..4].copy_from_slice(&final_length.to_be_bytes());
+    fn finish(mut self) -> Result<Vec<u8>> {
+        set_message_length(&mut self.bytes, 8)?;
         let fingerprint = crc32fast::hash(&self.bytes) ^ FINGERPRINT_XOR;
         self = self.attribute(ATTR_FINGERPRINT, &fingerprint.to_be_bytes());
-        self.bytes
+        Ok(self.bytes)
     }
 }
 
@@ -918,19 +1139,34 @@ fn error_code(message: &Message<'_>) -> Option<u16> {
     Some(u16::from(value[2]) * 100 + u16::from(value[3]))
 }
 
+fn response_requires_integrity(message: &Message<'_>) -> bool {
+    match message.class() {
+        Class::Success => true,
+        Class::Error => !matches!(error_code(message), Some(400 | 401 | 420 | 438)),
+        _ => false,
+    }
+}
+
+fn is_fingerprinted_allocation_mismatch(message: &Message<'_>) -> bool {
+    message.class() == Class::Error
+        && error_code(message) == Some(437)
+        && message.fingerprint_valid() == Some(true)
+}
+
+fn requires_allocation_recreate(operation: Operation, code: u16) -> bool {
+    code == 437 || (operation == Operation::Channel && code == 400)
+}
+
 fn attribute_u32(message: &Message<'_>, kind: u16) -> Option<u32> {
     let value: [u8; 4] = message.attribute(kind)?.value.try_into().ok()?;
     Some(u32::from_be_bytes(value))
 }
 
-fn refresh_deadline(now: Instant, lifetime: u32, margin: Duration) -> Instant {
-    let lifetime = Duration::from_secs(u64::from(lifetime));
-    let advance = if lifetime > margin.saturating_mul(2) {
-        margin
-    } else {
-        lifetime / 2
-    };
-    now + lifetime.saturating_sub(advance)
+fn allocation_refresh_deadline(now: Instant, lifetime: Option<u32>, interval: Duration) -> Instant {
+    let lifetime = Duration::from_secs(u64::from(
+        lifetime.unwrap_or(REQUESTED_ALLOCATION_LIFETIME_SECS),
+    ));
+    now + interval.min(lifetime / 2).max(Duration::from_millis(500))
 }
 
 fn encode_xor_address(address: SocketAddr, transaction: &[u8; 12]) -> Vec<u8> {
@@ -1001,6 +1237,10 @@ mod tests {
     use super::*;
 
     fn ready_core() -> (Arc<NativeCore>, [u8; 16]) {
+        ready_core_with_lifetime(600)
+    }
+
+    fn ready_core_with_lifetime(lifetime: u32) -> (Arc<NativeCore>, [u8; 16]) {
         let core = NativeCore::create_with_profile(
             "127.0.0.1:3478".parse().unwrap(),
             "user",
@@ -1017,14 +1257,15 @@ mod tests {
             .attribute(ATTR_ERROR_CODE, &[0, 0, 4, 1])
             .attribute(ATTR_REALM, b"realm")
             .attribute(ATTR_NONCE, b"nonce")
-            .finish();
+            .finish()
+            .unwrap();
         assert_eq!(core.input_stun(&challenge), 0);
         let (length, _) = core.pull_control(&mut wire).unwrap().unwrap();
         let authenticated = Message::decode(&wire[..length]).unwrap();
         let key = core.lock().key.unwrap();
         let success = MessageBuilder::with_transaction(0x0103, authenticated.transaction())
             .xor_address(ATTR_XOR_RELAYED_ADDRESS, "127.0.0.1:50000".parse().unwrap())
-            .attribute(ATTR_LIFETIME, &86_400u32.to_be_bytes())
+            .attribute(ATTR_LIFETIME, &lifetime.to_be_bytes())
             .finish_authenticated(&key)
             .unwrap();
         assert_eq!(core.input_stun(&success), 0);
@@ -1045,8 +1286,8 @@ mod tests {
 
     fn bind_ready_channel(core: &NativeCore, key: &[u8; 16]) {
         core.start_permission().unwrap();
-        complete_empty_success(core, METHOD_CREATE_PERMISSION as u16, key);
         core.start_channel().unwrap();
+        complete_empty_success(core, METHOD_CREATE_PERMISSION as u16, key);
         complete_empty_success(core, METHOD_CHANNEL_BIND as u16, key);
         assert_eq!(core.lock().channel, Some(CHANNEL_NUMBER));
     }
@@ -1077,6 +1318,10 @@ mod tests {
                 .value,
             [1, 0, 0, 0]
         );
+        assert_eq!(
+            message.attribute(ATTR_LIFETIME).unwrap().value,
+            REQUESTED_ALLOCATION_LIFETIME_SECS.to_be_bytes()
+        );
     }
 
     #[test]
@@ -1104,7 +1349,8 @@ mod tests {
             .attribute(ATTR_ERROR_CODE, &[0, 0, 4, 1])
             .attribute(ATTR_REALM, b"realm")
             .attribute(ATTR_NONCE, b"nonce-1")
-            .finish();
+            .finish()
+            .unwrap();
         assert_eq!(core.input_stun(&challenge), 0);
         let (length, _) = core.pull_control(&mut wire).unwrap().unwrap();
         let authenticated = Message::decode(&wire[..length]).unwrap();
@@ -1112,6 +1358,7 @@ mod tests {
             authenticated.attribute(ATTR_NONCE).unwrap().value,
             b"nonce-1"
         );
+        while core.pull_event().unwrap().is_some() {}
         let first_authenticated_transaction = authenticated.transaction();
         let key = {
             let inner = core.lock();
@@ -1120,15 +1367,48 @@ mod tests {
         let stale = MessageBuilder::with_transaction(0x0113, first_authenticated_transaction)
             .attribute(ATTR_ERROR_CODE, &[0, 0, 4, 38])
             .attribute(ATTR_NONCE, b"nonce-2")
-            .finish_authenticated(&key)
+            .finish()
             .unwrap();
         assert_eq!(core.input_stun(&stale), 0);
+        assert!(core.pull_event().unwrap().is_none());
         let (length, _) = core.pull_control(&mut wire).unwrap().unwrap();
         let retried = Message::decode(&wire[..length]).unwrap();
         assert_ne!(retried.transaction(), first_authenticated_transaction);
         assert_eq!(retried.attribute(ATTR_REALM).unwrap().value, b"realm");
         assert_eq!(retried.attribute(ATTR_NONCE).unwrap().value, b"nonce-2");
         assert!(verify_integrity(&wire[..length], &retried, Some(&key)));
+    }
+
+    #[test]
+    fn fingerprinted_unverified_allocation_mismatch_destroys_allocation() {
+        let (core, _) = ready_core();
+        core.lock()
+            .start_operation(Operation::Refresh, true, 0)
+            .unwrap();
+        let mut wire = [0u8; 1024];
+        let (length, _) = core.pull_control(&mut wire).unwrap().unwrap();
+        let refresh = Message::decode(&wire[..length]).unwrap();
+        let mismatch = MessageBuilder::with_transaction(0x0114, refresh.transaction())
+            .attribute(ATTR_ERROR_CODE, &[0, 0, 4, 37])
+            .finish()
+            .unwrap();
+        assert_eq!(core.input_stun(&mismatch), 0);
+        assert_eq!(core.lock().state, STATE_DESTROYING);
+    }
+
+    #[test]
+    fn channel_bind_bad_request_destroys_allocation() {
+        let (core, key) = ready_core();
+        core.start_channel().unwrap();
+        let mut wire = [0u8; 1024];
+        let (length, _) = core.pull_control(&mut wire).unwrap().unwrap();
+        let bind = Message::decode(&wire[..length]).unwrap();
+        let bad_request = MessageBuilder::with_transaction(0x0119, bind.transaction())
+            .attribute(ATTR_ERROR_CODE, &[0, 0, 4, 0])
+            .finish_authenticated(&key)
+            .unwrap();
+        assert_eq!(core.input_stun(&bad_request), 0);
+        assert_eq!(core.lock().state, STATE_DESTROYING);
     }
 
     #[test]
@@ -1165,7 +1445,32 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_timers_emit_refresh_channel_and_permission_requests() {
+    fn stream_transport_sends_a_control_request_once() {
+        let core = NativeCore::create_with_transport(
+            "127.0.0.1:3478".parse().unwrap(),
+            "user",
+            "pass",
+            "127.0.0.1:9000".parse().unwrap(),
+            TurnControlTransport::Stream,
+        )
+        .unwrap();
+        core.start_allocation().unwrap();
+        let mut wire = [0u8; 1024];
+        core.pull_control(&mut wire).unwrap().unwrap();
+        let mut inner = core.lock();
+        let deadline = inner.pending[0].next_attempt;
+        inner.expire_transactions(deadline);
+        assert!(inner.pending.is_empty());
+        assert!(inner.controls.is_empty());
+        assert!(inner.events.iter().any(|event| {
+            event.kind == EVENT_REQUEST_COMPLETE
+                && event.method == METHOD_ALLOCATE
+                && event.status == RESULT_TIMEOUT
+        }));
+    }
+
+    #[test]
+    fn lifecycle_timers_emit_refresh_and_maintenance_requests() {
         let (core, key) = ready_core();
         bind_ready_channel(&core, &key);
         while core.pull_event().unwrap().is_some() {}
@@ -1173,7 +1478,7 @@ mod tests {
             let now = Instant::now();
             let mut inner = core.lock();
             inner.allocation_refresh = Some(now);
-            inner.channel_refresh = Some(now);
+            inner.maintenance_refresh = Some(now);
             inner.keepalive = Some(now + Duration::from_secs(1));
         }
         core.poll().unwrap();
@@ -1187,55 +1492,123 @@ mod tests {
                 wire[..length].to_vec(),
             ));
         }
-        assert_eq!(requests.len(), 2);
+        assert_eq!(requests.len(), 3);
         assert_eq!(requests[0].0, METHOD_REFRESH as u16);
-        assert_eq!(requests[1].0, METHOD_CHANNEL_BIND as u16);
+        assert_eq!(requests[1].0, METHOD_CREATE_PERMISSION as u16);
+        assert_eq!(requests[2].0, METHOD_CHANNEL_BIND as u16);
         let refresh = Message::decode(&requests[0].2).unwrap();
-        assert!(refresh.attribute(ATTR_LIFETIME).is_none());
+        assert_eq!(
+            refresh.attribute(ATTR_LIFETIME).unwrap().value,
+            REQUESTED_ALLOCATION_LIFETIME_SECS.to_be_bytes()
+        );
         assert!(refresh.attribute(ATTR_MESSAGE_INTEGRITY).is_some());
+        let permission = Message::decode(&requests[1].2).unwrap();
+        assert!(permission.attribute(ATTR_XOR_PEER_ADDRESS).is_some());
+        assert!(permission.attribute(ATTR_MESSAGE_INTEGRITY).is_some());
         let refresh_success = MessageBuilder::with_transaction(0x0104, requests[0].1)
             .attribute(ATTR_LIFETIME, &7_200u32.to_be_bytes())
             .finish_authenticated(&key)
             .unwrap();
-        let channel_success = MessageBuilder::with_transaction(0x0109, requests[1].1)
+        let permission_success = MessageBuilder::with_transaction(0x0108, requests[1].1)
+            .finish_authenticated(&key)
+            .unwrap();
+        let channel_success = MessageBuilder::with_transaction(0x0109, requests[2].1)
             .finish_authenticated(&key)
             .unwrap();
         assert_eq!(core.input_stun(&refresh_success), 0);
+        assert_eq!(core.input_stun(&permission_success), 0);
         assert_eq!(core.input_stun(&channel_success), 0);
         {
             let inner = core.lock();
             let now = Instant::now();
             let allocation_delay = inner.allocation_refresh.unwrap() - now;
-            let channel_delay = inner.channel_refresh.unwrap() - now;
-            let permission_delay = inner.permission_refresh.unwrap() - now;
-            assert!(allocation_delay >= Duration::from_secs(7_139));
-            assert!(allocation_delay <= Duration::from_secs(7_140));
-            assert!(channel_delay >= Duration::from_secs(239));
-            assert!(channel_delay <= Duration::from_secs(240));
-            assert!(permission_delay >= Duration::from_secs(239));
-            assert!(permission_delay <= Duration::from_secs(240));
+            let maintenance_delay = inner.maintenance_refresh.unwrap() - now;
+            assert!(allocation_delay >= Duration::from_secs(299));
+            assert!(allocation_delay <= Duration::from_secs(300));
+            assert!(maintenance_delay >= Duration::from_secs(174));
+            assert!(maintenance_delay <= Duration::from_secs(175));
+            assert!(inner.permission_retry.is_none());
+            assert!(inner.channel_retry.is_none());
         }
+    }
+
+    #[test]
+    fn channel_bind_success_does_not_change_maintenance_deadline() {
+        let (core, key) = ready_core();
+        bind_ready_channel(&core, &key);
+        let maintenance_deadline = Instant::now() + Duration::from_secs(3);
+        {
+            let mut inner = core.lock();
+            inner.maintenance_refresh = Some(maintenance_deadline);
+        }
+        core.start_channel().unwrap();
+        complete_empty_success(&core, METHOD_CHANNEL_BIND as u16, &key);
+        assert_eq!(core.lock().maintenance_refresh, Some(maintenance_deadline));
+    }
+
+    #[test]
+    fn permission_timeout_keeps_maintenance_deadline() {
+        let (core, key) = ready_core();
+        bind_ready_channel(&core, &key);
+        let maintenance_deadline = Instant::now() + Duration::from_secs(175);
+        {
+            let mut inner = core.lock();
+            inner.maintenance_refresh = Some(maintenance_deadline);
+        }
+        core.start_permission().unwrap();
+        let mut wire = [0u8; 1024];
+        core.pull_control(&mut wire).unwrap().unwrap();
+        let mut inner = core.lock();
+        for _ in 0..MAX_TRANSMISSIONS {
+            let Some(deadline) = inner.pending.first().map(|pending| pending.next_attempt) else {
+                break;
+            };
+            inner.expire_transactions(deadline);
+            inner.controls.clear();
+        }
+        assert_eq!(inner.maintenance_refresh, Some(maintenance_deadline));
+        assert!(inner.permission_retry.is_some());
+    }
+
+    #[test]
+    fn keepalive_uses_valid_channel_data_framing() {
+        let (core, key) = ready_core();
+        bind_ready_channel(&core, &key);
+        while core.pull_event().unwrap().is_some() {}
         {
             let now = Instant::now();
             let mut inner = core.lock();
-            inner.permission_refresh = Some(now);
-            inner.channel_refresh = Some(now + Duration::from_secs(240));
-            inner.allocation_refresh = Some(now + Duration::from_secs(7_140));
-            inner.keepalive = Some(now + Duration::from_secs(1));
+            inner.keepalive = Some(now);
+            inner.allocation_refresh = Some(now + Duration::from_secs(1));
+            inner.maintenance_refresh = Some(now + Duration::from_secs(1));
         }
         core.poll().unwrap();
+        let mut wire = [0u8; 1024];
         let (length, _) = core.pull_control(&mut wire).unwrap().unwrap();
-        assert_eq!(
-            Message::decode(&wire[..length]).unwrap().method(),
-            METHOD_CREATE_PERMISSION as u16
-        );
-        assert!(core.pull_control(&mut wire).unwrap().is_none());
+        assert_eq!(&wire[..length], &[0x40, 0, 0, 1, 0xff, 0, 0, 0]);
+    }
+
+    #[test]
+    fn ten_minute_allocation_lifetime_keeps_short_maintenance_refreshes() {
+        let (core, key) = ready_core_with_lifetime(600);
+        bind_ready_channel(&core, &key);
+        while core.pull_event().unwrap().is_some() {}
+
+        let inner = core.lock();
+        let now = Instant::now();
+        let allocation_delay = inner.allocation_refresh.unwrap() - now;
+        let maintenance_delay = inner.maintenance_refresh.unwrap() - now;
+
+        assert!(allocation_delay >= Duration::from_secs(299));
+        assert!(allocation_delay <= Duration::from_secs(300));
+        assert!(maintenance_delay >= Duration::from_secs(174));
+        assert!(maintenance_delay <= Duration::from_secs(175));
     }
 
     #[test]
     fn long_scheduler_pause_retransmits_once_and_rebases_the_deadline() {
         let (core, key) = ready_core();
-        core.start_permission().unwrap();
+        core.start_channel().unwrap();
         let mut wire = [0u8; 1024];
         core.pull_control(&mut wire).unwrap().unwrap();
         let mut inner = core.lock();
@@ -1250,14 +1623,14 @@ mod tests {
         drop(inner);
         let (length, _) = core.pull_control(&mut wire).unwrap().unwrap();
         let request = Message::decode(&wire[..length]).unwrap();
-        let response = MessageBuilder::with_transaction(0x0108, request.transaction())
+        let response = MessageBuilder::with_transaction(0x0109, request.transaction())
             .finish_authenticated(&key)
             .unwrap();
         assert_eq!(core.input_stun(&response), 0);
     }
 
     #[test]
-    fn maintenance_timeout_invalidates_the_entire_allocation() {
+    fn maintenance_timeout_keeps_allocation_alive_and_schedules_retry() {
         let (core, key) = ready_core();
         bind_ready_channel(&core, &key);
         core.start_channel().unwrap();
@@ -1271,15 +1644,15 @@ mod tests {
             inner.expire_transactions(deadline);
             inner.controls.clear();
         }
-        assert_eq!(inner.state, STATE_DESTROYING);
+        assert_eq!(inner.state, STATE_READY);
         assert!(inner.pending.is_empty());
         assert!(inner.controls.is_empty());
-        assert!(inner.relay.is_none());
-        assert!(inner.channel.is_none());
-        assert!(inner.allocation_refresh.is_none());
-        assert!(inner.permission_refresh.is_none());
-        assert!(inner.channel_refresh.is_none());
-        assert!(inner.keepalive.is_none());
+        assert!(inner.relay.is_some());
+        assert_eq!(inner.channel, Some(CHANNEL_NUMBER));
+        assert!(inner.allocation_refresh.is_some());
+        assert!(inner.allocation_expires_at.is_some());
+        assert!(inner.channel_retry.is_some());
+        assert!(inner.keepalive.is_some());
         assert!(inner.events.iter().any(|event| {
             event.kind == EVENT_REQUEST_COMPLETE
                 && event.method == METHOD_CHANNEL_BIND
@@ -1288,23 +1661,99 @@ mod tests {
     }
 
     #[test]
-    fn refresh_deadline_uses_margin_and_avoids_short_lifetime_spin() {
+    fn repeated_channel_maintenance_timeouts_recreate_only_the_allocation() {
+        let (core, key) = ready_core();
+        bind_ready_channel(&core, &key);
+        while core.pull_event().unwrap().is_some() {}
+        let mut wire = [0u8; 1024];
+
+        for attempt in 1..=MAX_CHANNEL_MAINTENANCE_FAILURES {
+            core.start_channel().unwrap();
+            core.pull_control(&mut wire).unwrap().unwrap();
+            let mut inner = core.lock();
+            for _ in 0..MAX_TRANSMISSIONS {
+                let Some(deadline) = inner.pending.first().map(|pending| pending.next_attempt)
+                else {
+                    break;
+                };
+                inner.expire_transactions(deadline);
+                inner.controls.clear();
+            }
+
+            if attempt < MAX_CHANNEL_MAINTENANCE_FAILURES {
+                assert_eq!(inner.state, STATE_READY);
+                assert_eq!(inner.channel, Some(CHANNEL_NUMBER));
+                assert_eq!(inner.channel_failures, attempt);
+                assert!(inner.channel_retry.is_some());
+            } else {
+                assert_eq!(inner.state, STATE_DESTROYING);
+                assert!(inner.pending.is_empty());
+                assert!(inner.controls.is_empty());
+                assert!(inner.relay.is_some());
+                assert!(inner.allocation_expires_at.is_some());
+                assert!(inner.events.iter().any(|event| {
+                    event.kind == EVENT_CHANNEL_REBIND_EXHAUSTED && event.status == RESULT_TIMEOUT
+                }));
+            }
+        }
+
+        core.graceful_shutdown().unwrap();
+        assert_eq!(core.lock().state, STATE_DEALLOCATING);
+        let (length, _) = core.pull_control(&mut wire).unwrap().unwrap();
+        let deallocate = Message::decode(&wire[..length]).unwrap();
+        assert_eq!(deallocate.method(), METHOD_REFRESH as u16);
+        assert_eq!(
+            deallocate.attribute(ATTR_LIFETIME).unwrap().value,
+            0u32.to_be_bytes()
+        );
+    }
+
+    #[test]
+    fn allocation_refresh_deadline_is_three_hundred_seconds_or_half_the_lifetime() {
         let now = Instant::now();
         assert_eq!(
-            refresh_deadline(now, 86_400, ALLOCATION_REFRESH_MARGIN) - now,
-            Duration::from_secs(86_340)
+            allocation_refresh_deadline(now, Some(86_400), ALLOCATION_REFRESH) - now,
+            Duration::from_secs(300)
         );
         assert_eq!(
-            refresh_deadline(now, 600, ALLOCATION_REFRESH_MARGIN) - now,
-            Duration::from_secs(540)
+            allocation_refresh_deadline(now, Some(7_200), ALLOCATION_REFRESH) - now,
+            Duration::from_secs(300)
         );
         assert_eq!(
-            refresh_deadline(now, 60, ALLOCATION_REFRESH_MARGIN) - now,
+            allocation_refresh_deadline(now, None, ALLOCATION_REFRESH) - now,
+            Duration::from_secs(300)
+        );
+        assert_eq!(
+            allocation_refresh_deadline(now, Some(600), ALLOCATION_REFRESH) - now,
+            Duration::from_secs(300)
+        );
+        assert_eq!(
+            allocation_refresh_deadline(now, Some(60), ALLOCATION_REFRESH) - now,
             Duration::from_secs(30)
         );
         assert_eq!(
-            refresh_deadline(now, 1, ALLOCATION_REFRESH_MARGIN) - now,
+            allocation_refresh_deadline(now, Some(1), ALLOCATION_REFRESH) - now,
             Duration::from_millis(500)
         );
+    }
+
+    #[test]
+    fn invalid_integrity_keeps_the_existing_transaction_for_retransmission() {
+        let (core, _) = ready_core();
+        core.start_channel().unwrap();
+        let mut wire = [0u8; 1024];
+        let (length, _) = core.pull_control(&mut wire).unwrap().unwrap();
+        let request = Message::decode(&wire[..length]).unwrap();
+        let response = MessageBuilder::with_transaction(0x0109, request.transaction())
+            .finish()
+            .unwrap();
+        assert_eq!(core.input_stun(&response), RESULT_AUTHENTICATION);
+        let mut inner = core.lock();
+        assert_eq!(inner.pending.len(), 1);
+        assert_eq!(inner.pending[0].transaction, request.transaction());
+        let deadline = inner.pending[0].next_attempt;
+        inner.expire_transactions(deadline);
+        assert_eq!(inner.pending.len(), 1);
+        assert_eq!(inner.controls.len(), 1);
     }
 }

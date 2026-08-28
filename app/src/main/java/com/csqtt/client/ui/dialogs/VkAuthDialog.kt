@@ -5,6 +5,7 @@ package com.csqtt.client.ui.dialogs
 
 import android.graphics.Outline
 import android.view.View
+import android.view.ViewGroup
 import android.view.ViewOutlineProvider
 import android.widget.FrameLayout
 import androidx.compose.animation.core.animateFloatAsState
@@ -19,7 +20,6 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Key
@@ -46,10 +46,14 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.csqtt.client.VkAuthPayload
 import com.csqtt.client.VkAuthPhase
 import com.csqtt.client.VkAuthSession
 import com.csqtt.client.VkAuthWebViewManager
+import com.csqtt.client.ui.design.CsqttShapes
 
 @Composable
 internal fun VkAuthDialog(
@@ -57,6 +61,7 @@ internal fun VkAuthDialog(
     onDismiss: () -> Unit,
 ) {
     val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
     var uiReady by remember { mutableStateOf(false) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
     var phase by remember { mutableStateOf(VkAuthPhase.LOGIN) }
@@ -71,9 +76,18 @@ internal fun VkAuthDialog(
         )
     }
 
-    DisposableEffect(session, webView) {
+    DisposableEffect(session, webView, lifecycleOwner) {
         session.attach(webView)
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_STOP -> session.pause()
+                Lifecycle.Event.ON_START -> session.resume()
+                else -> Unit
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
         onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
             session.stop()
             VkAuthWebViewManager.release(webView)
         }
@@ -94,7 +108,7 @@ internal fun VkAuthDialog(
         properties = DialogProperties(usePlatformDefaultWidth = false),
     ) {
         Surface(
-            shape = RoundedCornerShape(28.dp),
+            shape = CsqttShapes.Dialog,
             color = MaterialTheme.colorScheme.surface,
             contentColor = MaterialTheme.colorScheme.onSurface,
             tonalElevation = 8.dp,
@@ -144,7 +158,10 @@ internal fun VkAuthDialog(
                     AndroidView(
                         factory = { ctx ->
                             FrameLayout(ctx).apply {
-                                val radius = 20f * ctx.resources.displayMetrics.density
+                                isFocusable = false
+                                isFocusableInTouchMode = false
+                                descendantFocusability = ViewGroup.FOCUS_AFTER_DESCENDANTS
+                                val radius = 32f * ctx.resources.displayMetrics.density
                                 outlineProvider = object : ViewOutlineProvider() {
                                     override fun getOutline(view: View, outline: Outline) {
                                         outline.setRoundRect(0, 0, view.width, view.height, radius)
@@ -158,6 +175,7 @@ internal fun VkAuthDialog(
                                         FrameLayout.LayoutParams.MATCH_PARENT,
                                     ),
                                 )
+                                post { webView.requestFocus() }
                             }
                         },
                         modifier = Modifier.fillMaxSize().alpha(webAlpha),
@@ -180,7 +198,7 @@ internal fun VkAuthDialog(
                             )
                             Button(
                                 onClick = onDismiss,
-                                shape = RoundedCornerShape(16.dp),
+                                shape = CsqttShapes.Pill,
                                 colors = ButtonDefaults.buttonColors(
                                     contentColor = MaterialTheme.colorScheme.onPrimary,
                                 ),

@@ -21,7 +21,6 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -130,7 +129,7 @@ fun CryptoDonateDialog(onDismiss: () -> Unit) {
                     modifier = Modifier
                         .fillMaxWidth()
                         .height(48.dp),
-                    shape = RoundedCornerShape(14.dp),
+                    shape = CsqttShapes.Pill,
                     colors = ButtonDefaults.buttonColors(
                         containerColor = MaterialTheme.colorScheme.primary,
                         contentColor = MaterialTheme.colorScheme.onPrimary
@@ -175,7 +174,7 @@ private fun CryptoAddressField(
         )
 
         Surface(
-            shape = RoundedCornerShape(16.dp),
+            shape = CsqttShapes.Control,
             color = if (isDark) Color(0xFF13171F) else Color(0xFFF1F3F7),
             border = BorderStroke(1.dp, colors.outlineVariant.copy(alpha = if (isDark) 0.35f else 0.5f)),
             modifier = Modifier.fillMaxWidth()
@@ -205,12 +204,12 @@ private fun CryptoAddressField(
                 }
 
                 Surface(
-                    shape = RoundedCornerShape(12.dp),
+                    shape = CsqttShapes.Pill,
                     color = Color(0xFF121418),
                     contentColor = Color.White,
                     modifier = Modifier
                         .size(42.dp)
-                        .clip(RoundedCornerShape(12.dp))
+                        .clip(CsqttShapes.Pill)
                         .clickable(onClick = onCopy)
                 ) {
                     Box(

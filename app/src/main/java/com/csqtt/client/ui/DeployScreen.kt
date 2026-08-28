@@ -5,6 +5,10 @@ package com.csqtt.client.ui
 
 import android.content.res.Configuration
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkVertically
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.snap
@@ -12,7 +16,6 @@ import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -56,6 +59,7 @@ internal fun DeployScreen(
     snackbarHostState: SnackbarHostState = remember { SnackbarHostState() },
 ) {
     var passwordVisible by rememberSaveable { mutableStateOf(false) }
+    val scrollState = rememberScrollState()
 
     CsqttScreen(
         modifier = modifier,
@@ -64,8 +68,7 @@ internal fun DeployScreen(
             Column(
                 modifier = Modifier
                     .fillMaxSize()
-                    .verticalScroll(rememberScrollState())
-                    .padding(bottom = 110.dp),
+                    .verticalScroll(scrollState),
                 verticalArrangement = Arrangement.spacedBy(CsqttSpacing.Md),
             ) {
                 AppSectionCard {
@@ -94,11 +97,18 @@ internal fun DeployScreen(
                                 )
                             },
                         )
+                        AnimatedVisibility(
+                            visible = state.manualPorts,
+                            enter = fadeIn() + expandVertically(expandFrom = Alignment.Top),
+                            exit = fadeOut() + shrinkVertically(shrinkTowards = Alignment.Top),
+                        ) {
+                            ManualPortFields(state = state, onAction = onAction)
+                        }
                         OutlinedButton(
                             onClick = { onAction(DeployAction.EditSshKeys) },
                             enabled = !state.isDeploying,
                             modifier = Modifier.fillMaxWidth().height(52.dp),
-                            shape = RoundedCornerShape(20.dp),
+                            shape = CsqttShapes.Pill,
                             colors = ButtonDefaults.outlinedButtonColors(
                                 containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
                                 contentColor = MaterialTheme.colorScheme.onSurface,
@@ -123,6 +133,13 @@ internal fun DeployScreen(
                             isError = state.host.isBlank(),
                             keyboardType = KeyboardType.Uri,
                         )
+                        AnimatedVisibility(
+                            visible = state.manualPorts,
+                            enter = fadeIn() + expandVertically(expandFrom = Alignment.Top),
+                            exit = fadeOut() + shrinkVertically(shrinkTowards = Alignment.Top),
+                        ) {
+                            ManualPortFields(state = state, onAction = onAction)
+                        }
                         AdaptiveFieldPair(
                             first = {
                                 DeployTextField(
@@ -163,6 +180,12 @@ internal fun DeployScreen(
                             onCheckedChange = { onAction(DeployAction.SshKeysModeChanged(it)) },
                         )
                         CsqttSettingRow(
+                            title = "Ручные порты",
+                            checked = state.manualPorts,
+                            enabled = !state.isDeploying,
+                            onCheckedChange = { onAction(DeployAction.ManualPortsChanged(it)) },
+                        )
+                        CsqttSettingRow(
                             title = "Установить в Docker",
                             checked = state.dockerInstall,
                             enabled = !state.isDeploying,
@@ -170,75 +193,6 @@ internal fun DeployScreen(
                             onInfoClick = { onAction(DeployAction.DockerInfo) },
                             infoContentDescription = "О Docker-установке",
                         )
-                    }
-                }
-
-                AppSectionCard {
-                    Text("Сеть", style = MaterialTheme.typography.titleMedium, fontWeight = androidx.compose.ui.text.font.FontWeight.SemiBold)
-                    AdaptiveFieldPair(
-                        first = {
-                            DeployTextField(
-                                value = state.primaryDns,
-                                onValueChange = { onAction(DeployAction.PrimaryDnsChanged(it)) },
-                                label = "Основной DNS",
-                                placeholder = "1.1.1.1",
-                                enabled = !state.isDeploying,
-                                keyboardType = KeyboardType.Uri,
-                            )
-                        },
-                        second = {
-                            DeployTextField(
-                                value = state.secondaryDns,
-                                onValueChange = { onAction(DeployAction.SecondaryDnsChanged(it)) },
-                                label = "Резервный DNS",
-                                placeholder = "1.0.0.1",
-                                enabled = !state.isDeploying,
-                                keyboardType = KeyboardType.Uri,
-                            )
-                        },
-                    )
-                    CsqttSettingRow(
-                        title = "Ручные порты",
-                        checked = state.manualPorts,
-                        enabled = !state.isDeploying,
-                        onCheckedChange = { onAction(DeployAction.ManualPortsChanged(it)) },
-                    )
-                    AnimatedVisibility(visible = state.manualPorts) {
-                        Column(verticalArrangement = Arrangement.spacedBy(CsqttSpacing.Sm)) {
-                            DeployTextField(
-                                value = state.sshPort,
-                                onValueChange = { onAction(DeployAction.SshPortChanged(it)) },
-                                label = "SSH-порт",
-                                placeholder = "22",
-                                enabled = !state.isDeploying,
-                                isError = state.showValidation && !isValidPort(state.sshPort),
-                                keyboardType = KeyboardType.Number,
-                            )
-                            AdaptiveFieldPair(
-                                first = {
-                                    DeployTextField(
-                                        value = state.peerPort,
-                                        onValueChange = { onAction(DeployAction.PeerPortChanged(it)) },
-                                        label = "Порт туннеля",
-                                        placeholder = "46000",
-                                        enabled = !state.isDeploying,
-                                        isError = state.showValidation && !isValidPort(state.peerPort),
-                                        keyboardType = KeyboardType.Number,
-                                    )
-                                },
-                                second = {
-                                    DeployTextField(
-                                        value = state.webPort,
-                                        onValueChange = { onAction(DeployAction.WebPortChanged(it)) },
-                                        label = "Порт WEB-панели",
-                                        placeholder = "46002",
-                                        enabled = !state.isDeploying,
-                                        isError = state.showValidation && !isValidPort(state.webPort),
-                                        keyboardType = KeyboardType.Number,
-                                    )
-                                },
-                            )
-                        }
                     }
                 }
 
@@ -261,6 +215,48 @@ internal fun DeployScreen(
                 modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 72.dp),
             )
         }
+    }
+}
+
+@Composable
+private fun ManualPortFields(
+    state: DeployUiState,
+    onAction: (DeployAction) -> Unit,
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(CsqttSpacing.Sm),
+    ) {
+        DeployTextField(
+            value = state.sshPort,
+            onValueChange = { onAction(DeployAction.SshPortChanged(it)) },
+            label = "SSH-порт",
+            placeholder = "22",
+            enabled = !state.isDeploying,
+            isError = state.showValidation && !isValidPort(state.sshPort),
+            keyboardType = KeyboardType.Number,
+            modifier = Modifier.weight(1f),
+        )
+        DeployTextField(
+            value = state.peerPort,
+            onValueChange = { onAction(DeployAction.PeerPortChanged(it)) },
+            label = "Порт туннеля",
+            placeholder = "46000",
+            enabled = !state.isDeploying,
+            isError = state.showValidation && !isValidPort(state.peerPort),
+            keyboardType = KeyboardType.Number,
+            modifier = Modifier.weight(1f),
+        )
+        DeployTextField(
+            value = state.webPort,
+            onValueChange = { onAction(DeployAction.WebPortChanged(it)) },
+            label = "Порт WEB-панели",
+            placeholder = "46002",
+            enabled = !state.isDeploying,
+            isError = state.showValidation && !isValidPort(state.webPort),
+            keyboardType = KeyboardType.Number,
+            modifier = Modifier.weight(1f),
+        )
     }
 }
 

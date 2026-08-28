@@ -16,6 +16,7 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.semantics.heading
@@ -33,6 +34,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.csqtt.client.R
 
+internal val LocalCsqttHeaderActions = staticCompositionLocalOf<(@Composable RowScope.() -> Unit)?> { null }
+
 @Composable
 fun CsqttScreen(
     modifier: Modifier = Modifier,
@@ -41,6 +44,8 @@ fun CsqttScreen(
     actions: (@Composable RowScope.() -> Unit)? = null,
     content: @Composable ColumnScope.() -> Unit,
 ) {
+    val headerActions = LocalCsqttHeaderActions.current
+
     Column(
         modifier = modifier
             .fillMaxSize()
@@ -68,12 +73,18 @@ fun CsqttScreen(
                     modifier = Modifier.height(26.dp)
                 )
 
-                Icon(
-                    painter = painterResource(id = R.drawable.ic_v200_by_amurcanov),
-                    contentDescription = "v2.0.0 by amurcanov",
-                    tint = Color.Unspecified,
-                    modifier = Modifier.height(20.dp).padding(top = 4.dp)
-                )
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Icon(
+                        painter = painterResource(id = R.drawable.ic_v205_by_amurcanov),
+                        contentDescription = "v2.1.5 by amurcanov",
+                        tint = Color.Unspecified,
+                        modifier = Modifier.height(19.dp)
+                    )
+                    headerActions?.let { Row(content = it) }
+                }
             }
             if (!title.isNullOrBlank() || actions != null) {
                 Row(

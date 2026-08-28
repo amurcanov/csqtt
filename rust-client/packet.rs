@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 amurcanov
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 
+use crate::client_perf::{self, Stage as PerfStage};
 use anyhow::{Result, bail};
 use bytes::BytesMut;
 use crossbeam_queue::ArrayQueue;
@@ -44,6 +45,10 @@ impl PacketPool {
     }
 
     pub fn try_acquire(self: &Arc<Self>) -> Option<PacketBuf> {
+        client_perf::measure_sampled(PerfStage::PacketPool, 128, || self.try_acquire_inner())
+    }
+
+    fn try_acquire_inner(self: &Arc<Self>) -> Option<PacketBuf> {
         let storage = if let Some(storage) = self.queue.pop() {
             self.retained.fetch_sub(1, Ordering::AcqRel);
             storage
@@ -91,6 +96,10 @@ impl PacketPool {
     }
 
     fn release(&self, storage: BytesMut) {
+        client_perf::measure_sampled(PerfStage::PacketPool, 128, || self.release_inner(storage));
+    }
+
+    fn release_inner(&self, storage: BytesMut) {
         if storage.len() != PACKET_CAPACITY {
             self.allocated.fetch_sub(1, Ordering::AcqRel);
             return;
@@ -332,7 +341,7 @@ mod tests {
 
     #[test]
     fn production_pool_covers_all_bounded_worker_queues() {
-        for (workers, expected) in [(9, 2_816), (27, 7_424), (108, 28_160), (162, 41_984)] {
+        for (workers, expected) in [(9, 2_816), (27, 7_424), (108, 28_160), (126, 32_768)] {
             assert_eq!(packet_pool_size(workers), expected);
         }
     }

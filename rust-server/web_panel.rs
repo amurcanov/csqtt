@@ -4,12 +4,12 @@
 use crate::{
     App, lock_unpoison, log_event,
     model::{MAX_PASSWORDS, PasswordEntry, is_expired, now, random_password, random_token},
-    protocol,
+    protocol, read_unpoison,
 };
 use axum::{
     Json, Router,
     body::Body,
-    extract::{ConnectInfo, Path, State},
+    extract::{ConnectInfo, DefaultBodyLimit, Path, State},
     http::{HeaderMap, Request, StatusCode, header},
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
@@ -19,9 +19,10 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
+    io::Read,
     net::SocketAddr,
-    sync::{Arc, atomic::Ordering},
-    time::Duration,
+    sync::{Arc, LazyLock, Mutex, atomic::Ordering},
+    time::{Duration, Instant},
 };
 use subtle::ConstantTimeEq;
 
@@ -54,6 +55,53 @@ struct SettingsRequest {
     dns_primary: Option<String>,
     #[serde(default)]
     dns_secondary: Option<String>,
+    #[serde(default)]
+    auto_restart_interval_hours: Option<u8>,
+}
+
+const WEB_BODY_LIMIT_BYTES: usize = 16 * 1024;
+const MAX_LOGIN_FIELD_BYTES: usize = 256;
+const MAX_CLIENT_NAME_BYTES: usize = 128;
+const MAX_PROXY_PROFILE_NAME_BYTES: usize = 64;
+
+fn validate_text_field(
+    value: &str,
+    max_bytes: usize,
+    message: &'static str,
+) -> Result<(), &'static str> {
+    if value.len() > max_bytes || value.chars().any(char::is_control) {
+        return Err(message);
+    }
+    Ok(())
+}
+
+fn validate_login_request(request: &LoginRequest) -> Result<(), &'static str> {
+    validate_text_field(
+        &request.user,
+        MAX_LOGIN_FIELD_BYTES,
+        "login fields are too long or invalid",
+    )?;
+    validate_text_field(
+        &request.pass,
+        MAX_LOGIN_FIELD_BYTES,
+        "login fields are too long or invalid",
+    )
+}
+
+fn validate_client_name(name: &str) -> Result<(), &'static str> {
+    validate_text_field(
+        name,
+        MAX_CLIENT_NAME_BYTES,
+        "client name is too long or invalid",
+    )
+}
+
+fn validate_proxy_profile_name(name: &str) -> Result<(), &'static str> {
+    validate_text_field(
+        name,
+        MAX_PROXY_PROFILE_NAME_BYTES,
+        "proxy profile name is too long or invalid",
+    )
 }
 
 #[derive(Serialize)]
@@ -75,31 +123,10 @@ struct ClientInfo {
     local_port: u16,
 }
 
-#[derive(Deserialize)]
-struct StreamDebugRequest {
-    enabled: bool,
-}
-
-#[derive(Serialize)]
-struct StreamDebugInfo {
-    id: u64,
-    source: String,
-    device_id: String,
-    generation: u64,
-    tunnel_ip: String,
-    mode: &'static str,
-    tunnel_ready: bool,
-    handshake_ready: bool,
-    created_at: u64,
-    last_seen: u64,
-    debug_started_at: u64,
-    up_bytes: u64,
-    down_bytes: u64,
-    up_packets: u64,
-    down_packets: u64,
-}
-
 const CAESAR_SHIFT: u8 = 47;
+pub(crate) const MAX_WEB_SESSIONS: usize = 256;
+pub(crate) const MAX_LOGIN_LIMITS: usize = 4_096;
+const MAX_WEB_CONNECTIONS: usize = 64;
 
 fn caesar_decode(value: &str) -> String {
     if let Some(rest) = value.strip_prefix("c1:")
@@ -152,30 +179,138 @@ async fn auth_middleware(
     next: Next,
 ) -> Response {
     if authorized(&state.app, request.headers()) {
-        next.run(request).await
-    } else {
-        (
-            StatusCode::UNAUTHORIZED,
-            [(header::SET_COOKIE, expired_session_cookie())],
-        )
-            .into_response()
+        return next.run(request).await;
     }
+    let mut response = StatusCode::UNAUTHORIZED.into_response();
+    // Clear the cookie only when the client actually presented one; an
+    // unconditional delete header on every 401 fights concurrent sessions.
+    if !cookie_tokens(request.headers()).is_empty() {
+        response.headers_mut().insert(
+            header::SET_COOKIE,
+            expired_session_cookie().parse().unwrap(),
+        );
+    }
+    response
 }
 
 fn expired_session_cookie() -> &'static str {
     "csqtt_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict; Secure"
 }
 
+// The plain-HTTP redirect echoes the client Host header into Location.
+// Restrict it to plausible host forms and an optional configured allowlist so
+// a crafted Host cannot bounce visitors to a third-party origin.
+fn is_safe_redirect_host(host: &str) -> bool {
+    if host.is_empty() || host.len() > 255 {
+        return false;
+    }
+    if !host.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b':' | b'[' | b']')
+    }) {
+        return false;
+    }
+    if let Ok(allowed) = std::env::var("CSQTT_WEB_HOSTS") {
+        let allowed = allowed.trim();
+        if !allowed.is_empty() {
+            return allowed
+                .split(',')
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .any(|entry| entry.eq_ignore_ascii_case(host));
+        }
+    }
+    true
+}
+
 async fn root(State(state): State<WebState>, headers: HeaderMap) -> Response {
     if authorized(&state.app, &headers) {
-        Html(PANEL_HTML).into_response()
-    } else {
-        (
-            [(header::SET_COOKIE, expired_session_cookie())],
-            Html(LOGIN_HTML),
-        )
-            .into_response()
+        return Html(PANEL_HTML).into_response();
     }
+    let mut response = (StatusCode::UNAUTHORIZED, Html(LOGIN_HTML)).into_response();
+    if !cookie_tokens(&headers).is_empty() {
+        response.headers_mut().insert(
+            header::SET_COOKIE,
+            expired_session_cookie().parse().unwrap(),
+        );
+    }
+    response
+}
+
+fn pwa_response(
+    body: &'static str,
+    content_type: &'static str,
+    cache_control: &'static str,
+) -> Response {
+    let mut response = body.into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_static(content_type),
+    );
+    headers.insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static(cache_control),
+    );
+    response
+}
+
+fn pwa_binary_response(
+    body: Vec<u8>,
+    content_type: &'static str,
+    cache_control: &'static str,
+) -> Response {
+    let mut response = body.into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_static(content_type),
+    );
+    headers.insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static(cache_control),
+    );
+    response
+}
+
+async fn pwa_manifest() -> Response {
+    pwa_response(
+        PWA_MANIFEST,
+        "application/manifest+json; charset=utf-8",
+        "no-cache",
+    )
+}
+
+async fn pwa_service_worker() -> Response {
+    let mut response = pwa_response(
+        PWA_SERVICE_WORKER,
+        "application/javascript; charset=utf-8",
+        "no-cache",
+    );
+    response.headers_mut().insert(
+        header::HeaderName::from_static("service-worker-allowed"),
+        header::HeaderValue::from_static("/"),
+    );
+    response
+}
+
+async fn pwa_icon() -> Response {
+    pwa_response(PWA_ICON_SVG, "image/svg+xml", "public, max-age=604800")
+}
+
+async fn pwa_icon_192() -> Response {
+    pwa_binary_response(
+        PWA_ICON_192_PNG.clone(),
+        "image/png",
+        "public, max-age=604800",
+    )
+}
+
+async fn pwa_icon_512() -> Response {
+    pwa_binary_response(
+        PWA_ICON_512_PNG.clone(),
+        "image/png",
+        "public, max-age=604800",
+    )
 }
 
 async fn login(
@@ -184,20 +319,29 @@ async fn login(
     headers: HeaderMap,
     Json(request): Json<LoginRequest>,
 ) -> Response {
-    let trust_xff = std::env::var("CSQTT_TRUST_XFF")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-    let source = if trust_xff {
-        headers
+    if let Err(message) = validate_login_request(&request) {
+        return (StatusCode::BAD_REQUEST, message).into_response();
+    }
+    // Rate-limit by the real socket address: a client-supplied XFF value can
+    // mint fresh lockout buckets, and a shared XFF value would lock out whole
+    // NAT networks. XFF is informational only.
+    let source = addr.ip().to_string();
+    if let Ok(forwarded) = std::env::var("CSQTT_TRUST_XFF")
+        && (forwarded == "1" || forwarded.eq_ignore_ascii_case("true"))
+        && let Some(forwarded) = headers
             .get("x-forwarded-for")
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.split(',').next())
-            .map(|s| s.trim().to_owned())
+            .map(str::trim)
             .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| addr.ip().to_string())
-    } else {
-        addr.ip().to_string()
-    };
+    {
+        log_event(
+            &state.app,
+            "INFO",
+            "AUTH",
+            &format!("Login attempt from {source} (XFF: {forwarded})"),
+        );
+    }
 
     let current = now();
     if let Some(value) = state.app.login_limits.get(&source)
@@ -213,33 +357,59 @@ async fn login(
         constant_equal(&user, &state.app.web_user) & constant_equal(&pass, &state.app.web_pass);
 
     if !valid {
-        state
-            .app
-            .login_limits
-            .entry(source)
-            .and_modify(|v| {
-                if v.1 <= current {
-                    *v = (1, current + 180);
-                } else {
-                    v.0 += 1;
-                }
-            })
-            .or_insert((1, current + 180));
+        if !state.record_failed_login(source, current) {
+            return (StatusCode::TOO_MANY_REQUESTS, "too many login sources").into_response();
+        }
         return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response();
     }
 
     state.app.login_limits.remove(&source);
     let token = random_token(32);
-    state.web_session_insert(token.clone());
+    if !state.web_session_insert(token.clone()) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many active web sessions",
+        )
+            .into_response();
+    }
     let cookie =
         format!("csqtt_session={token}; Path=/; Max-Age=86400; HttpOnly; SameSite=Strict; Secure");
     (StatusCode::OK, [(header::SET_COOKIE, cookie)], "ok").into_response()
 }
 
 impl WebState {
-    fn web_session_insert(&self, token: String) {
+    fn record_failed_login(&self, source: String, current: i64) -> bool {
+        let _admission = lock_unpoison(&self.app.web_auth_admission);
+        self.app.login_limits.retain(|_, value| value.1 > current);
+        if !self.app.login_limits.contains_key(&source)
+            && self.app.login_limits.len() >= MAX_LOGIN_LIMITS
+        {
+            return false;
+        }
+        self.app
+            .login_limits
+            .entry(source)
+            .and_modify(|value| {
+                if value.1 <= current {
+                    *value = (1, current + 180);
+                } else {
+                    value.0 = value.0.saturating_add(1);
+                }
+            })
+            .or_insert((1, current + 180));
+        true
+    }
+
+    fn web_session_insert(&self, token: String) -> bool {
+        let _admission = lock_unpoison(&self.app.web_auth_admission);
+        let current = now();
+        self.app.web_sessions.retain(|_, expiry| *expiry > current);
+        if self.app.web_sessions.len() >= MAX_WEB_SESSIONS {
+            return false;
+        }
         let key = hash_token(&token);
-        self.app.web_sessions.insert(key, now() + 86400);
+        self.app.web_sessions.insert(key, current + 86400);
+        true
     }
 }
 
@@ -268,6 +438,53 @@ async fn logout_all(State(state): State<WebState>) -> Response {
         .into_response()
 }
 
+// Handlers call this after the DB change is committed. A failed engine reload
+// must not read as a failed request — the client would retry and duplicate the
+// change — so the error is reported as a warning instead of a 500.
+async fn refresh_credentials_report(state: &WebState) -> Result<(), String> {
+    match crate::protocol::refresh_credentials(&state.app).await {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let message = format!("{error:#}");
+            log_event(
+                &state.app,
+                "ERROR",
+                "AUTH",
+                &format!("Change saved but credential reload failed: {message}"),
+            );
+            Err(message)
+        }
+    }
+}
+
+/// A mutating API must not report success until its SQLite transaction has
+/// completed.  The in-memory state remains available if persistence fails, but
+/// callers receive a clear 5xx instead of a misleading 200 that vanishes on
+/// the next restart.
+async fn wait_for_persistence(state: &WebState, revision: u64) -> Result<(), Response> {
+    match tokio::time::timeout(
+        Duration::from_secs(15),
+        state.app.db_persistence.wait(revision),
+    )
+    .await
+    {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => {
+            eprintln!("[WEB] Failed to persist database mutation: {error:#}");
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to persist change",
+            )
+                .into_response())
+        }
+        Err(_) => Err((
+            StatusCode::GATEWAY_TIMEOUT,
+            "database persistence is taking too long; refresh before retrying",
+        )
+            .into_response()),
+    }
+}
+
 fn proc_kib(text: &str, field: &str) -> Option<u64> {
     text.lines()
         .find(|line| line.starts_with(field))?
@@ -277,7 +494,13 @@ fn proc_kib(text: &str, field: &str) -> Option<u64> {
         .ok()
 }
 
-#[derive(Default)]
+fn read_proc_text<'a>(path: &str, buffer: &'a mut [u8]) -> Option<&'a str> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.read(buffer).ok()?;
+    std::str::from_utf8(&buffer[..len]).ok()
+}
+
+#[derive(Clone, Copy, Default)]
 struct ProcessMemory {
     rss: u64,
     peak: u64,
@@ -296,6 +519,68 @@ fn process_memory(text: &str) -> ProcessMemory {
         shared: proc_kib(text, "RssShmem:").unwrap_or(0),
         swap: proc_kib(text, "VmSwap:").unwrap_or(0),
     }
+}
+
+#[derive(Clone, Copy, Default)]
+struct ProcessMemoryRollup {
+    pss: u64,
+    pss_anon: u64,
+    anonymous: u64,
+    file: u64,
+    shmem: u64,
+    private: u64,
+    shared: u64,
+    swap_pss: u64,
+}
+
+fn process_memory_rollup(text: &str) -> ProcessMemoryRollup {
+    let private_clean = proc_kib(text, "Private_Clean:").unwrap_or(0);
+    let private_dirty = proc_kib(text, "Private_Dirty:").unwrap_or(0);
+    let shared_clean = proc_kib(text, "Shared_Clean:").unwrap_or(0);
+    let shared_dirty = proc_kib(text, "Shared_Dirty:").unwrap_or(0);
+    ProcessMemoryRollup {
+        pss: proc_kib(text, "Pss:").unwrap_or(0),
+        pss_anon: proc_kib(text, "Pss_Anon:").unwrap_or(0),
+        anonymous: proc_kib(text, "Anonymous:").unwrap_or(0),
+        file: proc_kib(text, "Pss_File:").unwrap_or(0),
+        shmem: proc_kib(text, "Pss_Shmem:").unwrap_or(0),
+        private: private_clean.saturating_add(private_dirty),
+        shared: shared_clean.saturating_add(shared_dirty),
+        swap_pss: proc_kib(text, "SwapPss:").unwrap_or(0),
+    }
+}
+
+#[derive(Default)]
+struct SystemStatsCache {
+    sampled_at: Option<Instant>,
+    process_memory: ProcessMemory,
+    process_rollup: ProcessMemoryRollup,
+    total_ram: u64,
+}
+
+static SYSTEM_STATS_CACHE: LazyLock<Mutex<SystemStatsCache>> =
+    LazyLock::new(|| Mutex::new(SystemStatsCache::default()));
+const SYSTEM_STATS_CACHE_TTL: Duration = Duration::from_secs(60);
+
+fn cached_system_stats() -> (ProcessMemory, ProcessMemoryRollup, u64) {
+    let mut cache = lock_unpoison(&SYSTEM_STATS_CACHE);
+    let refresh = cache
+        .sampled_at
+        .is_none_or(|sampled_at| sampled_at.elapsed() >= SYSTEM_STATS_CACHE_TTL);
+    if refresh {
+        let mut buffer = [0_u8; 4096];
+        cache.process_memory = read_proc_text("/proc/self/status", &mut buffer)
+            .map(process_memory)
+            .unwrap_or_default();
+        cache.process_rollup = read_proc_text("/proc/self/smaps_rollup", &mut buffer)
+            .map(process_memory_rollup)
+            .unwrap_or_default();
+        cache.total_ram = read_proc_text("/proc/meminfo", &mut buffer)
+            .and_then(|text| proc_kib(text, "MemTotal:"))
+            .unwrap_or(0);
+        cache.sampled_at = Some(Instant::now());
+    }
+    (cache.process_memory, cache.process_rollup, cache.total_ram)
 }
 
 fn format_memory_kib(kib: u64) -> String {
@@ -327,18 +612,7 @@ fn format_total_memory_kib(kib: u64) -> String {
 }
 
 async fn stats(State(state): State<WebState>, _headers: HeaderMap) -> impl IntoResponse {
-    let (process_status, memory_info) = tokio::join!(
-        tokio::fs::read_to_string("/proc/self/status"),
-        tokio::fs::read_to_string("/proc/meminfo")
-    );
-    let process_memory = process_status
-        .as_deref()
-        .map(process_memory)
-        .unwrap_or_default();
-    let total_ram = memory_info
-        .ok()
-        .and_then(|text| proc_kib(&text, "MemTotal:"))
-        .unwrap_or(0);
+    let (process_memory, process_rollup, total_ram) = cached_system_stats();
 
     let cpu_total = state.app.cpu_percent.load(Ordering::Relaxed);
     let cpu_cores = state.app.cpu_cores.load(Ordering::Relaxed).max(1);
@@ -348,6 +622,10 @@ async fn stats(State(state): State<WebState>, _headers: HeaderMap) -> impl IntoR
         .checked_div(cpu_capacity)
         .unwrap_or(0)
         .min(100);
+    let log_ring_bytes = crate::lock_unpoison(&state.app.logs)
+        .iter()
+        .map(String::len)
+        .sum::<usize>();
     let db = state.app.db.read().await;
     let (
         local_proxy_active,
@@ -383,12 +661,28 @@ async fn stats(State(state): State<WebState>, _headers: HeaderMap) -> impl IntoR
         "ram_file": format_memory_kib(process_memory.file),
         "ram_shared": format_memory_kib(process_memory.shared),
         "ram_swap": format_memory_kib(process_memory.swap),
+        "ram_pss": format_memory_kib(process_rollup.pss),
+        "ram_private": format_memory_kib(process_rollup.private),
+        "ram_shared_rollup": format_memory_kib(process_rollup.shared),
+        "ram_anon_rollup": format_memory_kib(process_rollup.pss_anon),
+        "ram_anonymous_rollup": format_memory_kib(process_rollup.anonymous),
+        "ram_file_rollup": format_memory_kib(process_rollup.file),
+        "ram_shmem_rollup": format_memory_kib(process_rollup.shmem),
+        "ram_swap_pss": format_memory_kib(process_rollup.swap_pss),
         "ram_used_kib": process_memory.rss,
         "ram_peak_kib": process_memory.peak,
         "ram_anonymous_kib": process_memory.anonymous,
         "ram_file_kib": process_memory.file,
         "ram_shared_kib": process_memory.shared,
         "ram_swap_kib": process_memory.swap,
+        "ram_pss_kib": process_rollup.pss,
+        "ram_private_kib": process_rollup.private,
+        "ram_shared_rollup_kib": process_rollup.shared,
+        "ram_anon_rollup_kib": process_rollup.pss_anon,
+        "ram_anonymous_rollup_kib": process_rollup.anonymous,
+        "ram_file_rollup_kib": process_rollup.file,
+        "ram_shmem_rollup_kib": process_rollup.shmem,
+        "ram_swap_pss_kib": process_rollup.swap_pss,
         "cpu_total": cpu_total,
         "cpu_capacity": cpu_capacity,
         "cpu_normalized": cpu_normalized,
@@ -402,11 +696,12 @@ async fn stats(State(state): State<WebState>, _headers: HeaderMap) -> impl IntoR
         "devices": db.devices.len(),
         "transport": "RTP/ChaCha20-Poly1305",
         "tunnel": "userspace-tun",
+        "allocator": crate::allocator_name(),
         "local_proxy_enabled": !db.local_proxy.active_profile_id.is_empty(),
         "local_proxy_port": db.local_proxy.active_profile().map(|p| p.port).unwrap_or(0),
         "local_proxy_active": local_proxy_active,
         "local_proxy_port_listening": state.app.proxy_port_listening.load(Ordering::Acquire),
-        "local_proxy_health_error": state.app.proxy_health_error.read().unwrap().clone(),
+        "local_proxy_health_error": crate::read_unpoison(&state.app.proxy_health_error).clone(),
         "local_proxy_tcp_sessions": local_proxy_tcp_sessions,
         "local_proxy_udp_flows": local_proxy_udp_flows,
         "local_proxy_tcp_peak": local_proxy_tcp_peak,
@@ -416,8 +711,50 @@ async fn stats(State(state): State<WebState>, _headers: HeaderMap) -> impl IntoR
         "hot_sessions": protocol::ACTIVE_SESSIONS_GAUGE.load(Ordering::Relaxed),
         "hot_session_capacity": protocol::HOT_SESSION_CAPACITY_GAUGE.load(Ordering::Relaxed),
         "public_session_capacity": state.app.sessions.capacity(),
-        "stream_debug_enabled": state.app.stream_debug_active.load(Ordering::Acquire)
+        "mem_engine_epochs": protocol::epoch_snapshot_len(),
+        "mem_device_epochs": state.app.device_epochs.len(),
+        "mem_device_epoch_capacity": state.app.device_epochs.capacity(),
+        "mem_derived_keys": state.app.derived_keys.len(),
+        "mem_web_sessions": state.app.web_sessions.len(),
+        "mem_web_session_capacity": MAX_WEB_SESSIONS,
+        "mem_login_limits": state.app.login_limits.len(),
+        "mem_login_limit_capacity": MAX_LOGIN_LIMITS,
+        "mem_log_ring": crate::lock_unpoison(&state.app.logs).len(),
+        "mem_log_bytes": log_ring_bytes,
+        "mem_dpi_ring": protocol::dpi_ring_len(),
+        "mem_stream_repairs": protocol::STREAM_REPAIRS_GAUGE.load(Ordering::Relaxed),
+        "mem_stream_inventory": protocol::STREAM_INVENTORY_GAUGE.load(Ordering::Relaxed),
+        "memory_trim_count": state.app.memory_trim_count.load(Ordering::Relaxed),
+        "memory_trim_last_unix": state.app.memory_trim_last_unix.load(Ordering::Relaxed)
     }))
+}
+
+async fn memory_trim(State(state): State<WebState>) -> Response {
+    match crate::trim_memory(&state.app).await {
+        Ok(allocator_collected) => Json(serde_json::json!({
+            "compacted": true,
+            // Application buffers and tables are compacted on the dataplane
+            // thread. The system allocator has no portable explicit trim API.
+            "allocator_collected": allocator_collected,
+            "allocator_collection_scope": "not-supported-by-system-allocator",
+            "trim_count": state.app.memory_trim_count.load(Ordering::Relaxed),
+            "trimmed_at": state.app.memory_trim_last_unix.load(Ordering::Relaxed),
+        }))
+        .into_response(),
+        Err(error) => {
+            log_event(
+                &state.app,
+                "WARNING",
+                "MEMORY",
+                &format!("Memory trim skipped: {error:#}"),
+            );
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "memory trim is temporarily unavailable",
+            )
+                .into_response()
+        }
+    }
 }
 
 async fn settings_get(State(state): State<WebState>) -> impl IntoResponse {
@@ -430,6 +767,7 @@ async fn settings_get(State(state): State<WebState>) -> impl IntoResponse {
         "main_password": db.main_password,
         "dns_primary": primary,
         "dns_secondary": secondary,
+        "auto_restart_interval_hours": db.auto_restart_interval_hours(),
         "restart_required": db.main_password != state.app.startup_main_password
             || db.dns != state.app.startup_dns
     }))
@@ -473,15 +811,35 @@ async fn settings_post(
             return (StatusCode::BAD_REQUEST, "primary DNS is required").into_response();
         }
     };
-    let revision = {
+    if let Some(hours) = request.auto_restart_interval_hours
+        && !matches!(hours, 0 | 12 | 24 | 48 | 72)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            "auto restart interval must be 0, 12, 24, 48, or 72 hours",
+        )
+            .into_response();
+    }
+    let requested_auto_restart_interval = request.auto_restart_interval_hours;
+    let credentials_changed = request.main_password.is_some() || dns.is_some();
+    let (revision, retired_main_password) = {
         let mut db = state.app.db.write().await;
-        if let Some(password) = request.main_password {
-            db.main_password = password;
-        }
+        let retired_main_password = if let Some(password) = request.main_password {
+            (db.main_password != password)
+                .then(|| std::mem::replace(&mut db.main_password, password))
+        } else {
+            None
+        };
         if let Some(dns) = dns {
             db.dns = dns;
         }
-        state.app.db_persistence.submit(db.clone())
+        if let Some(hours) = requested_auto_restart_interval {
+            db.set_auto_restart_interval_hours(hours);
+        }
+        (
+            state.app.db_persistence.submit(db.clone()),
+            retired_main_password,
+        )
     };
     match state.app.db_persistence.wait(revision).await {
         Ok(()) => {}
@@ -494,15 +852,17 @@ async fn settings_post(
                 .into_response();
         }
     }
-    if crate::protocol::refresh_credentials(&state.app)
-        .await
-        .is_err()
+    if let Some(hours) = requested_auto_restart_interval {
+        state.app.auto_restart_interval_tx.send_replace(hours);
+    }
+    if let Some(password) = retired_main_password
+        && !password.is_empty()
     {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "failed to refresh credentials",
-        )
-            .into_response();
+        state.app.derived_keys.remove(&password);
+    }
+    if credentials_changed && let Err(message) = refresh_credentials_report(&state).await {
+        let warning = format!("saved but reload failed: {message}");
+        return (StatusCode::OK, [("x-csqtt-reload-error", warning)], "saved").into_response();
     }
     let restart_required = {
         let db = state.app.db.read().await;
@@ -584,87 +944,6 @@ async fn clients_get(State(state): State<WebState>) -> impl IntoResponse {
     Json(list)
 }
 
-async fn stream_debug_toggle(
-    State(state): State<WebState>,
-    Json(request): Json<StreamDebugRequest>,
-) -> Response {
-    state
-        .app
-        .stream_debug_active
-        .store(false, Ordering::Release);
-    if request.enabled {
-        for entry in state.app.sessions.iter() {
-            entry.value().stream_debug.reset();
-        }
-    }
-    state
-        .app
-        .stream_debug_active
-        .store(request.enabled, Ordering::Release);
-
-    Json(serde_json::json!({ "enabled": request.enabled })).into_response()
-}
-
-async fn client_streams(
-    State(state): State<WebState>,
-    Path(password): Path<String>,
-) -> impl IntoResponse {
-    if !state.app.stream_debug_active.load(Ordering::Acquire) {
-        return Json(serde_json::json!({
-            "enabled": false,
-            "server_now": now(),
-            "streams": []
-        }));
-    }
-
-    let mut sessions: Vec<_> = state
-        .app
-        .sessions
-        .iter()
-        .filter(|entry| entry.value().password == password)
-        .map(|entry| entry.value().clone())
-        .collect();
-    sessions.sort_unstable_by_key(|session| (session.created_at, session.id));
-
-    let streams: Vec<StreamDebugInfo> = sessions
-        .into_iter()
-        .filter_map(|session| {
-            let metrics = session.stream_debug.snapshot();
-            if !metrics.active {
-                return None;
-            }
-            let device_id = lock_unpoison(&session.device_id).clone();
-            let tunnel_ip = lock_unpoison(&session.tunnel_ip)
-                .map(|ip| format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]))
-                .unwrap_or_default();
-            let mode = if session.is_srtp { "SRTP" } else { "RTP" };
-            Some(StreamDebugInfo {
-                id: session.id,
-                source: session.address.to_string(),
-                device_id,
-                generation: session.generation_id.load(Ordering::Relaxed),
-                tunnel_ip,
-                mode,
-                tunnel_ready: session.has_tunnel.load(Ordering::Relaxed),
-                handshake_ready: session.handshake_done.load(Ordering::Relaxed),
-                created_at: session.created_at,
-                last_seen: session.last_seen.load(Ordering::Relaxed),
-                debug_started_at: metrics.started_at,
-                up_bytes: metrics.up_bytes,
-                down_bytes: metrics.down_bytes,
-                up_packets: metrics.up_packets,
-                down_packets: metrics.down_packets,
-            })
-        })
-        .collect();
-
-    Json(serde_json::json!({
-        "enabled": true,
-        "server_now": now(),
-        "streams": streams
-    }))
-}
-
 fn normalize_client_vk_hashes(raw: &str) -> Result<String, &'static str> {
     let value = raw.trim();
     if value.is_empty() {
@@ -687,6 +966,9 @@ async fn clients_create(
     State(state): State<WebState>,
     Json(request): Json<CreateClientRequest>,
 ) -> Response {
+    if let Err(message) = validate_client_name(&request.name) {
+        return (StatusCode::BAD_REQUEST, message).into_response();
+    }
     if request.days < 0 || request.days > 3650 {
         return (StatusCode::BAD_REQUEST, "days must be 0..3650").into_response();
     }
@@ -703,6 +985,7 @@ async fn clients_create(
     let result = {
         let mut db = state.app.db.write().await;
         db.passwords.retain(|_, entry| !is_expired(entry));
+        db.prune_dangling_device_bindings();
         if db.passwords.len() >= MAX_PASSWORDS {
             return (StatusCode::BAD_REQUEST, "limit reached").into_response();
         }
@@ -736,19 +1019,13 @@ async fn clients_create(
                 local_port,
             },
         );
-        state.app.db_persistence.submit(db.clone());
-        (password, expires)
+        let revision = state.app.db_persistence.submit(db.clone());
+        (password, expires, revision)
     };
-    if crate::protocol::refresh_credentials(&state.app)
-        .await
-        .is_err()
-    {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "failed to refresh credentials",
-        )
-            .into_response();
+    if let Err(response) = wait_for_persistence(&state, result.2).await {
+        return response;
     }
+    let reload_error = refresh_credentials_report(&state).await.err();
 
     Json(serde_json::json!({
         "password": result.0,
@@ -756,7 +1033,8 @@ async fn clients_create(
         "dtls_port": dtls_port,
         "wg_port": wg_port,
         "local_port": local_port,
-        "vk_hashes": vk_hashes
+        "vk_hashes": vk_hashes,
+        "reload_error": reload_error,
     }))
     .into_response()
 }
@@ -766,6 +1044,9 @@ async fn client_update(
     Path(password): Path<String>,
     Json(request): Json<CreateClientRequest>,
 ) -> Response {
+    if let Err(message) = validate_client_name(&request.name) {
+        return (StatusCode::BAD_REQUEST, message).into_response();
+    }
     if request.days < 0 || request.days > 3650 {
         return (StatusCode::BAD_REQUEST, "days must be 0..3650").into_response();
     }
@@ -774,7 +1055,7 @@ async fn client_update(
         Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
     };
 
-    {
+    let revision = {
         let mut db = state.app.db.write().await;
         let Some(entry) = db.passwords.get_mut(&password) else {
             return StatusCode::NOT_FOUND.into_response();
@@ -796,58 +1077,57 @@ async fn client_update(
         entry.wg_port = wg_port;
         entry.local_port = local_port;
         entry.ports = format!("{},{},{}", dtls_port, wg_port, local_port);
-        state.app.db_persistence.submit(db.clone());
+        state.app.db_persistence.submit(db.clone())
+    };
+    if let Err(response) = wait_for_persistence(&state, revision).await {
+        return response;
     }
-    if crate::protocol::refresh_credentials(&state.app)
-        .await
-        .is_err()
-    {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "failed to refresh credentials",
-        )
-            .into_response();
+    if let Err(message) = refresh_credentials_report(&state).await {
+        let warning = format!("saved but reload failed: {message}");
+        return (StatusCode::OK, [("x-csqtt-reload-error", warning)], "saved").into_response();
     }
     StatusCode::OK.into_response()
 }
 
 async fn client_toggle(State(state): State<WebState>, Path(password): Path<String>) -> Response {
-    {
+    let revision = {
         let mut db = state.app.db.write().await;
         let Some(entry) = db.passwords.get_mut(&password) else {
             return StatusCode::NOT_FOUND.into_response();
         };
         entry.is_deactivated = !entry.is_deactivated;
-        state.app.db_persistence.submit(db.clone());
+        state.app.db_persistence.submit(db.clone())
+    };
+    if let Err(response) = wait_for_persistence(&state, revision).await {
+        return response;
     }
 
     crate::protocol::drop_password_sessions(&state.app, &password);
-    if crate::protocol::refresh_credentials(&state.app)
-        .await
-        .is_err()
-    {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "failed to refresh credentials",
-        )
-            .into_response();
+    if let Err(message) = refresh_credentials_report(&state).await {
+        let warning = format!("saved but reload failed: {message}");
+        return (StatusCode::OK, [("x-csqtt-reload-error", warning)], "saved").into_response();
     }
 
     StatusCode::OK.into_response()
 }
 
 async fn client_unbind(State(state): State<WebState>, Path(password): Path<String>) -> Response {
-    {
+    let revision = {
         let mut db = state.app.db.write().await;
         if password == db.main_password {
             db.main_device_id.clear();
-            state.app.db_persistence.submit(db.clone());
+            db.clear_device_binding(&password);
+            state.app.db_persistence.submit(db.clone())
         } else if let Some(entry) = db.passwords.get_mut(&password) {
             entry.device_id.clear();
-            state.app.db_persistence.submit(db.clone());
+            db.clear_device_binding(&password);
+            state.app.db_persistence.submit(db.clone())
         } else {
             return StatusCode::NOT_FOUND.into_response();
         }
+    };
+    if let Err(response) = wait_for_persistence(&state, revision).await {
+        return response;
     }
 
     crate::protocol::drop_password_sessions(&state.app, &password);
@@ -856,52 +1136,61 @@ async fn client_unbind(State(state): State<WebState>, Path(password): Path<Strin
 }
 
 async fn client_delete(State(state): State<WebState>, Path(password): Path<String>) -> Response {
-    {
+    let revision = {
         let mut db = state.app.db.write().await;
         if db.passwords.remove(&password).is_none() {
             return StatusCode::NOT_FOUND.into_response();
         };
+        db.clear_device_binding(&password);
         state.app.derived_keys.remove(&password);
-        state.app.db_persistence.submit(db.clone());
+        state.app.db_persistence.submit(db.clone())
+    };
+    if let Err(response) = wait_for_persistence(&state, revision).await {
+        return response;
     }
 
     crate::protocol::drop_password_sessions(&state.app, &password);
-    if crate::protocol::refresh_credentials(&state.app)
-        .await
-        .is_err()
-    {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "failed to refresh credentials",
-        )
-            .into_response();
+    if let Err(message) = refresh_credentials_report(&state).await {
+        let warning = format!("saved but reload failed: {message}");
+        return (StatusCode::OK, [("x-csqtt-reload-error", warning)], "saved").into_response();
     }
 
     StatusCode::OK.into_response()
 }
 
 async fn reboot(State(state): State<WebState>) -> Response {
-    if protocol::notify_panel_restart(&state.app).is_err() {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    if state.app.restart_pending.swap(true, Ordering::AcqRel) {
+        return (
+            StatusCode::ACCEPTED,
+            [
+                (header::RETRY_AFTER, "3"),
+                (header::CACHE_CONTROL, "no-store"),
+            ],
+        )
+            .into_response();
     }
-    let app = state.app.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-        let _ = protocol::notify_panel_restart(&app);
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        let _ = protocol::notify_panel_restart(&app);
-        tokio::time::sleep(std::time::Duration::from_millis(650)).await;
-        protocol::drop_all_sessions(&app);
-        if let Err(error) = crate::request_service_restart() {
-            log_event(
-                &app,
-                "ERROR",
-                "SYSTEM",
-                &format!("Managed restart request failed: {error:#}"),
-            );
+
+    // This is the same managed-restart path used by the automatic uptime
+    // interval. It runs outside csqtt.service's cgroup, so the accepted HTTP
+    // response can be written before systemd stops the current process.
+    match crate::request_managed_restart(&state.app, "panel") {
+        Ok(()) => (
+            StatusCode::ACCEPTED,
+            [
+                (header::RETRY_AFTER, "3"),
+                (header::CACHE_CONTROL, "no-store"),
+            ],
+        )
+            .into_response(),
+        Err(error) => {
+            state.app.restart_pending.store(false, Ordering::Release);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("restart failed: {error:#}"),
+            )
+                .into_response()
         }
-    });
-    StatusCode::ACCEPTED.into_response()
+    }
 }
 
 async fn web_session_janitor(app: Arc<App>) {
@@ -918,8 +1207,14 @@ async fn web_session_janitor(app: Arc<App>) {
 
 pub enum DualProtocolStream {
     #[allow(dead_code)]
-    Plain(tokio::net::TcpStream),
-    Tls(Box<tokio_rustls::server::TlsStream<tokio::net::TcpStream>>),
+    Plain {
+        stream: tokio::net::TcpStream,
+        _permit: tokio::sync::OwnedSemaphorePermit,
+    },
+    Tls {
+        stream: Box<tokio_rustls::server::TlsStream<tokio::net::TcpStream>>,
+        _permit: tokio::sync::OwnedSemaphorePermit,
+    },
 }
 
 impl tokio::io::AsyncRead for DualProtocolStream {
@@ -929,8 +1224,12 @@ impl tokio::io::AsyncRead for DualProtocolStream {
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         match &mut *self {
-            DualProtocolStream::Plain(s) => std::pin::Pin::new(s).poll_read(cx, buf),
-            DualProtocolStream::Tls(s) => std::pin::Pin::new(s.as_mut()).poll_read(cx, buf),
+            DualProtocolStream::Plain { stream, .. } => {
+                std::pin::Pin::new(stream).poll_read(cx, buf)
+            }
+            DualProtocolStream::Tls { stream, .. } => {
+                std::pin::Pin::new(stream.as_mut()).poll_read(cx, buf)
+            }
         }
     }
 }
@@ -942,8 +1241,12 @@ impl tokio::io::AsyncWrite for DualProtocolStream {
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
         match &mut *self {
-            DualProtocolStream::Plain(s) => std::pin::Pin::new(s).poll_write(cx, buf),
-            DualProtocolStream::Tls(s) => std::pin::Pin::new(s.as_mut()).poll_write(cx, buf),
+            DualProtocolStream::Plain { stream, .. } => {
+                std::pin::Pin::new(stream).poll_write(cx, buf)
+            }
+            DualProtocolStream::Tls { stream, .. } => {
+                std::pin::Pin::new(stream.as_mut()).poll_write(cx, buf)
+            }
         }
     }
 
@@ -952,8 +1255,10 @@ impl tokio::io::AsyncWrite for DualProtocolStream {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         match &mut *self {
-            DualProtocolStream::Plain(s) => std::pin::Pin::new(s).poll_flush(cx),
-            DualProtocolStream::Tls(s) => std::pin::Pin::new(s.as_mut()).poll_flush(cx),
+            DualProtocolStream::Plain { stream, .. } => std::pin::Pin::new(stream).poll_flush(cx),
+            DualProtocolStream::Tls { stream, .. } => {
+                std::pin::Pin::new(stream.as_mut()).poll_flush(cx)
+            }
         }
     }
 
@@ -962,8 +1267,12 @@ impl tokio::io::AsyncWrite for DualProtocolStream {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         match &mut *self {
-            DualProtocolStream::Plain(s) => std::pin::Pin::new(s).poll_shutdown(cx),
-            DualProtocolStream::Tls(s) => std::pin::Pin::new(s.as_mut()).poll_shutdown(cx),
+            DualProtocolStream::Plain { stream, .. } => {
+                std::pin::Pin::new(stream).poll_shutdown(cx)
+            }
+            DualProtocolStream::Tls { stream, .. } => {
+                std::pin::Pin::new(stream.as_mut()).poll_shutdown(cx)
+            }
         }
     }
 }
@@ -971,12 +1280,14 @@ impl tokio::io::AsyncWrite for DualProtocolStream {
 #[derive(Clone)]
 pub struct DualAcceptor {
     tls_acceptor: axum_server::tls_rustls::RustlsAcceptor,
+    connections: Arc<tokio::sync::Semaphore>,
 }
 
 impl DualAcceptor {
     pub fn new(config: axum_server::tls_rustls::RustlsConfig) -> Self {
         Self {
             tls_acceptor: axum_server::tls_rustls::RustlsAcceptor::new(config),
+            connections: Arc::new(tokio::sync::Semaphore::new(MAX_WEB_CONNECTIONS)),
         }
     }
 }
@@ -995,21 +1306,50 @@ where
 
     fn accept(&self, stream: tokio::net::TcpStream, service: S) -> Self::Future {
         let tls_acceptor = self.tls_acceptor.clone();
+        let connections = self.connections.clone();
         Box::pin(async move {
+            let permit = connections.try_acquire_owned().map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::ConnectionAborted,
+                    "web connection limit",
+                )
+            })?;
             let mut buf = [0u8; 1];
-            let _ = stream.peek(&mut buf).await?;
+            let _ = tokio::time::timeout(Duration::from_secs(3), stream.peek(&mut buf))
+                .await
+                .map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::TimedOut, "web connection timed out")
+                })??;
             if buf[0] == 0x16 {
-                let (tls_stream, service) = tls_acceptor.accept(stream, service).await?;
-                Ok((DualProtocolStream::Tls(Box::new(tls_stream)), service))
+                let (tls_stream, service) = tokio::time::timeout(
+                    Duration::from_secs(3),
+                    tls_acceptor.accept(stream, service),
+                )
+                .await
+                .map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::TimedOut, "TLS handshake timed out")
+                })??;
+                Ok((
+                    DualProtocolStream::Tls {
+                        stream: Box::new(tls_stream),
+                        _permit: permit,
+                    },
+                    service,
+                ))
             } else {
                 let mut stream = stream;
                 use tokio::io::AsyncReadExt;
+                // Bound the whole header read, not each recv: a dribbling
+                // client must not pin an accept task for seconds.
+                let read_deadline = std::time::Instant::now() + Duration::from_millis(1200);
                 let mut read_buf = vec![0u8; 4096];
                 let mut total_read = 0;
-                while total_read < read_buf.len() - 1 {
+                while total_read < read_buf.len() - 1 && std::time::Instant::now() < read_deadline {
                     let max_to_read = std::cmp::min(1024, read_buf.len() - 1 - total_read);
+                    let remaining =
+                        read_deadline.saturating_duration_since(std::time::Instant::now());
                     match tokio::time::timeout(
-                        Duration::from_millis(500),
+                        remaining.max(Duration::from_millis(1)),
                         stream.read(&mut read_buf[total_read..total_read + max_to_read]),
                     )
                     .await
@@ -1046,6 +1386,14 @@ where
                     }
                 }
 
+                if !is_safe_redirect_host(&host) {
+                    host.clear();
+                }
+                if host.is_empty()
+                    && let Ok(local) = stream.local_addr()
+                {
+                    host = local.to_string();
+                }
                 if host.is_empty() {
                     host = "127.0.0.1:46002".to_string();
                 }
@@ -1093,16 +1441,18 @@ async fn logs_toggle(
     State(state): State<WebState>,
     Json(request): Json<LogsToggleRequest>,
 ) -> Response {
+    let revision = {
+        let mut db = state.app.db.write().await;
+        db.logging_active = Some(request.active);
+        state.app.db_persistence.submit(db.clone())
+    };
+    if let Err(response) = wait_for_persistence(&state, revision).await {
+        return response;
+    }
     state
         .app
         .logging_active
         .store(request.active, Ordering::Relaxed);
-
-    {
-        let mut db = state.app.db.write().await;
-        db.logging_active = Some(request.active);
-        state.app.db_persistence.submit(db.clone());
-    }
 
     StatusCode::OK.into_response()
 }
@@ -1156,7 +1506,7 @@ async fn local_proxy_get(State(state): State<WebState>) -> impl IntoResponse {
         "profiles": profiles,
         "route_active": active,
         "port_listening": state.app.proxy_port_listening.load(std::sync::atomic::Ordering::Acquire),
-        "health_error": state.app.proxy_health_error.read().unwrap().clone(),
+        "health_error": crate::read_unpoison(&state.app.proxy_health_error).clone(),
         "tcp_sessions": tcp_sessions,
         "udp_flows": udp_flows,
     }))
@@ -1166,6 +1516,9 @@ async fn local_proxy_create(
     State(state): State<WebState>,
     Json(request): Json<ProfileRequest>,
 ) -> Response {
+    if let Err(message) = validate_proxy_profile_name(&request.name) {
+        return (StatusCode::BAD_REQUEST, message).into_response();
+    }
     let port = if request.port == 0 {
         crate::model::DEFAULT_LOCAL_PROXY_PORT
     } else {
@@ -1186,13 +1539,16 @@ async fn local_proxy_create(
         return (StatusCode::BAD_REQUEST, error.to_string()).into_response();
     }
     let id = profile.id.clone();
-    {
+    let revision = {
         let mut db = state.app.db.write().await;
         if db.local_proxy.profiles.len() >= 20 {
             return (StatusCode::BAD_REQUEST, "Too many profiles (max 20)").into_response();
         }
         db.local_proxy.profiles.push(profile);
-        state.app.db_persistence.submit(db.clone());
+        state.app.db_persistence.submit(db.clone())
+    };
+    if let Err(response) = wait_for_persistence(&state, revision).await {
+        return response;
     }
     log_event(
         &state.app,
@@ -1209,6 +1565,9 @@ async fn local_proxy_update(
     Path(id): Path<String>,
     Json(request): Json<ProfileRequest>,
 ) -> Response {
+    if let Err(message) = validate_proxy_profile_name(&request.name) {
+        return (StatusCode::BAD_REQUEST, message).into_response();
+    }
     let port = if request.port == 0 {
         crate::model::DEFAULT_LOCAL_PROXY_PORT
     } else {
@@ -1224,10 +1583,9 @@ async fn local_proxy_update(
     if let Err(error) = crate::proxy_route::validate_config(&temp_profile) {
         return (StatusCode::BAD_REQUEST, error.to_string()).into_response();
     }
-    let was_active;
-    {
+    let (was_active, revision) = {
         let mut db = state.app.db.write().await;
-        was_active = db.local_proxy.active_profile_id == id;
+        let was_active = db.local_proxy.active_profile_id == id;
         let Some(profile) = db.local_proxy.find_profile_mut(&id) else {
             return (StatusCode::NOT_FOUND, "Profile not found").into_response();
         };
@@ -1237,7 +1595,10 @@ async fn local_proxy_update(
         profile.port = port;
         profile.username = request.username;
         profile.password = request.password;
-        state.app.db_persistence.submit(db.clone());
+        (was_active, state.app.db_persistence.submit(db.clone()))
+    };
+    if let Err(response) = wait_for_persistence(&state, revision).await {
+        return response;
     }
     if was_active {
         state.app.proxy_trigger.notify_one();
@@ -1253,14 +1614,16 @@ async fn local_proxy_update(
 }
 
 async fn local_proxy_delete(State(state): State<WebState>, Path(id): Path<String>) -> Response {
-    let was_active;
-    {
+    let (was_active, revision) = {
         let mut db = state.app.db.write().await;
-        was_active = db.local_proxy.active_profile_id == id;
+        let was_active = db.local_proxy.active_profile_id == id;
         if !db.local_proxy.remove_profile(&id) {
             return (StatusCode::NOT_FOUND, "Profile not found").into_response();
         }
-        state.app.db_persistence.submit(db.clone());
+        (was_active, state.app.db_persistence.submit(db.clone()))
+    };
+    if let Err(response) = wait_for_persistence(&state, revision).await {
+        return response;
     }
     if was_active {
         state.app.proxy_trigger.notify_one();
@@ -1274,14 +1637,42 @@ async fn local_proxy_delete(State(state): State<WebState>, Path(id): Path<String
     Json(serde_json::json!({ "deleted": true })).into_response()
 }
 
+// The monitor loop applies the TPROXY route asynchronously after the trigger;
+// wait briefly so the response reflects reality instead of pre-declaring success.
+async fn wait_proxy_route_applied(state: &WebState, want_active: bool) -> Result<(), String> {
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(8);
+    loop {
+        let route_active = state.app.proxy_route.read().await.is_some();
+        let health_error = read_unpoison(&state.app.proxy_health_error).clone();
+        if want_active {
+            if route_active && health_error.is_none() {
+                return Ok(());
+            }
+            if let Some(error) = health_error {
+                return Err(error);
+            }
+        } else if !route_active {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err("route is still applying; check status in a few seconds".to_owned());
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+}
+
 async fn local_proxy_activate(State(state): State<WebState>, Path(id): Path<String>) -> Response {
-    {
+    let revision = {
         let mut db = state.app.db.write().await;
         if db.local_proxy.find_profile(&id).is_none() {
             return (StatusCode::NOT_FOUND, "Profile not found").into_response();
         }
         db.local_proxy.active_profile_id = id.clone();
-        state.app.db_persistence.submit(db.clone());
+        state.app.db_persistence.submit(db.clone())
+    };
+    if let Err(response) = wait_for_persistence(&state, revision).await {
+        return response;
     }
     log_event(
         &state.app,
@@ -1290,14 +1681,20 @@ async fn local_proxy_activate(State(state): State<WebState>, Path(id): Path<Stri
         "Local SOCKS5 settings saved; applying TPROXY route",
     );
     state.app.proxy_trigger.notify_one();
-    Json(serde_json::json!({ "activated": true })).into_response()
+    match wait_proxy_route_applied(&state, true).await {
+        Ok(()) => Json(serde_json::json!({ "activated": true })).into_response(),
+        Err(error) => (StatusCode::BAD_GATEWAY, error).into_response(),
+    }
 }
 
 async fn local_proxy_deactivate(State(state): State<WebState>) -> Response {
-    {
+    let revision = {
         let mut db = state.app.db.write().await;
         db.local_proxy.active_profile_id.clear();
-        state.app.db_persistence.submit(db.clone());
+        state.app.db_persistence.submit(db.clone())
+    };
+    if let Err(response) = wait_for_persistence(&state, revision).await {
+        return response;
     }
     log_event(
         &state.app,
@@ -1306,7 +1703,10 @@ async fn local_proxy_deactivate(State(state): State<WebState>) -> Response {
         "Local SOCKS5 routing disabled; restoring direct route",
     );
     state.app.proxy_trigger.notify_one();
-    Json(serde_json::json!({ "deactivated": true })).into_response()
+    match wait_proxy_route_applied(&state, false).await {
+        Ok(()) => Json(serde_json::json!({ "deactivated": true })).into_response(),
+        Err(error) => (StatusCode::BAD_GATEWAY, error).into_response(),
+    }
 }
 
 async fn logs_download(State(state): State<WebState>) -> impl IntoResponse {
@@ -1332,6 +1732,12 @@ async fn logs_download(State(state): State<WebState>) -> impl IntoResponse {
 async fn security_headers(request: Request<Body>, next: Next) -> Response {
     let mut response = next.run(request).await;
     let h = response.headers_mut();
+    if !h.contains_key(header::CACHE_CONTROL) {
+        h.insert(
+            header::CACHE_CONTROL,
+            header::HeaderValue::from_static("no-store"),
+        );
+    }
     h.insert(
         header::X_CONTENT_TYPE_OPTIONS,
         header::HeaderValue::from_static("nosniff"),
@@ -1350,6 +1756,10 @@ async fn security_headers(request: Request<Body>, next: Next) -> Response {
             "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-ancestors 'none'",
         ),
     );
+    h.insert(
+        header::HeaderName::from_static("strict-transport-security"),
+        header::HeaderValue::from_static("max-age=15552000"),
+    );
     response
 }
 
@@ -1360,10 +1770,9 @@ pub async fn run(
     let state = WebState { app: app.clone() };
     let protected = Router::new()
         .route("/api/stats", get(stats))
+        .route("/api/memory/trim", post(memory_trim))
         .route("/api/settings", get(settings_get).post(settings_post))
         .route("/api/clients", get(clients_get).post(clients_create))
-        .route("/api/stream-debug", post(stream_debug_toggle))
-        .route("/api/clients/{password}/streams", get(client_streams))
         .route(
             "/api/clients/{password}",
             post(client_update).delete(client_delete),
@@ -1394,8 +1803,14 @@ pub async fn run(
 
     let router = Router::new()
         .route("/", get(root))
+        .route("/manifest.webmanifest", get(pwa_manifest))
+        .route("/sw.js", get(pwa_service_worker))
+        .route("/pwa-icon.svg", get(pwa_icon))
+        .route("/pwa-icon-192.png", get(pwa_icon_192))
+        .route("/pwa-icon-512.png", get(pwa_icon_512))
         .route("/api/login", post(login))
         .merge(protected)
+        .layer(DefaultBodyLimit::max(WEB_BODY_LIMIT_BYTES))
         .layer(middleware::from_fn(security_headers))
         .with_state(state);
 
@@ -1409,12 +1824,108 @@ pub async fn run(
     Ok(())
 }
 
+const PWA_MANIFEST: &str = r##"{
+  "id": "/",
+  "name": "CSQTT",
+  "short_name": "CSQTT",
+  "description": "Панель управления сервером CSQTT",
+  "lang": "ru",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "display_override": ["window-controls-overlay", "standalone"],
+  "prefer_related_applications": false,
+  "background_color": "#0a0a0c",
+  "theme_color": "#0a0a0c",
+  "icons": [
+    {
+      "src": "/pwa-icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/pwa-icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/pwa-icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}"##;
+
+const PWA_ICON_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><rect width="512" height="512" rx="122" fill="#0a0a0c"/><defs><linearGradient id="c" x1="128" y1="152" x2="390" y2="360" gradientUnits="userSpaceOnUse"><stop stop-color="#55adff"/><stop offset="1" stop-color="#0875f5"/></linearGradient></defs><path fill="url(#c)" d="M374 151a148 148 0 1 0 0 210l-44-37a91 91 0 1 1 0-136z"/></svg>"##;
+
+static PWA_ICON_192_PNG: LazyLock<Vec<u8>> = LazyLock::new(|| {
+    base64::engine::general_purpose::STANDARD
+        .decode("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")
+        .unwrap_or_default()
+});
+
+static PWA_ICON_512_PNG: LazyLock<Vec<u8>> = LazyLock::new(|| {
+    base64::engine::general_purpose::STANDARD
+        .decode("iVBORw0KGgoAAAANSUhEUgAAAgAAAAIACAYAAAD0eNT6AAAW3UlEQVR42u3d6Xdc9X3H8Tws4EWyhbBlWbYsY1my8dYlbbqSEEsBg7P0UUOTNE0CYTvgpJBuKZbUJBBCNtLS7S+JPOafCtjY50zvb2auNJJGQsss997v68HrSc7JE1n2+3N/9zfDpx58cF8dAIjlU34IAGAAAAAGAABgAAAABgAAYAAAAAYAAGAAAAAGAABgAAAABgAAYAAAAAYAAGAAAAAGAABgAAAABgAAYAAAAAYAAGAAAAAGAABgAAAABgAAYAAAAAYAAGAAAAAGAABgAAAABgAAYAAAAAYAAGAAAAAGAABgAAAABgAAYAAAAAYAAGAAAAAGAABgAAAABgAAYAAAAAYAAGAAAAAGAAAYAACAAQAAGAAAgAEAABgAAIABAAAYAACAAQAAGAAAgAEAABgAAIABAAAYAACAAQAAGAAAgAEAABgAAIABAAAYAABgAPghAIABAAAYAACAAQAAGAAAgAEAABgAAIABAAAYAACAAQAAGAAAgAEAABgAAIABAAAYAACAAQAAGAAAgAEAAAYAAGAAAD00+aWljs5//3b90/95r6M/avcfG/1hy+z3btdPfnFpjRMtfvaAAQA9dOrLSysey6L+J+/fa/jjLXz6/Xt7jv8Gv7lX/4MtzNy4XZ+4vrTCnx0YAMA2jF6YXwn9Z/4ri/x6798rbPx/P3mvsyuZieuLDSPn5/1ZgwEAYt+M/f1G8NtVKf5X3vt4rV83TTyz2GAUgAEAlQ/+xdc/qH/mv++vChr/5PI606/VDAIwAKAa7+5T8P80C31O/DvHf8WvPq5fajnzaq1+PBsEfpfAAIBSPOW3B1/8dxf/TsazMXDY6QAYAFCU6E9l0f+zTaIv/t2J/8V2vzQGwACAQUb/f+43iX9f49/ugjEABgD02proi38h4r/e+NPuDIABAF1wOov+pTc+2Bh+8S9c/C/8YtXpV2rGABgAsLvw/3mn6It/4eP/2DqGABgAsKVHsnf76Wk/hV/8qxH/dulU4NA5dwXAAID28P9gNfziX734n09+3mQIgAFA9GP+r2TH/P97v0n8Q8R/vbFrXg+AAUDM8It/2Pifa2MIgAFApPCLv/gn764yBMAAoOrhF3/xXxf/prv12czYtQV/d8AAoMyX+y6ny33iL/47iH/u1MvpsuCcv0tgAFC28P9Fp/CLv/hvI/5rhsBLhgAYABReHn7xF/9uxH/2Z3frMy2T2RDwdwwMAAr4nj8Pv/iLf6/j3879ADAAKNhxv/iLf6/jnzuZXgvMei0ABgCFeOoXf/HvR/zPJu80HX3KaQAYAPT1qX99+MVf/Psd/3ZOAzAAoI+X/MRf/IsQ/2T6neZrAX9HMQCg20/9Fzs/9Yu/+Bch/u2GnQZgAECX3vX/9ZL4i38p4t/w07v1I0+6G4ABAHt66t/syF/8xb+o8c+deLHmNAADAHZ15P9/98Vf/EsZ/zNtjAAMANimK+mpX/zFvwLxz6XTAH+3MQBgi6d+8Rf/qsW/4e279YkXvBLAAICO8f/LFH7xF/8Kxv/RNkYABgC03fIXf/GPEP+cTwlgAOB9f3bkL/7iHyn+ufRKwL8BGACIv/iLf6D4n24xAjAACPm+X/zFP3L8G95qGnIvAAMA8Rd/8Y8VfyMAAwDxF3/xDxr/qRYjAAMA8Rd/8Q8WfyMAA4DKfsxP/MVf/LeO/9Rbd+pTP7lTH/2CjwliAFCRm/7iL/7iv73458afv+XfEAwAxF/8xT9S/E+1GAEYAIi/+It/sPgbARgAiL/4i3/Q+BsBGACIv/iLf9D4J5OZY0YABgDiL/7iHyv+kz9uMgIwAPBRP/EX/2Dxz43O+4ggBgC+5Ef8xT9U/HNDM74sCAMA8Rd/8Q8V/5MtRgAGAOIv/uIfLP4NPzICMAAQf/EX/3DxNwAwABgI8Rd/8Rd/MACCftxP/MVf/Psf/7Hnbok/BgDiL/7iHy3+/h3CAGBgn/UXf/EXf/EHAyDYpT/xF3/xF38wAMRf/MVf/Hsc/4d98x8GAIN87y/+4i/+PucPBoD4i7/4i7/4gwFQ5aN/8Rd/8Rd/MADEX/zFX/x7GH+X/TAAGLjL6ehf/EsX/zOv1urjzyyucfj8/I7//NP/Z/zpxYZjybXF+ulXauIv/mAAVP3z/uJf7Pin0B/P4p4M6vdkLBsFyVQ2DMRf/DEAqMLRv/gXLv6Djv3ORsGC+O8g/j7mhwFAIYh/MeI//VqtPpEFf2QXx/dFcejcXGMMnHq5Jv6bxN9lPwwACv3eX/z7E/88+lX9/UpjYPKlmviLPwYAhTr6vzAv/gOIf9Wjv50xIP5gAFCwo3/x7138y368383XBEefWggT/7HnXfbDAKBIt/6/siT+fYp/xKf97WofAuIPBgADOPoX/+7G/+yNmvDvwJFsCJzMXg+IPxgA9PHin/h3L/4p/I75d294dq45BEoefx/zwwCg8Ef/4t+9+E9c98TftROBJxdKG3+X/TAAKPzFP/HvTvyFv7dDQPzBAKCLR//iv/f4p+N+v1f9ceLFmviDAcBeL/6J/97j7z3/YO4HFDH+LvthAFCKp3/x31v8J64v+X0qwGsB8QcDgB08/Yv/3uLvqb+YpwHiDwYAWzz9i//u4z9z47bfo4KaeKE2kPj7mB8GgB9CKT72J/67j7+n/uIbyk4D+hl/l/3AACgF8d9d/NNTv/iXawRMfLcm/mAAsOnTv/hvK/5+f8rpeDYCxB8MAE//4r/j+LvlX36j2acEuhl/l/3AACj307/4f2L8HflX65WA+IMB4Olf/MU/8AgQfzAAYj79i7/4Bx8B4g8GQLynf/EXfzqOgK3i77IfGACl/dY/8Rd/Nh8B4g8GQCVdSt/6J/7iT8cRIP5gAFT36V/8xZ/NR0AW+fXhP5a97xd/MADK/fT/xgfiL/7sYAQcc9kPDIBKXP4Tf/Fn2yNA/MEAqMZH/768JP7iD2AARHz6F39H/wAGQLWNZt/8J/4b+d0AMADiHP+Lv6N/AAMg2PG/+Pu8P4ABEOz4X/wbrjj6BzAAwhz/i/9K/B39AxgAMY7/xX8l/mdv1PxOABgAMY7/xb8Z/yvvfex3AsAAiOFUdvwv/s34T1xf9DsBYADEIP7N+Hv6BzAAwg+AiPH39A9gAIQ+/o8Yfxf/AAyAUC6+/kH4+Cc+9gdgAIQ9/o8af0//AAZA2I//RY1/493/M979AxgAAd//R47/lV+7+Q9gAAR8/x89/p7+AQyAcKLH39M/gAEQ8v1/9Ph7+gcwAEK+/48c/8RH/wAMgJgDIHD8p1/z0T8AAyDi+//A8b/s+B/AAIg7AOLG/7LLfwAGQNgLgIHj7/gfwAAI/P4/Zvwd/wMYAOEHQMT4O/4HMABCv/+PGn/H/wAGQFhR4+/4H8AAMAACxv+yL/8BMAAiv/+PGv/Lv/L+H8AAiD4AAsb/uON/AAMg9AAIGP9LBgCAARDZY9+/HTL+lxz/AxgAoS8ABo2/AQBgAIQfABHjf+ZVn/8HMAACixh/7/8BDAADIGD8DQAAAyC0yS8thYy/9/8ABoABEDD+BgCAAWAABIz/RQMAwAAwAOLF3ycAAAwAAyBY/JNxFwABDIDoAyBa/A0AAAMgvPPZ1wBHi//FXxoAAAZAcBHjbwAAGAAGQMD4J4fPz/vzBzAADIBI8U/82QMYAAZAsPhfMAAADAADIF78DQAAA8AACBh/AwDAAAgvYvwNAAADwAAIGH8DAMAAMAACxv/CLwwAAAMg+gAIGH8DAMAAMAACxt8AADAADICA8X/MAAAwAAyAePE3AAAMAAMgYPwNAAADILyI8U/8x4AADAADIFj8k/Gn/eeAAQyAwGa/dztc/A0AAAMgvJNfXAoX/+SYAQBgABgAseJ/Pg2AawYAgAEQfQAEi//5n39cP/1KzZ8/gAEQewBEi3/Onz+AARDWiS0GQJXjbwAAGAAGQMD4GwAABkB4EeOfjLkICGAAGACx4n/OAAAwAAyAePFPpnwSAMAAiD4AosW/4V33AAAMgMBmbtwOGX8DAMAACG3i+lLI+CfuAQAYAAZAsPg3B8CC3wEAA8AAiBT/c+/erc9m/A4AGABhRY1/cujcnN8BAAMg7gCIGP/EawAAAyCsqPFPTr3s+wAADICw9wAWQ8Z/1j0AAAPAAIgZ/9mfeQ0AYAAENXJ+Pmz8ZzKTL3kNAGAARL0HEDT+Ob8DAAZA6AEQMf4zXgMAGABh7wE8sxg2/l4DABgABkDA+Od8KRCAARDyImDk+J/NHH3KawAAAyCgyPE/+06T3wMAAyCc6ddqoeOfOAUAMABi3gMIHH+nAAAGQNh7ANHjnxxxCgBgAEQTPf7TmZM+EghgAERz5tVa6Pjnhmd9JBDAAAjkeHYPIHr8nQIAGAChXwNEjX/DT7O7AE+6CwBgAAQbANHjn/P7AGAAhDGevQYQ/7v1M04BAAyASA5nHwcU/1V+JwAMgDDEf9WJF10IBDAAIr0GEP8VPhYIYADEeQ0g/k1v360/+rZXAQAGQBDivxr/xIVAAAMgzGsA8V/LqwAAAyDEawDx38jvBoABEOM1gPivMfGCTwUAGABVfw3w9KL4tzndMuRVAIABUPlTAPFfE/+Gt4wAAAOg4k6/UhP/dfFPJr7rVQCAAVDx1wDivzb+ueNGAIABUGXivzH+Uy2jvh8AwACIcAog/qvxz7kPAGAAVPoUQPw3xn/qrTv1qZ/cMQJYse/M1frBry/7WYABUJ3LgOLfOf45I4AU/+F//rA+lDlgBIABUAWHzs2L/xbxP9ViBIj/UJs0AtL/7ucDBkClTgHEf238jQDxH9qEEQAGQGVOAcS/c/yNAPHf4J8+rB/MPGQEgAFQZuL/yfFPJtMImDECxL8Z/4NGABgAZTd2bVH8txH/yR83GQHiv96Br7kcCAZASYn/9uJvBIj/ZvYbAWAAlPYUQPy3FX8jQPw3nAC0GAFgAJTzFED8tx3/ky0Pz/va4LI78NmbXYl/wz9mI+BvjQAwAEp5CiD+241/w4/u1Meeu+X3p6TSt/t1M/7tXA4EA6BUxH9n8c+lEeCVQPm+2rdX8W+cBBgBYACU6xRgQfx3GP/cicxBI6A07/t7Hf/9RgAYAGVz6uWa+O8i/jmvBIp/5N+v+Df8IPvWwMdv+vljALCvBN8OOCf+u4x/O6cBxXzq73f8c/uedTkQA4AynAK8VBP/PcT/xL/fqU9kRnxKYPC3/D93c/DxzxkBGACU4RRA/PcW/3ZOAwb01P8vHxYn/kYABgBlMdnhFED8dx7/3NHvuBvQt3f931guZvwbftfwoMuBGAAUmfh3J/7J8WQpey0w57VAT4/7U/gLHv+HkjeyEfCoEYABQIE/Fij+3Yt/O0OgR+EvSfxzRgAGAIV1MnsVIP7djX/uSPZa4MBZ9wP29IU++XF/CeO/MgL+6k1/nhgAFPBC4Oyc+Pcg/uNt0hA47ERgR0/8G8Jf0vg3BkDy7G/92WIAUDxHn1oQ/x7Ff8Vi0+GrhsBW4T+0PvpViH/uq0YABgAFJP69j39yrOVQNgS8Hmge8+fhr3T8X28xAjAAKOKrAPHvT/yPLX604pFvLzfGQMSn/aHsmD8Pf4j4t3M5EAOAol0IFP/+xb9h4aP6WMvot6o9Bg48sTH6EeP/QIsRgAFAoYj/YOK/Xj4GyvyaYN/01Ub0h1P0//XDjuGPGn8jAAOAwhlOrwLEf6DxT462u/lRYwyU4XQgBT85nAU/J/6d478yAnxMEAOAojjy5IL4Fyj+7Y60jPx99jG5bBAMD3AUHHxiIdN8wm8PvvhvP/4P/MPv6r+X/I3LgRgAFMSJF2viX9D4r/HmqkcyI99crg99fmGN/bt4jbB/eq4+lAV+qBH5pkN/t1wf+eFHqzaJvvjvMP5GAAYARXsVIP7liv9mRpN/6+zhdj/caGQz4t/d+BsBGAAUdgSIv/iLf2/j38blQAwAivEqQPzFX/z7Fn8jAAOAwph4oSb+4i/+fYy/EYABQGFeBYi/+It/f+Ofe8DHBDEAKNIIEH/xF//ex9/lQAwACvP9AOIv/uLf5/gbARgAFOU+gPiLv/j3Of5GAAYAhRkB4i/+4t/f+LePAJcDMQAYFPEXf/EfQPx9QgADgEEbyi4Fir/4i/9g4m8EYAAw8BEg/uIv/oOJvwGAAUBBRoD4i7/4iz8GAPFGgPiLv/iLPwYA8Yx+YUH8xV/8+8A3A2IAUDjjz98Sf/EX/15/BNC/NRgAlGUEiL/4i7/4YwAQbASIv/iLv/hjABBsBIi/+Iu/+GMAENCxNALEX/zFX/wxADACxF/8xV/8MQCI8hHB+QXxF3/x91E/DABCflnQzJz4i7/4+5IfDADCjgDxF3/xF38MAIwA8Rd/8Rd/DACCjQDxF3/xF38MAAIae+6W+It/7Pi76Y8BgBEg/uIv/mAAEMpI9jFB8Rf/SPH3MT8MAGg5mN0LEH/xjxB/7/sxAKDDCDj6nVviL/7VjH868hd/DADYXD4CxF/8KxV/f7cxAGB7pwHiL/5ViL+nfgwA2OkIODtXP5KdBoi/+Jcy/o78MQBgj58SmFsQf/EvVfzd8scAgC45kJ0GiL/4lyH+nvoxAKAH0isB8Rf/QsbfRT8MAOjDaYD4i3+B4u+pHwMA+ujQ1QXxF/+Bxt+7fjAAGOBpwCPfXhZ/8e9v/N3wBwOAAp0GiL/49yH+nvrBAKCARr+1LP7i75IfGABEfS3QPgTEX/wd94MBQLAh8HA2BMRf/IUfDACC3g8Qf/H3nh8MAIIPAfEXf+EHA4CAhrMhIP7iL/xgABB5CIh/6PgLPxgABL8sOPLNZfGPEn+X+8AAgHb7OwwB8a9Q/IUfDAD4JEOfXxD/isTfMT8YALDzIfDEQv1wdiog/iWLf/a0L/xgAEDXxoD4Fzv+og8GAPTursD0XHMMiH8h4t+Ivnf7YADAIMaA+Pc3/qIPBgAUxr5sDBxsHwPi39X4iz4YAFCO7xd44mZ9+BvL4r/b+LvIBwYAlP904OrKIBD/TeL/1exz+p7ywQCASg+CM9kg+NzNhqjxb8Re8MEAAKNgdRRULv5iDwYAsMNPGnz25ooDX18ubvyf/e1q6L27BwMA6PHJQTYMOtn/teW9x//Z5fpDj9/MvNnw4OMCDxgAAGAA+CEAgAEAABgAAIABAAAYAACAAQAAGAAAgAEAABgAAIABAAAYAACAAQAAGAAAgAEAABgAAIABAAAYAACAAQAABgAAYAAAAAYAAGAAAAAGAABgAAAABgAAYAAAAAYAAGAAAAAGAABgAAAABgAAYAAAAAYAAGAAAAAGAABgAAAABgAAYAAAAAYAAGAAAAAGAAAYAACAAQAAGAAAgAEAABgAAIABAAAYAACAAQAAGAAAgAEAABgAAIABAAAYAACAAQAAGAAAgAEAABgAAGAAAAAGAABgAAAABgAAYAAAAAYAAGAAAAAGAABgAAAABgAAYAAAAAYAAGAAAAAGAABgAAAABgAAYAAAgAHgBwEABgAAYAAAAAYAAGAAAAAGAABgAAAABgAAYAAAAAYAAGAAAAAGAABgAAAABgAAYAAAAAYAAGAAAIAB4IcAAAYAAGAAAAAGAABgAAAABgAAYAAAAAYAAGAAAAAGAABgAAAABgAAYAAAAAYAAGAAAAAGAABgAAAABgAAGAAAQAz/Dxw3WBbFbYk0AAAAAElFTkSuQmCC")
+        .unwrap_or_default()
+});
+
+const PWA_SERVICE_WORKER: &str = r##"const CACHE_NAME = 'csqtt-panel-shell-2.1.5-pwa2';
+const SHELL_ASSETS = ['/manifest.webmanifest', '/pwa-icon.svg', '/pwa-icon-192.png', '/pwa-icon-512.png'];
+const OFFLINE_PAGE = '<!doctype html><html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>CSQTT</title><style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#0a0a0c;color:#f4f4f5;font:16px system-ui,-apple-system,Segoe UI,Roboto,sans-serif}main{max-width:320px;padding:28px;text-align:center}h1{margin:0 0 12px;color:#55adff;font-size:28px}p{margin:0;color:#a1a1aa;line-height:1.5}</style><main><h1>CSQTT</h1><p>Нет соединения с сервером. Проверьте сеть и откройте панель снова.</p></main></html>';
+
+self.addEventListener('install', event => {
+  event.waitUntil((async () => {
+    const cache = await caches.open(CACHE_NAME);
+    await cache.addAll(SHELL_ASSETS);
+    await self.skipWaiting();
+  })());
+});
+
+self.addEventListener('activate', event => {
+  event.waitUntil((async () => {
+    const names = await caches.keys();
+    await Promise.all(names.filter(name => name !== CACHE_NAME).map(name => caches.delete(name)));
+    await self.clients.claim();
+  })());
+});
+
+self.addEventListener('fetch', event => {
+  const request = event.request;
+  if (request.method !== 'GET') return;
+  const url = new URL(request.url);
+  if (url.origin !== self.location.origin || url.pathname.startsWith('/api/')) return;
+
+  if (request.mode === 'navigate') {
+    event.respondWith(fetch(request).catch(() => new Response(OFFLINE_PAGE, {
+      headers: { 'content-type': 'text/html; charset=utf-8' }
+    })));
+    return;
+  }
+
+  if (SHELL_ASSETS.includes(url.pathname)) {
+    event.respondWith(caches.match(request).then(cached => cached || fetch(request)));
+  }
+});
+"##;
+
 const LOGIN_HTML: &str = r##"
 <!DOCTYPE html>
 <html lang="ru">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="theme-color" content="#0a0a0c">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <link rel="manifest" href="/manifest.webmanifest">
+    <link rel="icon" type="image/png" sizes="192x192" href="/pwa-icon-192.png">
+    <link rel="apple-touch-icon" sizes="192x192" href="/pwa-icon-192.png">
+    <link rel="icon" type="image/svg+xml" href="/pwa-icon.svg">
     <title>Вход</title>
     <style>
         :root {
@@ -1444,8 +1955,8 @@ const LOGIN_HTML: &str = r##"
 
         .input-group { margin-bottom: 20px; }
         .input-group label { display: block; font-size: 13px; font-weight: 600; color: var(--text-muted); margin-bottom: 8px; text-transform: uppercase; letter-spacing: 0.05em; }
-        .input-group input { width: 100%; height: 52px; background: #f8fafc; border: 1px solid var(--border); border-radius: 14px; padding: 0 16px; font-size: 15px; color: var(--text-main); outline: none; transition: all 0.2s; }
-        .input-group input:focus { border-color: var(--primary); box-shadow: 0 0 0 4px rgba(0, 119, 255, 0.1); }
+        .input-group input, .input-group select { width: 100%; height: 52px; background: #f8fafc; border: 1px solid var(--border); border-radius: 14px; padding: 0 16px; font-size: 15px; color: var(--text-main); outline: none; transition: all 0.2s; }
+        .input-group input:focus, .input-group select:focus { border-color: var(--primary); box-shadow: 0 0 0 4px rgba(0, 119, 255, 0.1); }
 
         button { width: 100%; height: 52px; background: var(--primary); color: white; border: none; border-radius: 14px; font-size: 16px; font-weight: 600; cursor: pointer; transition: all 0.2s; margin-top: 12px; box-shadow: 0 8px 16px rgba(0, 119, 255, 0.25); }
         button:hover { transform: translateY(-2px); box-shadow: 0 12px 20px rgba(0, 119, 255, 0.35); }
@@ -1471,6 +1982,11 @@ const LOGIN_HTML: &str = r##"
         </form>
     </main>
     <script>
+        if ('serviceWorker' in navigator && window.isSecureContext) {
+            window.addEventListener('load', () => {
+                navigator.serviceWorker.register('/sw.js', { scope: '/' }).catch(() => {});
+            });
+        }
         function caesarEncode(s) {
             const bytes = new TextEncoder().encode(s);
             let bin = '';
@@ -1504,8 +2020,15 @@ const PANEL_HTML: &str = r##"
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="theme-color" content="#0a0a0c">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <link rel="manifest" href="/manifest.webmanifest">
+    <link rel="icon" type="image/png" sizes="192x192" href="/pwa-icon-192.png">
+    <link rel="apple-touch-icon" sizes="192x192" href="/pwa-icon-192.png">
+    <link rel="icon" type="image/svg+xml" href="/pwa-icon.svg">
     <title>CSQTT</title>
-    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAxMDggMTA4Ij48cmVjdCB3aWR0aD0iMTA4IiBoZWlnaHQ9IjEwOCIgcng9IjI0IiBmaWxsPSIjMEQwRTExIi8+PGRlZnM+PHJhZGlhbEdyYWRpZW50IGlkPSJnMSIgY3g9IjU0IiBjeT0iNTQiIHI9IjQwIj48c3RvcCBvZmZzZXQ9IjAlIiBzdG9wLWNvbG9yPSIjMDQ3NEZCIiBzdG9wLW9wYWNpdHk9IjAuMTUiLz48c3RvcCBvZmZzZXQ9IjYwJSIgc3RvcC1jb2xvcj0iIzAyNUVDQiIgc3RvcC1vcGFjaXR5PSIwLjA0Ii8+PHN0b3Agb2Zmc2V0PSIxMDAlIiBzdG9wLWNvbG9yPSIjMDAwMDAwIiBzdG9wLW9wYWNpdHk9IjAiLz48L3JhZGlhbEdyYWRpZW50PjxsaW5lYXJHcmFkaWVudCBpZD0iZzIiIHgxPSIyOCIgeTE9IjM2IiB4Mj0iNzgiIHkyPSI3MiIgZ3JhZGllbnRVbml0cz0idXNlclNwYWNlT25Vc2UiPjxzdG9wIG9mZnNldD0iMCUiIHN0b3AtY29sb3I9IiM0RkEzRkYiLz48c3RvcCBvZmZzZXQ9IjEwMCUiIHN0b3AtY29sb3I9IiMwNDc0ZmIiLz48L2xpbmVhckdyYWRpZW50PjwvZGVmcz48Y2lyY2xlIGN4PSI1NCIgY3k9IjU0IiByPSI0MCIgZmlsbD0idXJsKCNnMSkiLz48cGF0aCBkPSJNIDc4LjYsMzYuOCBBIDMwLDMwIDAgMSwwIDc4LjYsNzEuMiBMIDY5LjYsNjQuOSBBIDE5LDE5IDAgMSwxIDY5LjYsNDMuMSBaIiBmaWxsPSJ1cmwoI2cyKSIvPjwvc3ZnPg==">
     <style>
         :root {
             --bg-color: #f8fafc;
@@ -1541,7 +2064,7 @@ const PANEL_HTML: &str = r##"
         .stat-card, .stat-icon, .stat-value, .stat-sub, .progress-bar, .progress-fill,
         .section-header, .section-title, .table-wrapper, table, th, td, tr,
         .client-name, .client-pw, .client-hash, .traffic-flex, .badge, .actions,
-        .settings-grid, .setting-card, .input-group, .input-group input,
+        .settings-grid, .setting-card, .input-group, .input-group input, .input-group select,
         .toggle-row, .switch, .slider, dialog, .dlg-row, .dlg-actions,
         svg, path, rect, line, polyline, circle, .tab-btn {
             transition: background-color 0.3s ease, border-color 0.3s ease, color 0.3s ease, fill 0.3s ease, stroke 0.3s ease, box-shadow 0.3s ease;
@@ -1701,8 +2224,8 @@ const PANEL_HTML: &str = r##"
         input { background: var(--bg-color); color: var(--text-main); border: 1px solid var(--border); border-radius: 12px; outline: none; }
         .input-group { margin-bottom: 16px; }
         .input-group label { display: block; font-size: 13px; font-weight: 600; color: var(--text-muted); margin-bottom: 8px; text-transform: uppercase; }
-        .input-group input { width: 100%; height: 48px; background: var(--bg-color); color: var(--text-main); border: 1px solid var(--border); border-radius: 12px; padding: 0 16px; font-size: 14px; outline: none; transition: background 0.3s, border-color 0.3s, color 0.3s; }
-        .input-group input:focus { border-color: var(--primary); box-shadow: 0 0 0 3px rgba(0, 119, 255, 0.15); }
+        .input-group input, .input-group select { width: 100%; height: 48px; background: var(--bg-color); color: var(--text-main); border: 1px solid var(--border); border-radius: 12px; padding: 0 16px; font-size: 14px; outline: none; transition: background 0.3s, border-color 0.3s, color 0.3s; }
+        .input-group input:focus, .input-group select:focus { border-color: var(--primary); box-shadow: 0 0 0 3px rgba(0, 119, 255, 0.15); }
         .input-group input.is-invalid { border-color: #ef4444 !important; box-shadow: 0 0 0 3px rgba(239, 68, 68, 0.15) !important; }
         
         .toggle-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 16px; padding: 12px; background: var(--bg-color); border-radius: 12px; border: 1px solid var(--border); transition: background 0.3s, border-color 0.3s; }
@@ -1779,57 +2302,6 @@ const PANEL_HTML: &str = r##"
         .client-card-value {
             color: var(--text-main);
             font-weight: 500;
-        }
-        .clients-toolbar {
-            display: flex;
-            align-items: center;
-            justify-content: flex-end;
-            gap: 16px;
-            width: 100%;
-        }
-        .stream-debug-control {
-            display: flex;
-            align-items: center;
-            gap: 10px;
-            color: var(--text-muted);
-            font-size: 13px;
-            font-weight: 600;
-            white-space: nowrap;
-        }
-        .stream-card-actions {
-            display: inline-flex;
-            align-items: center;
-            gap: 8px;
-        }
-        .stream-stats-btn {
-            height: 28px;
-            min-height: 28px;
-            padding: 0 10px;
-            border: 1px solid var(--primary);
-            border-radius: 8px;
-            background: var(--icon-bg);
-            color: var(--primary);
-            font-size: 11px;
-            font-weight: 700;
-            cursor: pointer;
-            white-space: nowrap;
-        }
-        .stream-stats-btn:hover {
-            background: var(--primary);
-            color: #ffffff;
-        }
-        .stream-count-value {
-            height: 28px;
-            min-width: 28px;
-            padding: 0 8px;
-            display: inline-flex;
-            align-items: center;
-            justify-content: center;
-            border-radius: 8px;
-            background: var(--surface-hover);
-            color: var(--text-main);
-            font-weight: 700;
-            font-family: ui-monospace, SFMono-Regular, 'Cascadia Code', Consolas, monospace;
         }
         
         .dlg-header {
@@ -2179,157 +2651,6 @@ const PANEL_HTML: &str = r##"
         }
         .night-switch.is-on .ns-on { color: #ffffff; }
         .night-switch.is-off .ns-off { color: #ffffff; }
-        .stream-stats-dialog {
-            width: min(1240px, calc(100% - 32px));
-            max-height: calc(100vh - 40px);
-            padding: 24px;
-            overflow: hidden;
-        }
-        .stream-stats-summary {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 8px;
-            margin-bottom: 12px;
-        }
-        .stream-summary-chip {
-            padding: 7px 10px;
-            border-radius: 9px;
-            background: var(--surface-hover);
-            border: 1px solid var(--border);
-            color: var(--text-main);
-            font-size: 12px;
-            font-family: ui-monospace, SFMono-Regular, 'Cascadia Code', Consolas, monospace;
-        }
-        .stream-stats-note {
-            color: var(--text-muted);
-            font-size: 12px;
-            line-height: 1.45;
-            margin-bottom: 12px;
-        }
-        .stream-stats-table-wrap {
-            max-height: calc(100vh - 245px);
-            overflow: auto;
-            border: 1px solid var(--border);
-            border-radius: 12px;
-        }
-        .stream-stats-table {
-            display: table;
-            min-width: 1160px;
-            font-size: 12px;
-        }
-        .stream-stats-table thead {
-            display: table-header-group;
-        }
-        .stream-stats-table tbody {
-            display: table-row-group;
-        }
-        .stream-stats-table tr {
-            display: table-row;
-        }
-        .stream-stats-table th,
-        .stream-stats-table td {
-            display: table-cell;
-            width: auto;
-            padding: 9px 10px;
-            white-space: nowrap;
-        }
-        .stream-stats-table th {
-            position: sticky;
-            top: 0;
-            z-index: 1;
-        }
-        .stream-state {
-            display: inline-flex;
-            align-items: center;
-            gap: 6px;
-        }
-        .stream-state-dot {
-            width: 7px;
-            height: 7px;
-            border-radius: 50%;
-            background: #10b981;
-        }
-        .stream-state-dot.waiting {
-            background: #f59e0b;
-        }
-        @media(max-width: 768px) {
-            .clients-toolbar {
-                align-items: stretch;
-                flex-direction: column;
-                gap: 10px;
-            }
-            .stream-debug-control {
-                justify-content: space-between;
-            }
-            .stream-stats-dialog {
-                width: calc(100% - 16px) !important;
-                padding: 16px 12px !important;
-            }
-            .stream-stats-table-wrap {
-                max-height: calc(100vh - 260px);
-                max-height: calc(100dvh - 260px);
-                overflow-x: hidden;
-                padding: 8px;
-                background: var(--bg-color);
-            }
-            .stream-stats-table {
-                display: block;
-                width: 100%;
-                min-width: 0;
-                font-size: 12px;
-            }
-            .stream-stats-table thead {
-                display: none;
-            }
-            .stream-stats-table tbody {
-                display: grid;
-                gap: 8px;
-            }
-            .stream-stats-table tr {
-                display: grid;
-                grid-template-columns: repeat(2, minmax(0, 1fr));
-                gap: 0;
-                padding: 6px;
-                background: var(--surface);
-                border: 1px solid var(--border);
-                border-radius: 10px;
-            }
-            .stream-stats-table td {
-                display: flex;
-                width: auto;
-                min-width: 0;
-                flex-direction: column;
-                gap: 3px;
-                padding: 6px 7px;
-                white-space: normal;
-                overflow-wrap: anywhere;
-                border: 0;
-            }
-            .stream-stats-table td::before {
-                content: attr(data-label);
-                color: var(--text-muted);
-                font-size: 9px;
-                font-weight: 700;
-                line-height: 1.2;
-                text-transform: uppercase;
-                letter-spacing: 0.04em;
-            }
-            .stream-stats-table .stream-cell-source,
-            .stream-stats-table .stream-cell-packets,
-            .stream-stats-table .stream-cell-total,
-            .stream-stats-table .stream-cell-state,
-            .stream-stats-table .stream-stats-empty {
-                grid-column: 1 / -1;
-            }
-            .stream-stats-table .stream-stats-empty {
-                display: block;
-                padding: 12px;
-                text-align: center;
-            }
-            .stream-stats-table .stream-stats-empty::before {
-                content: none;
-            }
-        }
     </style>
 </head>
 <body>
@@ -2349,9 +2670,9 @@ const PANEL_HTML: &str = r##"
                 <button class="btn btn-ghost btn-icon" onclick="toggleTheme()" title="Сменить тему">
                     <svg id="themeIcon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>
                 </button>
-                <svg class="version-logo" viewBox="0 0 504 64" role="img" aria-label="v2.0.0 by amurcanov" fill="none" stroke="url(#versionLogoGradient)" stroke-width="6" stroke-linecap="round" stroke-linejoin="round">
-                    <defs><linearGradient id="versionLogoGradient" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="504" y2="64"><stop offset="0" stop-color="#45B7FF"></stop><stop offset="0.45" stop-color="#2087FF"></stop><stop offset="1" stop-color="#075BFF"></stop></linearGradient></defs>
-                    <path d="M8,24 L18,48 L28,24 M34,20 Q38,14 46,14 H50 Q58,14 58,22 Q58,28 52,33 L36,48 H58 M67,47 L67.8,47 M86,14 C78,14 74,20 74,31 C74,42 78,48 86,48 C94,48 98,42 98,31 C98,20 94,14 86,14 Z M107,47 L107.8,47 M126,14 C118,14 114,20 114,31 C114,42 118,48 126,48 C134,48 138,42 138,31 C138,20 134,14 126,14 Z M150,12 V48 M150,31 Q155,24 162,24 Q172,24 172,36 Q172,48 162,48 Q155,48 150,41 M182,24 L192,47 M202,24 L192,47 L188,57 Q186,60 181,58 M238,30 Q234,24 227,24 Q216,24 216,36 Q216,48 227,48 Q234,48 238,42 M238,24 V48 M248,48 V24 M248,31 Q252,24 258,24 Q265,24 265,32 V48 M265,31 Q269,24 275,24 Q282,24 282,32 V48 M292,24 V39 Q292,48 302,48 Q312,48 312,39 V24 M322,48 V24 M322,32 Q326,24 336,24 M370,29 Q366,24 358,24 Q348,24 348,36 Q348,48 358,48 Q366,48 370,43 M402,30 Q398,24 391,24 Q380,24 380,36 Q380,48 391,48 Q398,48 402,42 M402,24 V48 M412,48 V24 M412,32 Q417,24 424,24 Q434,24 434,35 V48 M455,24 Q444,24 444,36 Q444,48 455,48 Q466,48 466,36 Q466,24 455,24 Z M476,24 L486,48 L496,24"></path>
+                <svg class="version-logo" viewBox="0 0 516 64" role="img" aria-label="v2.1.5 by amurcanov" fill="none" stroke="url(#versionLogoGradient)" stroke-width="6" stroke-linecap="round" stroke-linejoin="round">
+                    <defs><linearGradient id="versionLogoGradient" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="516" y2="64"><stop offset="0" stop-color="#45B7FF"></stop><stop offset="0.45" stop-color="#2087FF"></stop><stop offset="1" stop-color="#075BFF"></stop></linearGradient></defs>
+                    <path d="M8,24 L18,48 L28,24 M34,20 Q38,14 46,14 H50 Q58,14 58,22 Q58,28 52,33 L36,48 H58 M67,47 L67.8,47 M86,14 V48 M107,47 L107.8,47 M142,14 H121 V30 Q126,24 133,24 Q142,24 142,36 Q142,48 132,48 Q125,48 121,42 M158,12 V48 M158,31 Q163,24 170,24 Q180,24 180,36 Q180,48 170,48 Q163,48 158,41 M190,24 L200,47 M210,24 L200,47 L196,57 Q194,60 189,58 M250,30 Q246,24 239,24 Q228,24 228,36 Q228,48 239,48 Q246,48 250,42 M250,24 V48 M260,48 V24 M260,31 Q264,24 270,24 Q277,24 277,32 V48 M277,31 Q281,24 287,24 Q294,24 294,32 V48 M304,24 V39 Q304,48 314,48 Q324,48 324,39 V24 M334,48 V24 M334,32 Q338,24 348,24 M382,29 Q378,24 370,24 Q360,24 360,36 Q360,48 370,48 Q378,48 382,43 M414,30 Q410,24 403,24 Q392,24 392,36 Q392,48 403,48 Q410,48 414,42 M414,24 V48 M424,48 V24 M424,32 Q429,24 436,24 Q446,24 446,35 V48 M467,24 Q456,24 456,36 Q456,48 467,48 Q478,48 478,36 Q478,24 467,24 Z M488,24 L498,48 L508,24"></path>
                 </svg>
             </div>
         </div>
@@ -2444,16 +2765,7 @@ const PANEL_HTML: &str = r##"
         <div id="clients-section" style="display: none;">
             <section>
                 <div class="section-header" style="justify-content: flex-end;">
-                    <div class="clients-toolbar">
-                        <div class="stream-debug-control">
-                            <span>Расширенная отладка потоков</span>
-                            <label class="switch">
-                                <input type="checkbox" id="streamDebugToggle" onchange="toggleStreamDebug()">
-                                <span class="slider"></span>
-                            </label>
-                        </div>
-                        <button class="btn btn-primary" onclick="openNewClientDlg()">Создать доступ</button>
-                    </div>
+                    <button class="btn btn-primary" onclick="openNewClientDlg()">Создать доступ</button>
                 </div>
                 <div id="clientsCards" class="client-cards-grid"></div>
             </section>
@@ -2501,6 +2813,19 @@ const PANEL_HTML: &str = r##"
                         </div>
                         <button id="saveDnsBtn" class="btn btn-primary" style="width: 100%; margin-top: 22px;" onclick="saveDnsSettings()" disabled>Сохранить DNS</button>
                     </div>
+                    <div class="glass-panel setting-card" style="display: flex; flex-direction: column; justify-content: space-between;">
+                        <div class="input-group" style="margin-bottom: 0;">
+                            <label for="auto_restart_interval">Интервал перезагрузок</label>
+                            <select id="auto_restart_interval">
+                                <option value="0" selected>Отключено (по умолчанию)</option>
+                                <option value="12">12 часов</option>
+                                <option value="24">24 часа</option>
+                                <option value="48">48 часов</option>
+                                <option value="72">72 часа</option>
+                            </select>
+                        </div>
+                        <button id="saveAutoRestartIntervalBtn" class="btn btn-primary" style="width: 100%; margin-top: 22px;" onclick="saveAutoRestartInterval()" disabled>Сохранить интервал</button>
+                    </div>
                 </div>
             </section>
 
@@ -2521,7 +2846,7 @@ const PANEL_HTML: &str = r##"
 
             <section style="margin-top: 20px;">
                 <div class="glass-panel support-card">
-                    <h3 class="support-card-title">Поддержать разработчика Amucanov</h3>
+                    <h3 class="support-card-title">Поддержать разработчика Amurcanov</h3>
                     <a class="yoomoney-button" href="https://yoomoney.ru/to/4100119505530465/100" target="_blank" rel="noopener noreferrer" aria-label="Перейти в ЮMoney" title="ЮMoney">
                         <svg class="yoomoney-logo" viewBox="0 0 92 20" aria-hidden="true" fill="#ffffff">
                             <path d="M33.9287 15.222H36.2782V9.5425C36.2782 8.34 37.1107 7.9145 37.9247 7.9145C38.8127 7.9145 39.4047 8.4695 39.4047 9.5425V15.222H41.7542V9.5425C41.7542 8.3215 42.5867 7.9145 43.4007 7.9145C44.2887 7.9145 44.8807 8.4695 44.8807 9.5425V15.222H47.2302V9.3575C47.2302 6.9895 45.7502 5.75 43.9187 5.75C42.6977 5.75 41.8282 6.305 41.1622 7.119C40.5702 6.2125 39.6082 5.75 38.5167 5.75C37.5177 5.75 36.7592 6.194 36.1672 6.86L36.0377 5.9535H33.9287V15.222Z"></path>
@@ -2628,7 +2953,7 @@ const PANEL_HTML: &str = r##"
         <h2>Создание доступа</h2>
         <div class="input-group">
             <label for="cname">Имя клиента</label>
-            <input id="cname">
+            <input id="cname" maxlength="128">
         </div>
         <div class="input-group">
             <label for="days">Срок действия (дней)</label>
@@ -2683,7 +3008,7 @@ const PANEL_HTML: &str = r##"
         
         <div class="input-group">
             <label for="edit_name">Имя клиента</label>
-            <input id="edit_name">
+            <input id="edit_name" maxlength="128">
         </div>
         
         <div class="input-group">
@@ -2749,42 +3074,6 @@ const PANEL_HTML: &str = r##"
         </div>
     </dialog>
 
-    <dialog id="streamStatsDlg" class="stream-stats-dialog" onclose="stopStreamStats()">
-        <div class="dlg-header">
-            <div>
-                <h2 id="streamStatsTitle">Статистика потоков</h2>
-                <div id="streamStatsPassword" style="color: var(--text-muted); font-size: 12px; margin-top: 4px;"></div>
-            </div>
-            <button class="close-btn" onclick="document.getElementById('streamStatsDlg').close()">
-                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
-            </button>
-        </div>
-        <div id="streamStatsSummary" class="stream-stats-summary"></div>
-        <div class="stream-stats-note">Скорость и пакеты в секунду считаются по дельте серверных счётчиков раз в секунду. Протокол не измеряет RTT, поэтому в миллисекундах показана фактическая давность последней активности.</div>
-        <div class="stream-stats-table-wrap">
-            <table class="stream-stats-table">
-                <thead>
-                    <tr>
-                        <th>#</th>
-                        <th>Источник</th>
-                        <th>Туннель</th>
-                        <th>Режим</th>
-                        <th>↑ Сейчас</th>
-                        <th>↓ Сейчас</th>
-                        <th>Пакеты/с</th>
-                        <th>Всего отладки</th>
-                        <th>Активность, мс</th>
-                        <th>Возраст</th>
-                        <th>Состояние</th>
-                    </tr>
-                </thead>
-                <tbody id="streamStatsBody">
-                    <tr><td class="stream-stats-empty" colspan="11">Загрузка...</td></tr>
-                </tbody>
-            </table>
-        </div>
-    </dialog>
-
     <dialog id="rebootDlg">
         <h2>Перезапуск сервера</h2>
         <p style="color: var(--text-muted); font-size: 15px; margin-bottom: 24px;">Вы уверены, что хотите перезапустить CSQTT? Активные соединения будут прерваны на несколько секунд.</p>
@@ -2798,6 +3087,11 @@ const PANEL_HTML: &str = r##"
     <div class="toast-container" id="toastContainer"></div>
 
     <script>
+        if ('serviceWorker' in navigator && window.isSecureContext) {
+            window.addEventListener('load', () => {
+                navigator.serviceWorker.register('/sw.js', { scope: '/' }).catch(() => {});
+            });
+        }
         function openCryptoDonateDlg() {
             document.getElementById('cryptoDonateDlg').showModal();
         }
@@ -2926,13 +3220,6 @@ const PANEL_HTML: &str = r##"
             }
         }
 
-        window.streamDebugEnabled = false;
-        let streamDebugToggling = false;
-        let streamStatsTimer = null;
-        let streamStatsBusy = false;
-        let streamStatsPassword = "";
-        let streamStatsPrevious = new Map();
-
         async function loadStats() {
             let r = await api("/api/stats"); if(!r.ok) return; let x = await r.json();
             document.getElementById('status_val').textContent = x.status === "Active" ? "Активно" : x.status;
@@ -2954,26 +3241,18 @@ const PANEL_HTML: &str = r##"
                 `Shared: ${x.ram_shared || '0 MB'}`,
                 `Swap: ${x.ram_swap || '0 MB'}`,
                 `Пик: ${x.ram_peak || '0 MB'}`,
+                `PSS: ${x.ram_pss || 'н/д'} · private: ${x.ram_private || 'н/д'} · shared: ${x.ram_shared_rollup || 'н/д'}`,
+                `smaps PSS anon/file/shmem: ${x.ram_anon_rollup || 'н/д'} / ${x.ram_file_rollup || 'н/д'} / ${x.ram_shmem_rollup || 'н/д'} · Anonymous RSS-like: ${x.ram_anonymous_rollup || 'н/д'}`,
+                `Аллокатор: ${x.allocator || 'system'}`,
                 `Сессии: ${Number(x.hot_sessions) || 0}/${Number(x.hot_session_capacity) || 0}`,
-                `TPROXY TCP/UDP: ${Number(x.local_proxy_tcp_sessions) || 0}/${Number(x.local_proxy_udp_flows) || 0}`
+                `TPROXY TCP/UDP: ${Number(x.local_proxy_tcp_sessions) || 0}/${Number(x.local_proxy_udp_flows) || 0}`,
+                `Эпохи движка: ${Number(x.mem_engine_epochs) || 0} · device-эпохи: ${Number(x.mem_device_epochs) || 0}`,
+                `Ключи: ${Number(x.mem_derived_keys) || 0} · web-сессии: ${Number(x.mem_web_sessions) || 0}/${Number(x.mem_web_session_capacity) || 0} · login-limit: ${Number(x.mem_login_limits) || 0}`,
+                `stream repair/inventory: ${Number(x.mem_stream_repairs) || 0}/${Number(x.mem_stream_inventory) || 0} · DPI: ${Number(x.mem_dpi_ring) || 0} · логи: ${Number(x.mem_log_ring) || 0} (${Number(x.mem_log_bytes) || 0} B)`,
+                `Циклов memory trim: ${Number(x.memory_trim_count) || 0}${Number(x.memory_trim_last_unix) ? ` · последнее: ${new Date(Number(x.memory_trim_last_unix) * 1000).toLocaleTimeString()}` : ''}`
             ].join('\n');
             document.getElementById('traffic_up').textContent = "↑ " + size(x.up);
             document.getElementById('traffic_down').textContent = "↓ " + size(x.down);
-
-            const streamDebugToggle = document.getElementById('streamDebugToggle');
-            if (streamDebugToggle && !streamDebugToggling) {
-                const enabled = Boolean(x.stream_debug_enabled);
-                const changed = window.streamDebugEnabled !== enabled;
-                window.streamDebugEnabled = enabled;
-                streamDebugToggle.checked = enabled;
-                if (!enabled) {
-                    const dlg = document.getElementById('streamStatsDlg');
-                    if (dlg && dlg.open) dlg.close();
-                }
-                if (changed && document.getElementById('clients-section').style.display !== 'none') {
-                    loadClients();
-                }
-            }
 
             updateLocalProxyRuntime(
                 Boolean(x.local_proxy_enabled),
@@ -2988,6 +3267,7 @@ const PANEL_HTML: &str = r##"
         let savedMainPassword = '';
         let savedDnsPrimary = '';
         let savedDnsSecondary = '';
+        let savedAutoRestartInterval = 0;
 
         function setRestartRequired(required) {
             document.getElementById('restartRequiredBanner')?.classList.toggle('visible', Boolean(required));
@@ -2997,13 +3277,18 @@ const PANEL_HTML: &str = r##"
             const mainPassword = document.getElementById('mainpass')?.value ?? '';
             const dnsPrimary = document.getElementById('dns_primary')?.value.trim() ?? '';
             const dnsSecondary = document.getElementById('dns_secondary')?.value.trim() ?? '';
+            const autoRestartInterval = Number(document.getElementById('auto_restart_interval')?.value ?? 0);
             const mainButton = document.getElementById('saveMainPasswordBtn');
             const dnsButton = document.getElementById('saveDnsBtn');
+            const autoRestartButton = document.getElementById('saveAutoRestartIntervalBtn');
             if (mainButton && !mainButton.classList.contains('saving')) {
                 mainButton.disabled = mainPassword === savedMainPassword;
             }
             if (dnsButton && !dnsButton.classList.contains('saving')) {
                 dnsButton.disabled = dnsPrimary === savedDnsPrimary && dnsSecondary === savedDnsSecondary;
+            }
+            if (autoRestartButton && !autoRestartButton.classList.contains('saving')) {
+                autoRestartButton.disabled = autoRestartInterval === savedAutoRestartInterval;
             }
         }
 
@@ -3012,9 +3297,13 @@ const PANEL_HTML: &str = r##"
             savedMainPassword = x.main_password || '';
             savedDnsPrimary = x.dns_primary || '';
             savedDnsSecondary = x.dns_secondary || '';
+            savedAutoRestartInterval = [0, 12, 24, 48, 72].includes(Number(x.auto_restart_interval_hours))
+                ? Number(x.auto_restart_interval_hours)
+                : 0;
             document.getElementById('mainpass').value = savedMainPassword;
             document.getElementById('dns_primary').value = savedDnsPrimary;
             document.getElementById('dns_secondary').value = savedDnsSecondary;
+            document.getElementById('auto_restart_interval').value = String(savedAutoRestartInterval);
             setRestartRequired(x.restart_required);
             updateSettingsDirtyState();
             loadLocalProxy();
@@ -3228,172 +3517,12 @@ const PANEL_HTML: &str = r##"
                         </div>
                         <div class="client-card-row">
                             <span class="client-card-label">Потоки:</span>
-                            <span class="stream-card-actions">
-                                ${window.streamDebugEnabled && x.active_sessions > 0 ? `<button class="stream-stats-btn" onclick="openStreamStats(event, ${idx})">Открыть статистику</button>` : ''}
-                                <span class="stream-count-value">${x.active_sessions}</span>
-                            </span>
+                            <span class="client-card-value">${x.active_sessions}</span>
                         </div>
                     </div>
                 </div>
                 `;
             }).join("");
-        }
-
-        async function toggleStreamDebug() {
-            const toggle = document.getElementById('streamDebugToggle');
-            if (!toggle || streamDebugToggling) return;
-            const previous = window.streamDebugEnabled;
-            const requested = toggle.checked;
-            streamDebugToggling = true;
-            toggle.disabled = true;
-            try {
-                const r = await api("/api/stream-debug", {
-                    method: "POST",
-                    body: JSON.stringify({ enabled: requested })
-                });
-                if (!r.ok) {
-                    toggle.checked = previous;
-                    showToast(await r.text(), "error");
-                    return;
-                }
-                const result = await r.json();
-                window.streamDebugEnabled = Boolean(result.enabled);
-                toggle.checked = window.streamDebugEnabled;
-                if (!window.streamDebugEnabled) {
-                    const dlg = document.getElementById('streamStatsDlg');
-                    if (dlg.open) dlg.close();
-                }
-                await loadClients();
-                showToast(window.streamDebugEnabled ? "Отладка потоков включена" : "Отладка потоков выключена");
-            } catch (e) {
-                toggle.checked = previous;
-            } finally {
-                streamDebugToggling = false;
-                toggle.disabled = false;
-            }
-        }
-
-        function formatStreamRate(bytesPerSecond) {
-            return bytesPerSecond === null ? "…" : size(Math.round(bytesPerSecond)) + "/с";
-        }
-
-        function formatStreamDuration(milliseconds) {
-            const ms = Math.max(0, Math.round(milliseconds));
-            if (ms < 1000) return ms + " мс";
-            if (ms < 60000) return (ms / 1000).toFixed(1) + " с";
-            if (ms < 3600000) return Math.floor(ms / 60000) + " м " + Math.floor(ms % 60000 / 1000) + " с";
-            return uptime(Math.floor(ms / 1000));
-        }
-
-        function stopStreamStats() {
-            if (streamStatsTimer) {
-                clearInterval(streamStatsTimer);
-                streamStatsTimer = null;
-            }
-            streamStatsPassword = "";
-            streamStatsPrevious.clear();
-        }
-
-        function openStreamStats(event, idx) {
-            event.stopPropagation();
-            const client = window.clientsData && window.clientsData[idx];
-            if (!client || !window.streamDebugEnabled) return;
-            const dlg = document.getElementById('streamStatsDlg');
-            stopStreamStats();
-            streamStatsPassword = client.password;
-            document.getElementById('streamStatsTitle').textContent = "Потоки: " + (client.name || "Без имени");
-            document.getElementById('streamStatsPassword').textContent = "Пароль: " + client.password;
-            document.getElementById('streamStatsSummary').innerHTML = '<span class="stream-summary-chip">Загрузка первого замера...</span>';
-            document.getElementById('streamStatsBody').innerHTML = '<tr><td class="stream-stats-empty" colspan="11">Загрузка...</td></tr>';
-            const tableWrap = dlg.querySelector('.stream-stats-table-wrap');
-            tableWrap.scrollTop = 0;
-            tableWrap.scrollLeft = 0;
-            dlg.showModal();
-            refreshStreamStats();
-            streamStatsTimer = setInterval(refreshStreamStats, 1000);
-        }
-
-        async function refreshStreamStats() {
-            const dlg = document.getElementById('streamStatsDlg');
-            if (!dlg.open || !streamStatsPassword || streamStatsBusy) return;
-            const requestedPassword = streamStatsPassword;
-            streamStatsBusy = true;
-            try {
-                const r = await api("/api/clients/" + encodeURIComponent(requestedPassword) + "/streams");
-                if (!r.ok || requestedPassword !== streamStatsPassword) return;
-                const data = await r.json();
-                if (!data.enabled) {
-                    window.streamDebugEnabled = false;
-                    const toggle = document.getElementById('streamDebugToggle');
-                    if (toggle) toggle.checked = false;
-                    dlg.close();
-                    loadClients();
-                    return;
-                }
-
-                const sampledAt = performance.now();
-                const serverNow = Number(data.server_now) || 0;
-                const streams = Array.isArray(data.streams) ? data.streams : [];
-                const next = new Map();
-                let totalUpRate = 0;
-                let totalDownRate = 0;
-                let ratedStreams = 0;
-
-                const rows = streams.map((stream, index) => {
-                    const previous = streamStatsPrevious.get(stream.id);
-                    let upRate = null;
-                    let downRate = null;
-                    let upPps = null;
-                    let downPps = null;
-                    if (previous) {
-                        const seconds = Math.max((sampledAt - previous.sampledAt) / 1000, 0.001);
-                        upRate = Math.max(0, Number(stream.up_bytes) - previous.upBytes) / seconds;
-                        downRate = Math.max(0, Number(stream.down_bytes) - previous.downBytes) / seconds;
-                        upPps = Math.max(0, Number(stream.up_packets) - previous.upPackets) / seconds;
-                        downPps = Math.max(0, Number(stream.down_packets) - previous.downPackets) / seconds;
-                        totalUpRate += upRate;
-                        totalDownRate += downRate;
-                        ratedStreams++;
-                    }
-                    next.set(stream.id, {
-                        sampledAt,
-                        upBytes: Number(stream.up_bytes),
-                        downBytes: Number(stream.down_bytes),
-                        upPackets: Number(stream.up_packets),
-                        downPackets: Number(stream.down_packets)
-                    });
-
-                    const activityMs = stream.last_seen ? Math.max(0, serverNow - Number(stream.last_seen)) * 1000 : null;
-                    const ageMs = Math.max(0, serverNow - Number(stream.created_at)) * 1000;
-                    const ready = Boolean(stream.tunnel_ready && stream.handshake_ready);
-                    const stateText = ready ? "Готов" : (stream.handshake_ready ? "Туннель..." : "Рукопожатие...");
-                    const sourceDetails = stream.device_id ? `<div style="color: var(--text-muted); font-size: 10px;">${esc(stream.device_id)} · gen ${Number(stream.generation)}</div>` : "";
-                    return `<tr>
-                        <td data-label="#">${index + 1}</td>
-                        <td data-label="Источник" class="stream-cell-source"><div>${esc(stream.source)}</div>${sourceDetails}</td>
-                        <td data-label="Туннель">${esc(stream.tunnel_ip || "—")}</td>
-                        <td data-label="Режим">${esc(stream.mode)}</td>
-                        <td data-label="↑ Сейчас">${formatStreamRate(upRate)}</td>
-                        <td data-label="↓ Сейчас">${formatStreamRate(downRate)}</td>
-                        <td data-label="Пакеты/с" class="stream-cell-packets">${upPps === null ? "…" : "↑ " + upPps.toFixed(0) + " / ↓ " + downPps.toFixed(0)}</td>
-                        <td data-label="Всего" class="stream-cell-total">↑ ${size(Number(stream.up_bytes))} / ↓ ${size(Number(stream.down_bytes))}</td>
-                        <td data-label="Активность">${activityMs === null ? "—" : formatStreamDuration(activityMs)}</td>
-                        <td data-label="Возраст">${formatStreamDuration(ageMs)}</td>
-                        <td data-label="Состояние" class="stream-cell-state"><span class="stream-state"><span class="stream-state-dot ${ready ? "" : "waiting"}"></span>${stateText}</span></td>
-                    </tr>`;
-                }).join("");
-
-                streamStatsPrevious = next;
-                document.getElementById('streamStatsBody').innerHTML = rows || '<tr><td class="stream-stats-empty" colspan="11">Активных потоков для этого пароля сейчас нет.</td></tr>';
-                document.getElementById('streamStatsSummary').innerHTML = `
-                    <span class="stream-summary-chip">Активных: ${streams.length}</span>
-                    <span class="stream-summary-chip">↑ ${ratedStreams ? formatStreamRate(totalUpRate) : "первый замер"}</span>
-                    <span class="stream-summary-chip">↓ ${ratedStreams ? formatStreamRate(totalDownRate) : "первый замер"}</span>
-                    <span class="stream-summary-chip">Интервал: 1 с</span>
-                `;
-            } finally {
-                streamStatsBusy = false;
-            }
         }
 
         function openEditClientDlgByIndex(idx) {
@@ -3769,6 +3898,27 @@ const PANEL_HTML: &str = r##"
             setRestartRequired(result.restart_required);
             await animateSavedButton(button, 'Сохранить DNS');
         }
+        async function saveAutoRestartInterval() {
+            const button = document.getElementById('saveAutoRestartIntervalBtn');
+            if (!button || button.disabled) return;
+            const hours = Number(document.getElementById('auto_restart_interval').value);
+            if (![0, 12, 24, 48, 72].includes(hours)) {
+                showToast('Выберите допустимый интервал перезагрузки', 'error');
+                return;
+            }
+            button.classList.add('saving'); button.disabled = true;
+            const response = await api('/api/settings', {
+                method: 'POST', body: JSON.stringify({ auto_restart_interval_hours: hours })
+            });
+            if (!response.ok) {
+                button.classList.remove('saving');
+                showToast(await response.text(), 'error');
+                updateSettingsDirtyState();
+                return;
+            }
+            savedAutoRestartInterval = hours;
+            await animateSavedButton(button, 'Сохранить интервал');
+        }
         async function executeReboot() {
             document.getElementById('rebootDlg').close();
             const response = await api("/api/reboot", {method: "POST"});
@@ -3790,6 +3940,9 @@ const PANEL_HTML: &str = r##"
             document.getElementById('logs-section').style.display = tabId === 'logs' ? 'block' : 'none';
             document.getElementById('settings-section').style.display = tabId === 'settings' ? 'block' : 'none';
             localStorage.setItem('csqtt-active-tab', tabId);
+            if (tabId === 'clients') {
+                loadClients();
+            }
             if (tabId === 'logs') {
                 loadLogs();
             }
@@ -3800,12 +3953,14 @@ const PANEL_HTML: &str = r##"
 
         let updateIntervalId = null;
         let logsIntervalId = null;
+        let nextClientsRefreshAt = 0;
         function startUpdateInterval(ms) {
             if (updateIntervalId) clearInterval(updateIntervalId);
             updateIntervalId = setInterval(() => {
                 loadStats();
-                if (document.getElementById('clients-section').style.display !== 'none') {
+                if (document.getElementById('clients-section').style.display !== 'none' && Date.now() >= nextClientsRefreshAt) {
                     loadClients();
+                    nextClientsRefreshAt = Date.now() + 30000;
                 }
             }, ms);
             if (!logsIntervalId) {
@@ -3826,7 +3981,8 @@ const PANEL_HTML: &str = r##"
         document.getElementById('mainpass')?.addEventListener('input', updateSettingsDirtyState);
         document.getElementById('dns_primary')?.addEventListener('input', updateSettingsDirtyState);
         document.getElementById('dns_secondary')?.addEventListener('input', updateSettingsDirtyState);
-        loadStats(); loadSettings(); loadClients(); if (savedTab === 'logs') { loadLogs(); }
+        document.getElementById('auto_restart_interval')?.addEventListener('change', updateSettingsDirtyState);
+        loadStats(); loadSettings(); if (savedTab === 'clients') { loadClients(); } if (savedTab === 'logs') { loadLogs(); }
         
         const savedInterval = parseInt(localStorage.getItem('csqtt-update-interval'), 10) || 3000;
         const selectElem = document.getElementById('updateIntervalSelect');
@@ -3842,7 +3998,21 @@ const PANEL_HTML: &str = r##"
 
 #[cfg(test)]
 mod tests {
-    use super::{PANEL_HTML, normalize_client_vk_hashes, process_memory};
+    use super::{
+        LOGIN_HTML, MAX_CLIENT_NAME_BYTES, PANEL_HTML, PWA_ICON_192_PNG, PWA_ICON_512_PNG,
+        PWA_MANIFEST, PWA_SERVICE_WORKER, normalize_client_vk_hashes, process_memory,
+        process_memory_rollup, validate_client_name, validate_proxy_profile_name,
+    };
+
+    #[test]
+    fn persisted_text_fields_have_byte_and_control_character_limits() {
+        assert!(validate_client_name("normal client").is_ok());
+        assert!(validate_client_name(&"x".repeat(MAX_CLIENT_NAME_BYTES)).is_ok());
+        assert!(validate_client_name(&"x".repeat(MAX_CLIENT_NAME_BYTES + 1)).is_err());
+        assert!(validate_client_name("bad\nname").is_err());
+        assert!(validate_proxy_profile_name(&"x".repeat(64)).is_ok());
+        assert!(validate_proxy_profile_name(&"x".repeat(65)).is_err());
+    }
 
     #[test]
     fn client_vk_hashes_accept_empty_or_one_to_six_values() {
@@ -3879,6 +4049,30 @@ mod tests {
     }
 
     #[test]
+    fn pwa_uses_standalone_shell_without_caching_authenticated_panel_data() {
+        assert!(PWA_MANIFEST.contains("\"display\": \"standalone\""));
+        assert!(PWA_MANIFEST.contains("\"start_url\": \"/\""));
+        assert!(PWA_MANIFEST.contains("\"sizes\": \"192x192\""));
+        assert!(PWA_MANIFEST.contains("pwa-icon-192.png"));
+        assert!(PWA_MANIFEST.contains("pwa-icon-512.png"));
+        assert!(LOGIN_HTML.contains("manifest.webmanifest"));
+        assert!(PANEL_HTML.contains("manifest.webmanifest"));
+        assert!(LOGIN_HTML.contains("pwa-icon-192.png"));
+        assert!(PANEL_HTML.contains("pwa-icon-192.png"));
+        assert!(PWA_SERVICE_WORKER.contains("url.pathname.startsWith('/api/')"));
+        assert!(PWA_SERVICE_WORKER.contains("SHELL_ASSETS"));
+        assert!(PWA_SERVICE_WORKER.contains("fetch(request).catch"));
+    }
+
+    #[test]
+    fn pwa_raster_icon_fallbacks_are_valid_pngs() {
+        const PNG_SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
+        assert!(PWA_ICON_192_PNG.starts_with(PNG_SIGNATURE));
+        assert!(PWA_ICON_512_PNG.starts_with(PNG_SIGNATURE));
+        assert!(PWA_ICON_512_PNG.len() > PWA_ICON_192_PNG.len());
+    }
+
+    #[test]
     fn process_memory_reads_linux_status_fields() {
         let memory = process_memory(
             "VmHWM:\t850000 kB\nVmRSS:\t400000 kB\nRssAnon:\t350000 kB\nRssFile:\t45000 kB\nRssShmem:\t5000 kB\nVmSwap:\t12000 kB\n",
@@ -3889,5 +4083,20 @@ mod tests {
         assert_eq!(memory.file, 45000);
         assert_eq!(memory.shared, 5000);
         assert_eq!(memory.swap, 12000);
+    }
+
+    #[test]
+    fn process_memory_rollup_reads_attribution_fields() {
+        let memory = process_memory_rollup(
+            "Pss:\t700 kB\nPss_Anon:\t650 kB\nPss_File:\t40 kB\nPss_Shmem:\t10 kB\nAnonymous:\t680 kB\nShared_Clean:\t12 kB\nShared_Dirty:\t3 kB\nPrivate_Clean:\t20 kB\nPrivate_Dirty:\t640 kB\nSwapPss:\t7 kB\n",
+        );
+        assert_eq!(memory.pss, 700);
+        assert_eq!(memory.pss_anon, 650);
+        assert_eq!(memory.anonymous, 680);
+        assert_eq!(memory.file, 40);
+        assert_eq!(memory.shmem, 10);
+        assert_eq!(memory.private, 660);
+        assert_eq!(memory.shared, 15);
+        assert_eq!(memory.swap_pss, 7);
     }
 }

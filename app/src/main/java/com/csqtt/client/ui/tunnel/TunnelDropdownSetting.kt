@@ -25,6 +25,7 @@ import androidx.compose.material.icons.filled.ArrowDropDown
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -42,6 +43,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import com.csqtt.client.ui.design.CsqttShapes
 
 data class ModeIndicator(
     val progress: Float,
@@ -128,11 +130,17 @@ internal fun CompactDropdownSetting(
                 onClick = { expanded = true },
                 enabled = enabled,
                 modifier = Modifier.fillMaxWidth().height(44.dp),
-                shape = RoundedCornerShape(14.dp),
+                shape = CsqttShapes.Pill,
                 contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+                colors = ButtonDefaults.outlinedButtonColors(
+                    containerColor = Color.Transparent,
+                    contentColor = MaterialTheme.colorScheme.onSurface,
+                    disabledContainerColor = Color.Transparent,
+                    disabledContentColor = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.45f),
+                ),
             ) {
                 Column(
-                    modifier = Modifier.weight(1f),
+                    modifier = Modifier.weight(1f).padding(start = 5.dp),
                     verticalArrangement = Arrangement.Center,
                 ) {
                     Text(
@@ -162,7 +170,7 @@ internal fun CompactDropdownSetting(
                     DropdownMenuItem(
                         text = {
                             Column(
-                                modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp),
+                                modifier = Modifier.fillMaxWidth().padding(start = 5.dp, top = 2.dp, bottom = 2.dp),
                                 verticalArrangement = Arrangement.spacedBy(3.dp),
                             ) {
                                 Text(
@@ -182,19 +190,21 @@ internal fun CompactDropdownSetting(
                         },
                         trailingIcon = if (onInfo != null) {
                             {
-                                IconButton(
-                                    onClick = {
-                                        expanded = false
-                                        onInfo(key)
-                                    },
-                                    modifier = Modifier.size(32.dp),
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.AutoMirrored.Filled.HelpOutline,
-                                        contentDescription = "Информация: $label",
-                                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                                        modifier = Modifier.size(18.dp),
-                                    )
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    IconButton(
+                                        onClick = {
+                                            expanded = false
+                                            onInfo(key)
+                                        },
+                                        modifier = Modifier.size(32.dp),
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.AutoMirrored.Filled.HelpOutline,
+                                            contentDescription = "Информация: $label",
+                                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            modifier = Modifier.size(18.dp),
+                                        )
+                                    }
                                 }
                             }
                         } else {

@@ -1,26 +1,29 @@
 // SPDX-FileCopyrightText: 2026 amurcanov
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 
+#[cfg(feature = "diagnostics")]
+use crate::perf::thread_cpu_time_ns;
 use crate::{
     App,
     dataplane::{self, DataplaneConfig, DataplaneLogic},
+    downlink_queue::DownlinkQueue,
     lock_unpoison, log_event,
     model::{
-        ClientDevice, Database, cached_now, derive_wrap_key, generate_key_pair, get_next_ip,
-        is_expired, now, resolve_session_ip,
+        ClientDevice, Database, TrafficCounters, TrafficSnapshot, cached_now, derive_wrap_key,
+        generate_key_pair, get_next_ip, is_expired, now, resolve_session_ip,
     },
-    packet::{PACKET_CAPACITY, PacketBuffer},
-    perf::{self, Profiler as AllProfiler, Stage as PerfStage, thread_cpu_time_ns},
+    packet::{PACKET_CAPACITY, PacketBuf, PacketBuffer},
+    perf::{self, Profiler as AllProfiler, Stage as PerfStage},
     selective_fec,
+    tokio_io::{IoCounters, PacketSink},
     tun_device::RouteTable,
-    uring_io::{IoCounters, PacketSink},
 };
 use anyhow::{Context, Result, anyhow, bail};
 use ctr::cipher::{InnerIvInit, KeyInit, StreamCipher};
 use rand::{Rng, RngCore, SeedableRng, rngs::OsRng, rngs::StdRng};
 use std::{
-    collections::{HashMap, VecDeque},
-    net::SocketAddr,
+    collections::{HashMap, HashSet, VecDeque},
+    net::{IpAddr, SocketAddr},
     sync::{
         Arc, RwLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -28,30 +31,50 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use subtle::ConstantTimeEq;
-use tokio::sync::{Mutex, OwnedMutexGuard, mpsc};
+use tokio::sync::{
+    Mutex, OwnedMutexGuard, RwLockReadGuard, RwLockWriteGuard, Semaphore, mpsc, oneshot,
+};
 use tokio_util::sync::CancellationToken;
 
 type Aes128Ctr128BE = ctr::Ctr128BE<aes::Aes128>;
 type Aes128CtrCore = ctr::CtrCore<aes::Aes128, ctr::flavors::Ctr128BE>;
 
-const MAX_ACTIVE_SESSIONS: usize = 4096;
-const CONTROL_EVENT_CAPACITY: usize = 512;
+pub(crate) const MAX_ACTIVE_SESSIONS: usize = 3072;
+const CONTROL_EVENT_CAPACITY: usize = 1024;
+const CONTROL_TASK_CAPACITY: usize = 128;
+const DB_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+const TRAFFIC_FLUSH_INTERVAL: Duration = Duration::from_secs(30);
 const SESSION_SETUP_IDLE_MS: u64 = 15_000;
-// This is a last-resort leak bound, not a path-health timeout. Normal recovery
-// and epoch/disconnect purges retire dead transports much sooner, while an
-// eight-hour lease lets a device retain a valid UDP/TURN path through a long
-// OEM sleep interval without server-side deletion.
-const SESSION_AUTH_IDLE_MS: u64 = 8 * 60 * 60 * 1_000;
+const SESSION_AUTH_IDLE_MS: u64 = 10 * 60 * 60 * 1_000;
 const PUBLIC_SETUP_GHOST_IDLE_SECS: u64 = 30;
-const PUBLIC_AUTH_GHOST_IDLE_SECS: u64 = SESSION_AUTH_IDLE_MS / 1_000;
-const PATH_LEASE: &[u8] = b"\xffCSQTT_LEASE";
-const PATH_RECEIPT_ACK: &[u8] = b"\xffCSQTT_RX_ACK";
+const PUBLIC_AUTH_GHOST_IDLE_SECS: u64 = 2 * 60;
+const PUBLIC_SESSION_LIMIT: usize = MAX_ACTIVE_SESSIONS + 256;
+const DIAGNOSTIC_CLIENT_LIMIT: usize = 8;
+const DIAGNOSTIC_REQUEST_MAX_BYTES: usize = 128;
+const DIAGNOSTIC_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
+const DIAGNOSTIC_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+const DIAGNOSTIC_LEASE: Duration = Duration::from_secs(5 * 60);
+const SESSION_LEASE: &[u8] = b"\xffCSQTT_LEASE";
 pub const PANEL_RESTART_NOTICE: &[u8] = b"\xffCSQTT_PANEL_RESTART_V1\x00\x91\x7d\x03\xa8";
-const PATH_PROBE_V2_MAGIC: &[u8; 4] = b"CSQ2";
+const STREAM_REPAIR_PREFIX: &[u8] = b"\xffCSQTT_STREAM_REPAIR_V1";
+const STREAM_ALIVE_PREFIX: &[u8] = b"\xffCSQTT_STREAM_ALIVE_V1";
+pub(crate) const MAX_STREAM_WORKERS: usize = 126;
+const MAX_STREAM_WORKERS_U16: u16 = MAX_STREAM_WORKERS as u16;
+const STREAM_RECONCILE_INTERVAL_MS: u64 = 3_000;
+const STREAM_REPAIR_GRACE_MS: u64 = 30_000;
+const STREAM_REPAIR_ESCALATE_MS: u64 = 60_000;
+const STREAM_ALIVE_INTERVAL_MS: u64 = 10_000;
+const STREAM_ALIVE_REPEAT: u8 = 2;
+const STREAM_CONTROL_CARRIERS: usize = 3;
+const STREAM_ROUND_ORPHAN_TTL_MS: u64 = 60_000;
+const STREAM_INVENTORY_RESYNC_MS: u64 = 60_000;
+const EPOCH_SWEEP_INTERVAL_MS: u64 = 5 * 60_000;
+const DOWNLINK_DRAIN_PACKET_LIMIT: usize = 128;
+const EPOCH_IDLE_TTL_MS: u64 = 60 * 60_000;
 const HOT_TABLE_RESERVE: usize = 128;
 const MEMORY_COMPACT_INTERVAL_MS: u64 = 5_000;
-const SETUP_BUDGET_PER_TICK: usize = 256;
-
+const SESSION_MAINTENANCE_INTERVAL_MS: u64 = 1_000;
+const SETUP_BUDGET_PER_TICK: usize = 1024;
 pub(crate) static SESSION_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 static ROUTE_REGISTRATION_COUNTER: AtomicU64 = AtomicU64::new(1);
 static CACHED_MONOTONIC_MS: AtomicU64 = AtomicU64::new(0);
@@ -83,6 +106,13 @@ pub static DPI_BROADCAST: std::sync::LazyLock<tokio::sync::broadcast::Sender<Dpi
         tx
     });
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DpiRingMemorySnapshot {
+    pub entries: usize,
+    pub entry_capacity: usize,
+    pub retained_bytes: usize,
+}
+
 pub fn record_dpi(frame: DpiFrame) {
     if let Ok(mut ring) = DPI_RING.try_write() {
         if ring.len() >= 100 {
@@ -91,6 +121,39 @@ pub fn record_dpi(frame: DpiFrame) {
         ring.push_back(frame.clone());
     }
     let _ = DPI_BROADCAST.send(frame);
+}
+
+pub fn epoch_snapshot_len() -> usize {
+    ENGINE_EPOCHS_GAUGE.load(Ordering::Relaxed) as usize
+}
+
+pub fn dpi_ring_len() -> usize {
+    DPI_RING.read().map(|ring| ring.len()).unwrap_or(0)
+}
+
+pub fn dpi_ring_memory_snapshot() -> DpiRingMemorySnapshot {
+    let Ok(ring) = DPI_RING.try_read() else {
+        return DpiRingMemorySnapshot::default();
+    };
+    let strings = ring.iter().fold(0usize, |total, frame| {
+        total
+            .saturating_add(frame.direction.capacity())
+            .saturating_add(frame.src.capacity())
+            .saturating_add(frame.dst.capacity())
+            .saturating_add(frame.proto.capacity())
+            .saturating_add(frame.device_id.capacity())
+            .saturating_add(frame.salt.capacity())
+            .saturating_add(frame.detail.capacity())
+            .saturating_add(frame.hex_preview.capacity())
+    });
+    DpiRingMemorySnapshot {
+        entries: ring.len(),
+        entry_capacity: ring.capacity(),
+        retained_bytes: ring
+            .capacity()
+            .saturating_mul(std::mem::size_of::<DpiFrame>())
+            .saturating_add(strings),
+    }
 }
 
 pub fn hex_and_ascii_dump(data: &[u8]) -> String {
@@ -134,6 +197,7 @@ fn is_dpi_control(plain: &[u8]) -> bool {
 }
 
 #[inline(always)]
+#[cfg(feature = "diagnostics")]
 fn should_record_dpi(
     enabled: bool,
     now_ms: u64,
@@ -155,6 +219,19 @@ fn should_record_dpi(
     }
     *last_sample_ms = now_ms;
     true
+}
+
+#[inline(always)]
+#[cfg(not(feature = "diagnostics"))]
+fn should_record_dpi(
+    enabled: bool,
+    now_ms: u64,
+    payload_counter: &mut u64,
+    last_sample_ms: &mut u64,
+    plain: &[u8],
+) -> bool {
+    let _ = (enabled, now_ms, payload_counter, last_sample_ms, plain);
+    false
 }
 
 fn display_control_payload(plain: &[u8]) -> String {
@@ -231,79 +308,155 @@ pub fn record_packet_dpi(
 }
 
 pub async fn run_dpi_server() -> Result<()> {
+    if !cfg!(feature = "diagnostics") {
+        return Ok(());
+    }
     let listener = tokio::net::TcpListener::bind("127.0.0.1:46003").await?;
+    let clients = Arc::new(Semaphore::new(DIAGNOSTIC_CLIENT_LIMIT));
     loop {
         let Ok((socket, _)) = listener.accept().await else {
             continue;
         };
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-        let (reader, mut writer) = tokio::io::split(socket);
-        let mut reader = BufReader::new(reader);
-        let mut line = String::new();
-        if reader.read_line(&mut line).await.is_err() {
+        let Ok(permit) = clients.clone().try_acquire_owned() else {
             continue;
-        }
-        let requested = if line.starts_with("GET_DPI:") {
-            line.trim()
-                .strip_prefix("GET_DPI:")
-                .unwrap_or("0")
-                .parse::<usize>()
-                .unwrap_or(0)
-        } else {
-            0
         };
-        let samples = if requested > 0 {
-            if let Ok(ring) = DPI_RING.try_read() {
-                let count = requested.min(ring.len());
-                ring.iter()
-                    .skip(ring.len() - count)
-                    .cloned()
-                    .collect::<Vec<_>>()
-            } else {
-                Vec::new()
-            }
-        } else {
-            Vec::new()
-        };
-        for frame in samples {
-            if let Ok(json) = serde_json::to_string(&frame)
-                && writer
-                    .write_all(format!("{json}\n").as_bytes())
-                    .await
-                    .is_err()
-            {
-                break;
-            }
-        }
-        if requested > 0 {
-            continue;
-        }
-        let mut rx = DPI_BROADCAST.subscribe();
         tokio::spawn(async move {
-            loop {
-                match rx.recv().await {
-                    Ok(frame) => {
-                        if let Ok(json) = serde_json::to_string(&frame)
-                            && writer
-                                .write_all(format!("{json}\n").as_bytes())
-                                .await
-                                .is_err()
-                        {
-                            break;
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                }
-            }
-            if DPI_BROADCAST.receiver_count() == 0
-                && let Ok(mut ring) = DPI_RING.write()
-            {
-                ring.clear();
-                ring.shrink_to_fit();
-            }
+            let _permit = permit;
+            serve_dpi_client(socket).await;
         });
     }
+}
+
+async fn serve_dpi_client(socket: tokio::net::TcpStream) {
+    let (mut reader, mut writer) = tokio::io::split(socket);
+    let request = match tokio::time::timeout(
+        DIAGNOSTIC_HANDSHAKE_TIMEOUT,
+        read_diagnostic_request(&mut reader),
+    )
+    .await
+    {
+        Ok(Ok(Some(request))) => request,
+        _ => return,
+    };
+    let requested = if request.starts_with("GET_DPI:") {
+        request
+            .strip_prefix("GET_DPI:")
+            .unwrap_or("0")
+            .parse::<usize>()
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    let samples = if requested > 0 {
+        if let Ok(ring) = DPI_RING.try_read() {
+            let count = requested.min(ring.len());
+            ring.iter()
+                .skip(ring.len() - count)
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
+    for frame in samples {
+        if let Ok(json) = serde_json::to_string(&frame)
+            && !write_diagnostic_line(&mut writer, &json).await
+        {
+            return;
+        }
+    }
+    if requested > 0 {
+        return;
+    }
+    let mut rx = DPI_BROADCAST.subscribe();
+    let mut control = [0_u8; 64];
+    let lease = tokio::time::sleep(DIAGNOSTIC_LEASE);
+    tokio::pin!(lease);
+    loop {
+        tokio::select! {
+            received = tokio::io::AsyncReadExt::read(&mut reader, &mut control) => {
+                match received {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => lease.as_mut().reset(tokio::time::Instant::now() + DIAGNOSTIC_LEASE),
+                }
+            }
+            _ = &mut lease => break,
+            frame = rx.recv() => match frame {
+                Ok(frame) => {
+                    if let Ok(json) = serde_json::to_string(&frame)
+                        && !write_diagnostic_line(&mut writer, &json).await
+                    {
+                        break;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    }
+    drop(rx);
+    if DPI_BROADCAST.receiver_count() == 0
+        && let Ok(mut ring) = DPI_RING.write()
+    {
+        ring.clear();
+        ring.shrink_to_fit();
+    }
+}
+
+async fn read_diagnostic_request<R>(reader: &mut R) -> std::io::Result<Option<String>>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+
+    let mut bytes = [0u8; DIAGNOSTIC_REQUEST_MAX_BYTES + 1];
+    let mut length = 0usize;
+    loop {
+        let read = reader.read(&mut bytes[length..]).await?;
+        if read == 0 {
+            if length == 0 {
+                return Ok(None);
+            }
+            break;
+        }
+        let end = length + read;
+        if let Some(newline) = bytes[length..end].iter().position(|byte| *byte == b'\n') {
+            length += newline;
+            break;
+        }
+        length = end;
+        if length == bytes.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "diagnostic request exceeds maximum length",
+            ));
+        }
+    }
+    let request = std::str::from_utf8(&bytes[..length]).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "diagnostic request is not UTF-8",
+        )
+    })?;
+    Ok(Some(request.trim().to_owned()))
+}
+
+async fn write_diagnostic_line<W>(writer: &mut W, line: &str) -> bool
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncWriteExt;
+
+    matches!(
+        tokio::time::timeout(DIAGNOSTIC_WRITE_TIMEOUT, async {
+            writer.write_all(line.as_bytes()).await?;
+            writer.write_all(b"\n").await
+        })
+        .await,
+        Ok(Ok(()))
+    )
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -345,36 +498,22 @@ pub struct SyscallsFrame {
     pub tun_tx_bps: u64,
     pub tun_tx_errors_s: u64,
     pub tun_tx_drops_s: u64,
-    pub sqe_per_sec: u64,
-    pub cqe_per_sec: u64,
-    pub udp_rx_rearms_s: u64,
-    pub tun_rx_rearms_s: u64,
+    pub readiness_wakeups_s: u64,
+    pub recv_syscalls_s: u64,
+    pub send_syscalls_s: u64,
+    pub rx_eagain_s: u64,
+    pub tx_eagain_s: u64,
+    pub partial_sendmmsg_s: u64,
     pub crypto_ops_s: u64,
     pub active_sessions: u64,
     pub free_udp_tx_slots: u64,
     pub free_tun_tx_slots: u64,
     #[serde(default)]
-    pub cq_min_wait_usec: u64,
-    #[serde(default)]
-    pub cq_wait_batch: u64,
-    #[serde(default)]
-    pub cq_capacity: u64,
-    #[serde(default)]
-    pub cq_overflow_s: u64,
+    pub recv_batch_max: u64,
     #[serde(default)]
     pub udp_rx_enobufs_s: u64,
     #[serde(default)]
-    pub udp_rx_multishot: u64,
-    #[serde(default)]
-    pub udp_rx_buffer_count: u64,
-    #[serde(default)]
-    pub tun_fixed_buffers: u64,
-    #[serde(default)]
-    pub iowq_bounded_limit: u64,
-    #[serde(default)]
-    pub iowq_unbounded_limit: u64,
-    #[serde(default)]
-    pub uring_mode: u64,
+    pub udp_tx_enobufs_s: u64,
     pub total_udp_rx_packets: u64,
     pub total_udp_tx_packets: u64,
     pub total_tun_rx_packets: u64,
@@ -441,13 +580,17 @@ pub static SYSCALLS_BROADCAST: std::sync::LazyLock<tokio::sync::broadcast::Sende
         tx
     });
 
-pub static GLOBAL_IO_COUNTERS: std::sync::LazyLock<std::sync::RwLock<crate::uring_io::IoCounters>> =
-    std::sync::LazyLock::new(|| std::sync::RwLock::new(crate::uring_io::IoCounters::default()));
+pub static GLOBAL_IO_COUNTERS: std::sync::LazyLock<std::sync::RwLock<crate::tokio_io::IoCounters>> =
+    std::sync::LazyLock::new(|| std::sync::RwLock::new(crate::tokio_io::IoCounters::default()));
 
 pub static CRYPTO_OPS_COUNTER: AtomicU64 = AtomicU64::new(0);
 pub static ACTIVE_SESSIONS_GAUGE: AtomicU64 = AtomicU64::new(0);
 pub static HOT_SESSION_CAPACITY_GAUGE: AtomicU64 = AtomicU64::new(0);
+pub static ENGINE_EPOCHS_GAUGE: AtomicU64 = AtomicU64::new(0);
+pub static STREAM_REPAIRS_GAUGE: AtomicU64 = AtomicU64::new(0);
+pub static STREAM_INVENTORY_GAUGE: AtomicU64 = AtomicU64::new(0);
 pub static SYSCALLS_CLIENTS: AtomicU64 = AtomicU64::new(0);
+static METRIC_CLIENTS: AtomicU64 = AtomicU64::new(0);
 pub static GLOBAL_CRYPTO_PERF: std::sync::LazyLock<RwLock<CryptoPerfSnapshot>> =
     std::sync::LazyLock::new(|| RwLock::new(CryptoPerfSnapshot::default()));
 
@@ -463,84 +606,93 @@ enum CryptoDirection {
     Wrap,
 }
 
+#[derive(Default)]
 struct CryptoProfiler {
+    #[cfg(feature = "diagnostics")]
     enabled: bool,
+    #[cfg(feature = "diagnostics")]
     cursors: [u64; 2],
+    #[cfg(feature = "diagnostics")]
     counters: CryptoPerfSnapshot,
     all: AllProfiler,
-}
-
-impl Default for CryptoProfiler {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            cursors: [19, 37],
-            counters: CryptoPerfSnapshot::default(),
-            all: AllProfiler::default(),
-        }
-    }
 }
 
 impl CryptoProfiler {
     #[inline(always)]
     fn begin(&mut self, kind: CryptoKind, direction: CryptoDirection, bytes: usize) -> Option<u64> {
-        if !self.enabled {
-            return None;
-        }
-        let index = kind as usize;
+        #[cfg(feature = "diagnostics")]
         {
-            let counter = match kind {
-                CryptoKind::Chacha => &mut self.counters.chacha,
-                CryptoKind::Srtp => &mut self.counters.srtp,
-            };
-            counter.operations = counter.operations.saturating_add(1);
-            counter.bytes = counter.bytes.saturating_add(bytes as u64);
+            if !self.enabled {
+                return None;
+            }
+            let index = kind as usize;
+            {
+                let counter = match kind {
+                    CryptoKind::Chacha => &mut self.counters.chacha,
+                    CryptoKind::Srtp => &mut self.counters.srtp,
+                };
+                counter.operations = counter.operations.saturating_add(1);
+                counter.bytes = counter.bytes.saturating_add(bytes as u64);
+            }
+            {
+                let counter = match direction {
+                    CryptoDirection::Unwrap => &mut self.counters.unwrap_crypto,
+                    CryptoDirection::Wrap => &mut self.counters.wrap_crypto,
+                };
+                counter.operations = counter.operations.saturating_add(1);
+                counter.bytes = counter.bytes.saturating_add(bytes as u64);
+            }
+            let cursor = self.cursors[index];
+            self.cursors[index] = cursor.wrapping_add(1);
+            if cursor.is_multiple_of(CRYPTO_PERF_SAMPLE_INTERVAL) {
+                let counter = match kind {
+                    CryptoKind::Chacha => &mut self.counters.chacha,
+                    CryptoKind::Srtp => &mut self.counters.srtp,
+                };
+                counter.samples = counter.samples.saturating_add(1);
+                let direction_counter = match direction {
+                    CryptoDirection::Unwrap => &mut self.counters.unwrap_crypto,
+                    CryptoDirection::Wrap => &mut self.counters.wrap_crypto,
+                };
+                direction_counter.samples = direction_counter.samples.saturating_add(1);
+                Some(thread_cpu_time_ns())
+            } else {
+                None
+            }
         }
+        #[cfg(not(feature = "diagnostics"))]
         {
-            let counter = match direction {
-                CryptoDirection::Unwrap => &mut self.counters.unwrap_crypto,
-                CryptoDirection::Wrap => &mut self.counters.wrap_crypto,
-            };
-            counter.operations = counter.operations.saturating_add(1);
-            counter.bytes = counter.bytes.saturating_add(bytes as u64);
-        }
-        let cursor = self.cursors[index];
-        self.cursors[index] = cursor.wrapping_add(1);
-        if cursor.is_multiple_of(CRYPTO_PERF_SAMPLE_INTERVAL) {
-            let counter = match kind {
-                CryptoKind::Chacha => &mut self.counters.chacha,
-                CryptoKind::Srtp => &mut self.counters.srtp,
-            };
-            counter.samples = counter.samples.saturating_add(1);
-            let direction_counter = match direction {
-                CryptoDirection::Unwrap => &mut self.counters.unwrap_crypto,
-                CryptoDirection::Wrap => &mut self.counters.wrap_crypto,
-            };
-            direction_counter.samples = direction_counter.samples.saturating_add(1);
-            Some(thread_cpu_time_ns())
-        } else {
+            let _ = (kind, direction, bytes);
             None
         }
     }
 
     #[inline(always)]
     fn finish(&mut self, kind: CryptoKind, direction: CryptoDirection, started: Option<u64>) {
-        let Some(started) = started else {
-            return;
-        };
-        let elapsed = thread_cpu_time_ns().saturating_sub(started);
-        let counter = match kind {
-            CryptoKind::Chacha => &mut self.counters.chacha,
-            CryptoKind::Srtp => &mut self.counters.srtp,
-        };
-        counter.sampled_ns = counter.sampled_ns.saturating_add(elapsed);
-        let direction_counter = match direction {
-            CryptoDirection::Unwrap => &mut self.counters.unwrap_crypto,
-            CryptoDirection::Wrap => &mut self.counters.wrap_crypto,
-        };
-        direction_counter.sampled_ns = direction_counter.sampled_ns.saturating_add(elapsed);
+        #[cfg(feature = "diagnostics")]
+        {
+            let Some(started) = started else {
+                return;
+            };
+            let elapsed = thread_cpu_time_ns().saturating_sub(started);
+            let counter = match kind {
+                CryptoKind::Chacha => &mut self.counters.chacha,
+                CryptoKind::Srtp => &mut self.counters.srtp,
+            };
+            counter.sampled_ns = counter.sampled_ns.saturating_add(elapsed);
+            let direction_counter = match direction {
+                CryptoDirection::Unwrap => &mut self.counters.unwrap_crypto,
+                CryptoDirection::Wrap => &mut self.counters.wrap_crypto,
+            };
+            direction_counter.sampled_ns = direction_counter.sampled_ns.saturating_add(elapsed);
+        }
+        #[cfg(not(feature = "diagnostics"))]
+        {
+            let _ = (kind, direction, started);
+        }
     }
 
+    #[cfg(feature = "diagnostics")]
     fn publish(&self) {
         if self.enabled
             && let Ok(mut global) = GLOBAL_CRYPTO_PERF.write()
@@ -553,55 +705,140 @@ impl CryptoProfiler {
 
 #[inline(always)]
 fn record_crypto_op(enabled: bool) {
-    if enabled {
-        CRYPTO_OPS_COUNTER.fetch_add(1, Ordering::Relaxed);
+    #[cfg(feature = "diagnostics")]
+    {
+        if enabled {
+            CRYPTO_OPS_COUNTER.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    {
+        let _ = enabled;
     }
 }
 
-pub async fn run_syscalls_server() -> Result<()> {
+pub async fn run_syscalls_server(app: Arc<App>) -> Result<()> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:46004").await?;
+    let clients = Arc::new(Semaphore::new(DIAGNOSTIC_CLIENT_LIMIT));
     loop {
         let Ok((socket, _)) = listener.accept().await else {
             continue;
         };
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-        let (reader, mut writer) = tokio::io::split(socket);
-        let mut buf_reader = BufReader::new(reader);
-        let mut line = String::new();
-        if buf_reader.read_line(&mut line).await.is_err() {
+        let Ok(permit) = clients.clone().try_acquire_owned() else {
             continue;
-        }
-        let request = line.trim();
-        let perf_all = request.eq_ignore_ascii_case("PERF")
-            || request.eq_ignore_ascii_case("PERF CRYPTO")
-            || request.eq_ignore_ascii_case("PERF ALL");
-        let mut rx = SYSCALLS_BROADCAST.subscribe();
+        };
+        let app = app.clone();
         tokio::spawn(async move {
-            let _perf_all = perf_all.then(AllPerfClient::new);
-            let _syscalls = (!perf_all).then(SyscallsClient::new);
-            loop {
-                match rx.recv().await {
-                    Ok(frame) => {
-                        if let Ok(json) = serde_json::to_string(&frame)
-                            && writer
-                                .write_all(format!("{json}\n").as_bytes())
-                                .await
-                                .is_err()
-                        {
-                            break;
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            let _permit = permit;
+            serve_syscalls_client(socket, app).await;
+        });
+    }
+}
+
+async fn serve_syscalls_client(socket: tokio::net::TcpStream, app: Arc<App>) {
+    let (mut reader, mut writer) = tokio::io::split(socket);
+    let request = match tokio::time::timeout(
+        DIAGNOSTIC_HANDSHAKE_TIMEOUT,
+        read_diagnostic_request(&mut reader),
+    )
+    .await
+    {
+        Ok(Ok(Some(request))) => request,
+        _ => return,
+    };
+    if request.eq_ignore_ascii_case("METRIC ALL") {
+        serve_metric_client(reader, writer, app).await;
+        return;
+    }
+    if !cfg!(feature = "diagnostics") {
+        return;
+    }
+    let perf_all = request.eq_ignore_ascii_case("PERF")
+        || request.eq_ignore_ascii_case("PERF CRYPTO")
+        || request.eq_ignore_ascii_case("PERF ALL");
+    let _perf_all = perf_all.then(AllPerfClient::new);
+    let _syscalls = (!perf_all).then(SyscallsClient::new);
+    let mut rx = SYSCALLS_BROADCAST.subscribe();
+    let mut control = [0_u8; 64];
+    let lease = tokio::time::sleep(DIAGNOSTIC_LEASE);
+    tokio::pin!(lease);
+    loop {
+        tokio::select! {
+            received = tokio::io::AsyncReadExt::read(&mut reader, &mut control) => {
+                match received {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => lease.as_mut().reset(tokio::time::Instant::now() + DIAGNOSTIC_LEASE),
                 }
             }
-        });
+            _ = &mut lease => break,
+            frame = rx.recv() => match frame {
+                Ok(frame) => {
+                    if let Ok(json) = serde_json::to_string(&frame)
+                        && !write_diagnostic_line(&mut writer, &json).await
+                    {
+                        break;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    }
+}
+
+async fn serve_metric_client<R, W>(mut reader: R, mut writer: W, app: Arc<App>)
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let Some(_client) = MetricClient::try_new() else {
+        let frame = crate::memory_metrics::MetricFrame {
+            timestamp_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+                .min(u64::MAX as u128) as u64,
+            error: "another `csqtt metric all` observer is already active".to_owned(),
+            ..crate::memory_metrics::MetricFrame::default()
+        };
+        if let Ok(json) = serde_json::to_string(&frame) {
+            let _ = write_diagnostic_line(&mut writer, &json).await;
+        }
+        return;
+    };
+
+    let mut timer = tokio::time::interval(crate::memory_metrics::METRIC_SAMPLE_INTERVAL);
+    timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut control = [0_u8; 64];
+    let lease = tokio::time::sleep(DIAGNOSTIC_LEASE);
+    tokio::pin!(lease);
+    loop {
+        tokio::select! {
+            received = tokio::io::AsyncReadExt::read(&mut reader, &mut control) => {
+                match received {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => lease.as_mut().reset(tokio::time::Instant::now() + DIAGNOSTIC_LEASE),
+                }
+            }
+            _ = &mut lease => break,
+            _ = timer.tick() => {
+                let frame = crate::memory_metrics::collect_metric_frame(&app).await;
+                let Ok(json) = serde_json::to_string(&frame) else {
+                    continue;
+                };
+                if !write_diagnostic_line(&mut writer, &json).await {
+                    break;
+                }
+            }
+        }
     }
 }
 
 struct AllPerfClient;
 
 struct SyscallsClient;
+
+struct MetricClient;
 
 impl AllPerfClient {
     fn new() -> Self {
@@ -629,12 +866,41 @@ impl Drop for SyscallsClient {
     }
 }
 
+impl MetricClient {
+    fn try_new() -> Option<Self> {
+        METRIC_CLIENTS
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+            .then_some(Self)
+    }
+}
+
+impl Drop for MetricClient {
+    fn drop(&mut self) {
+        METRIC_CLIENTS.store(0, Ordering::Release);
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DeviceEpochDecision {
     Current,
     Advanced,
     Stale,
     SaltConflict,
+}
+
+pub struct DeviceEpochSlot {
+    pub epoch: Arc<Mutex<DeviceEpochState>>,
+    pub last_used_ms: AtomicU64,
+}
+
+impl DeviceEpochSlot {
+    pub fn new(epoch: DeviceEpochState, now_ms: u64) -> Self {
+        Self {
+            epoch: Arc::new(Mutex::new(epoch)),
+            last_used_ms: AtomicU64::new(now_ms),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -688,13 +954,6 @@ enum CredentialAccess {
     Unbound,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SmartPingDecision {
-    Current,
-    Bind,
-    Reject,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SessionEpochIdentity {
     device_id: String,
@@ -739,10 +998,12 @@ impl StreamDebugMetrics {
         self.down_packets.store(0, Ordering::Relaxed);
     }
 
+    #[cfg(feature = "diagnostics")]
     fn generation(&self) -> u64 {
         self.generation.load(Ordering::Acquire)
     }
 
+    #[cfg(feature = "diagnostics")]
     fn publish(&self, up_bytes: u64, down_bytes: u64, up_packets: u64, down_packets: u64) {
         if !self.active.load(Ordering::Acquire) {
             return;
@@ -791,6 +1052,7 @@ pub struct Session {
     pub generation_id: AtomicU64,
     pub session_salt: std::sync::Mutex<String>,
     pub worker_id: AtomicU64,
+    pub desired_stream_count: AtomicU64,
     pub tunnel_ip: std::sync::Mutex<Option<[u8; 4]>>,
     pub last_seen: AtomicU64,
     pub up_bytes: AtomicU64,
@@ -824,6 +1086,7 @@ impl Session {
             generation_id: AtomicU64::new(generation_id),
             session_salt: std::sync::Mutex::new(session_salt.to_owned()),
             worker_id: AtomicU64::new(u64::MAX),
+            desired_stream_count: AtomicU64::new(0),
             tunnel_ip: std::sync::Mutex::new(None),
             last_seen: AtomicU64::new(wall_now),
             up_bytes: AtomicU64::new(0),
@@ -862,6 +1125,20 @@ impl CredentialSet {
 struct EpochValue {
     generation_id: u64,
     session_salt: String,
+    last_seen_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct EndpointKey {
+    peer: SocketAddr,
+    local_ip: Option<IpAddr>,
+}
+
+impl EndpointKey {
+    #[inline(always)]
+    fn new(peer: SocketAddr, local_ip: Option<IpAddr>) -> Self {
+        Self { peer, local_ip }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -977,6 +1254,7 @@ impl ReplayState {
     }
 }
 
+#[cfg(feature = "diagnostics")]
 struct HotDebug {
     generation: u64,
     up_bytes: u64,
@@ -985,6 +1263,7 @@ struct HotDebug {
     down_packets: u64,
 }
 
+#[cfg(feature = "diagnostics")]
 impl HotDebug {
     fn new(generation: u64) -> Self {
         Self {
@@ -1008,6 +1287,7 @@ impl HotDebug {
 struct HotSession {
     id: u64,
     peer: SocketAddr,
+    local_ip: Option<IpAddr>,
     password: Arc<str>,
     device_id: String,
     generation_id: u64,
@@ -1020,8 +1300,8 @@ struct HotSession {
     replay: ReplayState,
     tunnel_ip: Option<[u8; 4]>,
     registration_id: Option<u64>,
+    desired_stream_count: u16,
     last_inbound_ms: u64,
-    last_seen_wall: u64,
     up_total: u64,
     down_total: u64,
     reported_up: u64,
@@ -1029,7 +1309,9 @@ struct HotSession {
     is_srtp: bool,
     pending_tunnel: bool,
     public: Arc<Session>,
+    #[cfg(feature = "diagnostics")]
     debug: HotDebug,
+    fec_profile: FecProfile,
     fec_budget: selective_fec::Budget,
 }
 
@@ -1038,6 +1320,7 @@ impl HotSession {
     fn legacy(
         id: u64,
         peer: SocketAddr,
+        local_ip: Option<IpAddr>,
         password: Arc<str>,
         key: [u8; 32],
         payload_type: u8,
@@ -1045,6 +1328,7 @@ impl HotSession {
         device_id: &str,
         generation_id: u64,
         session_salt: &str,
+        fec_profile: FecProfile,
         stream_debug_active: Arc<AtomicBool>,
         monotonic_ms: u64,
         wall_now: u64,
@@ -1060,10 +1344,12 @@ impl HotSession {
             stream_debug_active,
             wall_now,
         );
+        #[cfg(feature = "diagnostics")]
         let debug_generation = public.stream_debug.generation();
         Self {
             id,
             peer,
+            local_ip,
             password,
             device_id: device_id.to_owned(),
             generation_id,
@@ -1079,8 +1365,8 @@ impl HotSession {
             replay: ReplayState::new(),
             tunnel_ip: None,
             registration_id: None,
+            desired_stream_count: 0,
             last_inbound_ms: monotonic_ms,
-            last_seen_wall: wall_now,
             up_total: 0,
             down_total: 0,
             reported_up: 0,
@@ -1088,8 +1374,40 @@ impl HotSession {
             is_srtp,
             pending_tunnel: false,
             public,
+            #[cfg(feature = "diagnostics")]
             debug: HotDebug::new(debug_generation),
+            fec_profile,
             fec_budget: selective_fec::Budget::new(),
+        }
+    }
+
+    #[inline(always)]
+    fn record_debug_up(&mut self, bytes: u64, enabled: bool) {
+        #[cfg(feature = "diagnostics")]
+        {
+            if enabled {
+                self.debug.up_bytes = self.debug.up_bytes.saturating_add(bytes);
+                self.debug.up_packets = self.debug.up_packets.saturating_add(1);
+            }
+        }
+        #[cfg(not(feature = "diagnostics"))]
+        {
+            let _ = (bytes, enabled);
+        }
+    }
+
+    #[inline(always)]
+    fn record_debug_down(&mut self, bytes: u64, enabled: bool) {
+        #[cfg(feature = "diagnostics")]
+        {
+            if enabled {
+                self.debug.down_bytes = self.debug.down_bytes.saturating_add(bytes);
+                self.debug.down_packets = self.debug.down_packets.saturating_add(1);
+            }
+        }
+        #[cfg(not(feature = "diagnostics"))]
+        {
+            let _ = (bytes, enabled);
         }
     }
 
@@ -1097,7 +1415,7 @@ impl HotSession {
         &mut self,
         global_up: &AtomicU64,
         global_down: &AtomicU64,
-        _wall_now: u64,
+        wall_now: u64,
         debug_enabled: bool,
     ) {
         let up_delta = self.up_total.saturating_sub(self.reported_up);
@@ -1114,20 +1432,25 @@ impl HotSession {
             global_down.fetch_add(down_delta, Ordering::Relaxed);
             self.reported_down = self.down_total;
         }
-        self.public
-            .last_seen
-            .store(self.last_seen_wall, Ordering::Relaxed);
-        let generation = self.public.stream_debug.generation();
-        if generation != self.debug.generation {
-            self.debug.reset(generation);
+        self.public.last_seen.store(wall_now, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        {
+            let generation = self.public.stream_debug.generation();
+            if generation != self.debug.generation {
+                self.debug.reset(generation);
+            }
+            if debug_enabled {
+                self.public.stream_debug.publish(
+                    self.debug.up_bytes,
+                    self.debug.down_bytes,
+                    self.debug.up_packets,
+                    self.debug.down_packets,
+                );
+            }
         }
-        if debug_enabled {
-            self.public.stream_debug.publish(
-                self.debug.up_bytes,
-                self.debug.down_bytes,
-                self.debug.up_packets,
-                self.debug.down_packets,
-            );
+        #[cfg(not(feature = "diagnostics"))]
+        {
+            let _ = debug_enabled;
         }
     }
 }
@@ -1159,6 +1482,154 @@ enum GetconfReconnectAction {
     Reject,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct StreamIdentity {
+    device_id: String,
+    generation_id: u64,
+    session_salt: String,
+}
+
+struct StreamInventory {
+    desired_count: u16,
+    desired_session_id: u64,
+    present: [bool; MAX_STREAM_WORKERS + 1],
+    carriers: Vec<usize>,
+    seen: bool,
+}
+
+impl StreamInventory {
+    fn new() -> Self {
+        Self {
+            desired_count: 0,
+            desired_session_id: 0,
+            present: [false; MAX_STREAM_WORKERS + 1],
+            carriers: Vec::with_capacity(STREAM_CONTROL_CARRIERS),
+            seen: false,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.desired_count = 0;
+        self.desired_session_id = 0;
+        self.present.fill(false);
+        self.carriers.clear();
+        self.seen = false;
+    }
+
+    fn observe(&mut self, slot: usize, session: &HotSession, worker_id: usize) {
+        if session.id >= self.desired_session_id {
+            self.desired_count = session.desired_stream_count;
+            self.desired_session_id = session.id;
+        }
+        self.present[worker_id] = true;
+        self.seen = true;
+        if self.carriers.len() < STREAM_CONTROL_CARRIERS {
+            self.carriers.push(slot);
+        }
+    }
+
+    fn fill_missing(&self, out: &mut Vec<u16>) {
+        let desired = usize::from(self.desired_count).min(MAX_STREAM_WORKERS);
+        for worker in 1..=desired {
+            if !self.present[worker] {
+                out.push(worker as u16);
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct StreamRepairRound {
+    sequence: u64,
+    last_missing: Vec<u16>,
+    first_missing_ms: u64,
+    last_sent_ms: u64,
+    alive_ids: Vec<u16>,
+    alive_desired_count: u16,
+    alive_sent_ms: u64,
+    alive_sent: u8,
+    last_seen_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum FecProfile {
+    #[default]
+    Safe,
+    Off,
+}
+
+impl StreamRepairRound {
+    fn repair_payload(
+        &mut self,
+        missing: &[u16],
+        desired_count: u16,
+        now_ms: u64,
+    ) -> Option<Vec<u8>> {
+        if missing != self.last_missing.as_slice() {
+            self.sequence = self.sequence.wrapping_add(1).max(1);
+            self.last_missing.clear();
+            self.last_missing.extend_from_slice(missing);
+            self.first_missing_ms = now_ms;
+            self.last_sent_ms = 0;
+            self.alive_ids.clear();
+            self.alive_sent = 0;
+        }
+        if now_ms.saturating_sub(self.first_missing_ms) < STREAM_REPAIR_GRACE_MS {
+            return None;
+        }
+        if self.last_sent_ms != 0
+            && now_ms.saturating_sub(self.last_sent_ms) < STREAM_REPAIR_ESCALATE_MS
+        {
+            return None;
+        }
+        if self.last_sent_ms != 0 {
+            self.sequence = self.sequence.wrapping_add(1).max(1);
+        }
+        self.last_sent_ms = now_ms;
+        Some(stream_control_payload(
+            STREAM_REPAIR_PREFIX,
+            self.sequence,
+            desired_count,
+            &self.last_missing,
+        ))
+    }
+
+    fn recovered(&mut self, desired_count: u16, now_ms: u64) {
+        if self.last_missing.is_empty() {
+            return;
+        }
+        self.alive_ids = std::mem::take(&mut self.last_missing);
+        self.alive_desired_count = desired_count;
+        self.alive_sent_ms = 0;
+        self.alive_sent = 0;
+        self.first_missing_ms = now_ms;
+        self.last_sent_ms = 0;
+    }
+
+    fn alive_payload(&mut self, now_ms: u64) -> Option<Vec<u8>> {
+        if self.alive_ids.is_empty()
+            || self.alive_sent >= STREAM_ALIVE_REPEAT
+            || (self.alive_sent_ms != 0
+                && now_ms.saturating_sub(self.alive_sent_ms) < STREAM_ALIVE_INTERVAL_MS)
+        {
+            return None;
+        }
+        self.alive_sent = self.alive_sent.saturating_add(1);
+        self.alive_sent_ms = now_ms;
+        Some(stream_control_payload(
+            STREAM_ALIVE_PREFIX,
+            self.sequence,
+            self.alive_desired_count,
+            &self.alive_ids,
+        ))
+    }
+
+    fn active(&self) -> bool {
+        !self.last_missing.is_empty()
+            || (!self.alive_ids.is_empty() && self.alive_sent < STREAM_ALIVE_REPEAT)
+    }
+}
+
 pub enum ProtocolCommand {
     SendPlain {
         session_id: u64,
@@ -1172,6 +1643,7 @@ pub enum ProtocolCommand {
         ip: [u8; 4],
         registration_id: u64,
         worker_id: u16,
+        desired_count: u16,
     },
     DeactivateTunnel {
         session_id: u64,
@@ -1195,15 +1667,15 @@ pub enum ProtocolCommand {
         device_id: String,
         requester_session_id: u64,
     },
-    RemoveAuthoritativeEpoch {
-        device_id: String,
-    },
     ReplaceCredentials(Arc<CredentialSet>),
     DropSession {
         session_id: u64,
     },
     DropPassword {
         password: String,
+    },
+    CompactMemory {
+        completed: oneshot::Sender<bool>,
     },
 }
 
@@ -1224,6 +1696,15 @@ enum ControlEvent {
         session_id: u64,
         payload: Vec<u8>,
     },
+    StreamRepair {
+        device_id: String,
+        generation_id: u64,
+        desired_count: u16,
+        sequence: u64,
+        missing: Vec<u16>,
+        selected_carriers: usize,
+        sent_carriers: usize,
+    },
     IoCounters(IoCounters),
 }
 
@@ -1239,44 +1720,78 @@ impl ProtocolRuntime {
     }
 
     pub async fn shutdown(mut self) -> Result<()> {
+        self.control_task.abort();
+        let _ = tokio::time::timeout(Duration::from_millis(500), &mut self.control_task).await;
         if let Some(runtime) = self.dataplane.take() {
-            tokio::task::spawn_blocking(move || runtime.shutdown())
-                .await
-                .map_err(|error| anyhow!("join dataplane shutdown: {error}"))??;
+            runtime.shutdown()?;
         }
-        let _ = self.control_task.await;
         Ok(())
     }
 }
 
+static CREDENTIALS_SNAPSHOT: std::sync::OnceLock<std::sync::Mutex<Arc<CredentialSet>>> =
+    std::sync::OnceLock::new();
+static EPOCHS_SNAPSHOT: std::sync::OnceLock<std::sync::Mutex<HashMap<String, EpochValue>>> =
+    std::sync::OnceLock::new();
+
+fn publish_credentials_snapshot(credentials: &Arc<CredentialSet>) {
+    match CREDENTIALS_SNAPSHOT.get() {
+        Some(snapshot) => *lock_unpoison(snapshot) = credentials.clone(),
+        None => {
+            let _ = CREDENTIALS_SNAPSHOT.set(std::sync::Mutex::new(credentials.clone()));
+        }
+    }
+}
+
+fn publish_epochs_snapshot(epochs: HashMap<String, EpochValue>) {
+    match EPOCHS_SNAPSHOT.get() {
+        Some(snapshot) => *lock_unpoison(snapshot) = epochs,
+        None => {
+            let _ = EPOCHS_SNAPSHOT.set(std::sync::Mutex::new(epochs));
+        }
+    }
+}
+
+fn latest_engine_state() -> (Arc<CredentialSet>, HashMap<String, EpochValue>) {
+    let credentials = CREDENTIALS_SNAPSHOT
+        .get()
+        .expect("credential snapshot published before dataplane spawn");
+    let epochs = EPOCHS_SNAPSHOT
+        .get()
+        .expect("epoch snapshot published before dataplane spawn");
+    (
+        lock_unpoison(credentials).clone(),
+        lock_unpoison(epochs).clone(),
+    )
+}
+
 pub async fn start(app: Arc<App>) -> Result<ProtocolRuntime> {
     let credentials = build_credentials(&app).await?;
-    let epochs = {
-        let db = app.db.read().await;
-        db.devices
-            .iter()
-            .map(|(device_id, device)| {
-                (
-                    device_id.clone(),
-                    EpochValue {
-                        generation_id: device.last_generation_id,
-                        session_salt: device.last_session_salt.clone(),
-                    },
-                )
-            })
-            .collect::<HashMap<_, _>>()
-    };
+    publish_credentials_snapshot(&credentials);
+    publish_epochs_snapshot(HashMap::new());
     let (control_tx, control_rx) = mpsc::channel(CONTROL_EVENT_CAPACITY);
-    let engine = ProtocolEngine::new(
-        credentials,
-        epochs,
-        control_tx,
-        app.stream_debug_active.clone(),
-        app.bytes_from_client.clone(),
-        app.bytes_to_client.clone(),
-    );
-    let runtime = dataplane::spawn(DataplaneConfig::new(app.listen), engine)
-        .context("start io_uring protocol dataplane")?;
+    let engine_factory = {
+        let control_tx = control_tx.clone();
+        let fec_profile = app.fec_profile;
+        let stream_debug_active = app.stream_debug_active.clone();
+        let shared = EngineShared {
+            global_up: app.bytes_from_client.clone(),
+            global_down: app.bytes_to_client.clone(),
+        };
+        move || {
+            let (credentials, epochs) = latest_engine_state();
+            ProtocolEngine::new(
+                credentials,
+                epochs,
+                control_tx.clone(),
+                fec_profile,
+                stream_debug_active.clone(),
+                shared.clone(),
+            )
+        }
+    };
+    let runtime = dataplane::spawn(DataplaneConfig::new(app.listen), engine_factory)
+        .context("start tokio protocol dataplane")?;
     let status = runtime.status_receiver();
     app.dataplane
         .set(runtime.handle())
@@ -1294,6 +1809,7 @@ pub async fn start(app: Arc<App>) -> Result<ProtocolRuntime> {
 
 pub async fn refresh_credentials(app: &Arc<App>) -> Result<()> {
     let credentials = build_credentials(app).await?;
+    publish_credentials_snapshot(&credentials);
     command(app, ProtocolCommand::ReplaceCredentials(credentials))
 }
 
@@ -1308,12 +1824,12 @@ pub fn drop_password_sessions(app: &Arc<App>, password: &str) {
         .sessions
         .iter()
         .filter(|entry| entry.value().password == password)
-        .map(|entry| (*entry.key(), entry.value().id))
+        .map(|entry| *entry.key())
         .collect::<Vec<_>>();
-    for (address, session_id) in candidates {
+    for session_id in candidates {
         if let Some((_, session)) = app
             .sessions
-            .remove_if(&address, |_, current| current.id == session_id)
+            .remove_if(&session_id, |_, current| current.id == session_id)
         {
             session.cancel_token.cancel();
         }
@@ -1344,6 +1860,15 @@ pub fn notify_panel_restart(app: &Arc<App>) -> Result<()> {
     )
 }
 
+pub async fn compact_memory(app: &Arc<App>) -> Result<bool> {
+    let (completed, confirmation) = oneshot::channel();
+    command(app, ProtocolCommand::CompactMemory { completed })?;
+    tokio::time::timeout(Duration::from_secs(3), confirmation)
+        .await
+        .map_err(|_| anyhow!("dataplane memory compaction timed out"))?
+        .map_err(|_| anyhow!("dataplane stopped before memory compaction"))
+}
+
 fn command(app: &Arc<App>, command_value: ProtocolCommand) -> Result<()> {
     app.dataplane
         .get()
@@ -1351,9 +1876,21 @@ fn command(app: &Arc<App>, command_value: ProtocolCommand) -> Result<()> {
         .try_send(command_value)
 }
 
+async fn db_read<'a>(app: &'a Arc<App>) -> Result<RwLockReadGuard<'a, Database>> {
+    tokio::time::timeout(DB_LOCK_TIMEOUT, app.db.read())
+        .await
+        .map_err(|_| anyhow!("database read lock timed out"))
+}
+
+async fn db_write<'a>(app: &'a Arc<App>) -> Result<RwLockWriteGuard<'a, Database>> {
+    tokio::time::timeout(DB_LOCK_TIMEOUT, app.db.write())
+        .await
+        .map_err(|_| anyhow!("database write lock timed out"))
+}
+
 async fn build_credentials(app: &Arc<App>) -> Result<Arc<CredentialSet>> {
     let passwords = {
-        let db = app.db.read().await;
+        let db = db_read(app).await?;
         let mut passwords = Vec::with_capacity(db.passwords.len() + 1);
         if !db.main_password.is_empty() {
             passwords.push(db.main_password.clone());
@@ -1365,6 +1902,9 @@ async fn build_credentials(app: &Arc<App>) -> Result<Arc<CredentialSet>> {
         }
         passwords
     };
+    let active_passwords: HashSet<&str> = passwords.iter().map(String::as_str).collect();
+    app.derived_keys
+        .retain(|password, _| active_passwords.contains(password.as_str()));
     let mut entries = Vec::with_capacity(passwords.len());
     for password in passwords {
         let key = if let Some(existing) = app.derived_keys.get(&password) {
@@ -1392,10 +1932,12 @@ struct ProtocolEngine {
     credentials: Arc<CredentialSet>,
     epochs: HashMap<String, EpochValue>,
     sessions: slab::Slab<HotSession>,
-    by_peer: HashMap<SocketAddr, usize>,
+    by_peer: HashMap<EndpointKey, usize>,
     by_id: HashMap<u64, usize>,
     routes: RouteTable,
+    downlink: DownlinkQueue,
     control_tx: mpsc::Sender<ControlEvent>,
+    fec_profile: FecProfile,
     stream_debug_active: Arc<AtomicBool>,
     global_up: Arc<AtomicU64>,
     global_down: Arc<AtomicU64>,
@@ -1415,8 +1957,38 @@ struct ProtocolEngine {
     last_io_counters: IoCounters,
     memory_compact_pending: bool,
     last_memory_compact_ms: u64,
+    last_stream_reconcile_ms: u64,
+    last_stream_inventory_resync_ms: u64,
+    last_session_maintenance_ms: u64,
+    stream_inventory_dirty: bool,
+    stream_repairs: HashMap<StreamIdentity, StreamRepairRound>,
+    stream_inventory: HashMap<StreamIdentity, StreamInventory>,
+    stream_actions: Vec<StreamControlAction>,
+    stream_missing_scratch: Vec<u16>,
+    epoch_sweep_active: HashSet<String>,
+    last_epoch_sweep_ms: u64,
     batch_now: Instant,
     crypto_profiler: CryptoProfiler,
+}
+
+struct StreamControlAction {
+    carriers: Vec<usize>,
+    payload: Vec<u8>,
+    repair: Option<StreamRepairLog>,
+}
+
+struct StreamRepairLog {
+    device_id: String,
+    generation_id: u64,
+    desired_count: u16,
+    sequence: u64,
+    missing: Vec<u16>,
+}
+
+#[derive(Clone)]
+struct EngineShared {
+    global_up: Arc<AtomicU64>,
+    global_down: Arc<AtomicU64>,
 }
 
 impl ProtocolEngine {
@@ -1424,9 +1996,9 @@ impl ProtocolEngine {
         credentials: Arc<CredentialSet>,
         epochs: HashMap<String, EpochValue>,
         control_tx: mpsc::Sender<ControlEvent>,
+        fec_profile: FecProfile,
         stream_debug_active: Arc<AtomicBool>,
-        global_up: Arc<AtomicU64>,
-        global_down: Arc<AtomicU64>,
+        shared: EngineShared,
     ) -> Self {
         let wall_now = wall_clock();
         let engine = Self {
@@ -1436,10 +2008,12 @@ impl ProtocolEngine {
             by_peer: HashMap::with_capacity(HOT_TABLE_RESERVE),
             by_id: HashMap::with_capacity(HOT_TABLE_RESERVE),
             routes: RouteTable::new(),
+            downlink: DownlinkQueue::default(),
             control_tx,
+            fec_profile,
             stream_debug_active,
-            global_up,
-            global_down,
+            global_up: shared.global_up,
+            global_down: shared.global_down,
             rng: StdRng::from_entropy(),
             setup_scratch: PacketBuffer::new(),
             stale_slots: Vec::with_capacity(256),
@@ -1456,10 +2030,21 @@ impl ProtocolEngine {
             last_io_counters: IoCounters::default(),
             memory_compact_pending: false,
             last_memory_compact_ms: 0,
+            last_stream_reconcile_ms: 0,
+            last_stream_inventory_resync_ms: 0,
+            last_session_maintenance_ms: 0,
+            stream_inventory_dirty: true,
+            stream_repairs: HashMap::new(),
+            stream_inventory: HashMap::new(),
+            stream_actions: Vec::new(),
+            stream_missing_scratch: Vec::new(),
+            epoch_sweep_active: HashSet::new(),
+            last_epoch_sweep_ms: 0,
             batch_now: Instant::now(),
             crypto_profiler: CryptoProfiler::default(),
         };
         engine.publish_session_gauges();
+        engine.publish_memory_gauges();
         engine
     }
 
@@ -1468,21 +2053,33 @@ impl ProtocolEngine {
         HOT_SESSION_CAPACITY_GAUGE.store(self.sessions.capacity() as u64, Ordering::Relaxed);
     }
 
+    fn publish_memory_gauges(&self) {
+        ENGINE_EPOCHS_GAUGE.store(self.epochs.len() as u64, Ordering::Relaxed);
+        STREAM_REPAIRS_GAUGE.store(self.stream_repairs.len() as u64, Ordering::Relaxed);
+        STREAM_INVENTORY_GAUGE.store(self.stream_inventory.len() as u64, Ordering::Relaxed);
+    }
+
+    fn publish_epoch_state(&self) {
+        publish_epochs_snapshot(self.epochs.clone());
+        self.publish_memory_gauges();
+    }
+
     fn compact_memory(&mut self, force: bool) {
         let session_count = self.sessions.len();
         let session_capacity = self.sessions.capacity();
         if !force
             && (session_capacity <= HOT_TABLE_RESERVE
-                || session_count.saturating_mul(4) > session_capacity)
+                || session_count.saturating_mul(2) > session_capacity)
         {
             self.memory_compact_pending = false;
             return;
         }
+        self.stream_inventory_dirty = true;
         let by_peer = &mut self.by_peer;
         let by_id = &mut self.by_id;
         let routes = &mut self.routes;
         self.sessions.compact(|session, _, new_slot| {
-            by_peer.insert(session.peer, new_slot);
+            by_peer.insert(EndpointKey::new(session.peer, session.local_ip), new_slot);
             by_id.insert(session.id, new_slot);
             if let (Some(ip), Some(registration_id)) = (session.tunnel_ip, session.registration_id)
             {
@@ -1498,16 +2095,58 @@ impl ProtocolEngine {
         self.by_peer.shrink_to(HOT_TABLE_RESERVE.max(session_count));
         self.by_id.shrink_to(HOT_TABLE_RESERVE.max(session_count));
         self.epochs.shrink_to_fit();
+        self.stream_repairs.shrink_to_fit();
+        self.stream_inventory.shrink_to_fit();
         self.stale_slots.shrink_to(256);
         self.memory_compact_pending = false;
         self.last_memory_compact_ms = self.monotonic_ms;
         self.publish_session_gauges();
+        self.publish_memory_gauges();
+    }
+
+    fn shrink_stream_bookkeeping(&mut self) {
+        const RETAINED_CAPACITY: usize = 32;
+        if self.stream_repairs.capacity() > RETAINED_CAPACITY
+            && self.stream_repairs.len().saturating_mul(4) < self.stream_repairs.capacity()
+        {
+            self.stream_repairs
+                .shrink_to(RETAINED_CAPACITY.max(self.stream_repairs.len()));
+        }
+        if self.stream_inventory.capacity() > RETAINED_CAPACITY
+            && self.stream_inventory.len().saturating_mul(4) < self.stream_inventory.capacity()
+        {
+            self.stream_inventory
+                .shrink_to(RETAINED_CAPACITY.max(self.stream_inventory.len()));
+        }
+        if self.stream_actions.capacity() > RETAINED_CAPACITY
+            && self.stream_actions.len().saturating_mul(4) < self.stream_actions.capacity()
+        {
+            self.stream_actions
+                .shrink_to(RETAINED_CAPACITY.max(self.stream_actions.len()));
+        }
+    }
+
+    fn shrink_epoch_bookkeeping(&mut self) {
+        const RETAINED_CAPACITY: usize = 32;
+        if self.epochs.capacity() > RETAINED_CAPACITY
+            && self.epochs.len().saturating_mul(4) < self.epochs.capacity()
+        {
+            self.epochs
+                .shrink_to(RETAINED_CAPACITY.max(self.epochs.len()));
+        }
+        if self.epoch_sweep_active.capacity() > RETAINED_CAPACITY
+            && self.epoch_sweep_active.len().saturating_mul(4) < self.epoch_sweep_active.capacity()
+        {
+            self.epoch_sweep_active
+                .shrink_to(RETAINED_CAPACITY.max(self.epoch_sweep_active.len()));
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
     fn create_legacy_session(
         &mut self,
         peer: SocketAddr,
+        local_ip: Option<IpAddr>,
         password: Arc<str>,
         key: [u8; 32],
         payload_type: u8,
@@ -1517,13 +2156,15 @@ impl ProtocolEngine {
         session_salt: &str,
         replay_seq: u16,
     ) -> usize {
-        if let Some(old_slot) = self.by_peer.get(&peer).copied() {
+        let endpoint_key = EndpointKey::new(peer, local_ip);
+        if let Some(old_slot) = self.by_peer.get(&endpoint_key).copied() {
             self.remove_slot_with_reason(old_slot, "peer-replaced");
         }
         let id = SESSION_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
         let mut session = HotSession::legacy(
             id,
             peer,
+            local_ip,
             password,
             key,
             payload_type,
@@ -1531,6 +2172,7 @@ impl ProtocolEngine {
             device_id,
             generation_id,
             session_salt,
+            self.fec_profile,
             self.stream_debug_active.clone(),
             self.monotonic_ms,
             self.wall_now,
@@ -1538,16 +2180,13 @@ impl ProtocolEngine {
         let _ = session.replay.accept(replay_seq);
         let public = session.public.clone();
         let slot = self.sessions.insert(session);
-        self.by_peer.insert(peer, slot);
+        self.by_peer.insert(endpoint_key, slot);
         self.by_id.insert(id, slot);
+        self.stream_inventory_dirty = true;
         self.publish_session_gauges();
-        if self
+        let _ = self
             .control_tx
-            .try_send(ControlEvent::SessionCreated(public))
-            .is_err()
-        {
-            self.remove_slot_with_reason(slot, "control-queue-full");
-        }
+            .try_send(ControlEvent::SessionCreated(public));
         slot
     }
 
@@ -1557,6 +2196,7 @@ impl ProtocolEngine {
         }
         let mut session = self.sessions.remove(slot);
         self.memory_compact_pending = true;
+        self.stream_inventory_dirty = true;
         self.publish_session_gauges();
         session.publish_counters(
             &self.global_up,
@@ -1564,7 +2204,8 @@ impl ProtocolEngine {
             self.wall_now,
             self.debug_enabled,
         );
-        self.by_peer.remove(&session.peer);
+        self.by_peer
+            .remove(&EndpointKey::new(session.peer, session.local_ip));
         self.by_id.remove(&session.id);
         if let (Some(ip), Some(registration_id)) = (session.tunnel_ip, session.registration_id) {
             let removed_active_route = self.routes.unregister(ip, registration_id);
@@ -1603,6 +2244,7 @@ impl ProtocolEngine {
                     public.has_tunnel.store(true, Ordering::Release);
                 }
             }
+            self.sync_downlink_profile(ip);
         }
         session.public.has_tunnel.store(false, Ordering::Release);
         session.public.cancel_token.cancel();
@@ -1613,7 +2255,13 @@ impl ProtocolEngine {
         });
     }
 
-    fn handle_unknown_legacy(&mut self, peer: SocketAddr, wire: &[u8], sink: &mut PacketSink<'_>) {
+    fn handle_unknown_legacy(
+        &mut self,
+        peer: SocketAddr,
+        local_ip: Option<IpAddr>,
+        wire: &[u8],
+        sink: &mut PacketSink<'_>,
+    ) {
         if self.sessions.len() >= MAX_ACTIVE_SESSIONS
             || wire.len() > PACKET_CAPACITY
             || self.setup_budget == 0
@@ -1658,12 +2306,13 @@ impl ProtocolEngine {
         let Some((password, key, decoded, device_id, generation_id, session_salt, plain)) = found
         else {
             if wire.len() >= 30 {
-                let _ = sink.send_udp(peer, b"DENIED:wrong_password");
+                let _ = sink.send_udp(peer, local_ip, b"DENIED:wrong_password");
             }
             return;
         };
         let slot = self.create_legacy_session(
             peer,
+            local_ip,
             password,
             key,
             decoded.payload_type,
@@ -1698,20 +2347,20 @@ impl ProtocolEngine {
             );
         }
         let session_id = session.id;
-        if self
-            .control_tx
-            .try_send(ControlEvent::Payload {
-                address: peer,
-                session_id,
-                payload: plain,
-            })
-            .is_err()
-        {
-            self.remove_slot_with_reason(slot, "control-queue-full");
-        }
+        let _ = self.control_tx.try_send(ControlEvent::Payload {
+            address: peer,
+            session_id,
+            payload: plain,
+        });
     }
 
-    fn handle_existing(&mut self, slot: usize, packet: &mut [u8], sink: &mut PacketSink<'_>) {
+    fn handle_existing(
+        &mut self,
+        slot: usize,
+        local_ip: Option<IpAddr>,
+        packet: &mut [u8],
+        sink: &mut PacketSink<'_>,
+    ) {
         if !self.sessions.contains(slot) {
             return;
         }
@@ -1749,6 +2398,9 @@ impl ProtocolEngine {
                 return;
             };
             let session = &self.sessions[slot];
+            if let Some(epoch) = self.epochs.get_mut(incoming_device) {
+                epoch.last_seen_ms = self.monotonic_ms;
+            }
             let authoritative = self.epochs.get(incoming_device);
             match getconf_reconnect_action_hot(
                 authoritative,
@@ -1762,6 +2414,7 @@ impl ProtocolEngine {
                 GetconfReconnectAction::Reject => return,
                 GetconfReconnectAction::Replace => {
                     let peer = session.peer;
+                    let local_ip = local_ip.or(session.local_ip);
                     let password = session.password.clone();
                     let key = session.key;
                     let payload_type = decoded.payload_type;
@@ -1772,6 +2425,7 @@ impl ProtocolEngine {
                     self.remove_slot_with_reason(slot, "epoch-replaced");
                     let new_slot = self.create_legacy_session(
                         peer,
+                        local_ip,
                         password,
                         key,
                         payload_type,
@@ -1807,29 +2461,21 @@ impl ProtocolEngine {
         if !accepted {
             return;
         }
+        let mut endpoint_key_update = None;
         {
             let session = &mut self.sessions[slot];
             session.last_inbound_ms = self.monotonic_ms;
-            session.last_seen_wall = self.wall_now;
+            if local_ip.is_some() && session.local_ip != local_ip {
+                endpoint_key_update = Some((session.peer, session.local_ip, local_ip));
+                session.local_ip = local_ip;
+            }
         }
-        if is_smart_ping(plain) {
-            let (ack, ack_len) = smart_ping_ack(plain);
-            let session = &mut self.sessions[slot];
-            send_plain(
-                session,
-                &ack[..ack_len],
-                &mut self.rng,
-                sink,
-                &mut self.crypto_profiler,
-                self.batch_now,
-                SendObservability {
-                    record_dpi: false,
-                    count_crypto: self.syscalls_enabled,
-                },
-            );
-            return;
+        if let Some((peer, old_local_ip, new_local_ip)) = endpoint_key_update {
+            self.by_peer.remove(&EndpointKey::new(peer, old_local_ip));
+            self.by_peer
+                .insert(EndpointKey::new(peer, new_local_ip), slot);
         }
-        if plain == PATH_LEASE {
+        if plain == SESSION_LEASE {
             return;
         }
         let record_dpi = should_record_dpi(
@@ -1869,7 +2515,7 @@ impl ProtocolEngine {
             );
             return;
         }
-        if plain.iter().all(|byte| *byte == 0xff) {
+        if is_idle_keepalive(plain) {
             return;
         }
         if is_control_payload(plain) {
@@ -1878,9 +2524,7 @@ impl ProtocolEngine {
                 session_id: session.id,
                 payload: plain.to_vec(),
             };
-            if self.control_tx.try_send(event).is_err() {
-                self.remove_slot_with_reason(slot, "control-queue-full");
-            }
+            let _ = self.control_tx.try_send(event);
             return;
         }
         if session.tunnel_ip.is_some() && session.registration_id.is_some() {
@@ -1888,17 +2532,14 @@ impl ProtocolEngine {
                 .crypto_profiler
                 .all
                 .begin(PerfStage::TunWrite, plain.len());
-            let written = sink.write_tun(plain);
+            let class = crate::striped_scheduler::packet_class(plain);
+            let written = sink.write_tun_priority(plain, class);
             self.crypto_profiler
                 .all
                 .finish(PerfStage::TunWrite, write_started);
             if written {
                 session.up_total = session.up_total.saturating_add(plain.len() as u64);
-                if self.debug_enabled {
-                    session.debug.up_bytes =
-                        session.debug.up_bytes.saturating_add(plain.len() as u64);
-                    session.debug.up_packets = session.debug.up_packets.saturating_add(1);
-                }
+                session.record_debug_up(plain.len() as u64, self.debug_enabled);
             }
             return;
         }
@@ -1921,43 +2562,70 @@ impl ProtocolEngine {
         ip: [u8; 4],
         registration_id: u64,
         worker_id: u16,
+        desired_count: u16,
     ) -> bool {
         let Some(slot) = self.by_id.get(&session_id).copied() else {
             return false;
         };
-        let session = &mut self.sessions[slot];
-        if let (Some(old_ip), Some(old_registration)) = (session.tunnel_ip, session.registration_id)
-        {
-            self.routes.unregister(old_ip, old_registration);
+        let mut old_ip = None;
+        let activated = {
+            let session = &mut self.sessions[slot];
+            if let (Some(previous_ip), Some(old_registration)) =
+                (session.tunnel_ip, session.registration_id)
+            {
+                self.routes.unregister(previous_ip, old_registration);
+                old_ip = Some(previous_ip);
+            }
+            if self
+                .routes
+                .register(ip, session_id, registration_id, worker_id, slot)
+            {
+                session.tunnel_ip = Some(ip);
+                session.registration_id = Some(registration_id);
+                session.desired_stream_count = desired_count;
+                session.pending_tunnel = false;
+                *lock_unpoison(&session.public.tunnel_ip) = Some(ip);
+                session
+                    .public
+                    .desired_stream_count
+                    .store(u64::from(desired_count), Ordering::Release);
+                session.public.has_tunnel.store(true, Ordering::Release);
+                self.stream_inventory_dirty = true;
+                true
+            } else {
+                false
+            }
+        };
+        if let Some(old_ip) = old_ip {
+            self.sync_downlink_profile(old_ip);
         }
-        if self
-            .routes
-            .register(ip, session_id, registration_id, worker_id, slot)
-        {
-            session.tunnel_ip = Some(ip);
-            session.registration_id = Some(registration_id);
-            session.pending_tunnel = false;
-            *lock_unpoison(&session.public.tunnel_ip) = Some(ip);
-            session.public.has_tunnel.store(true, Ordering::Release);
-            true
-        } else {
-            false
+        if activated {
+            self.sync_downlink_profile(ip);
         }
+        activated
     }
 
     fn remove_tunnel(&mut self, session_id: u64) {
         let Some(slot) = self.by_id.get(&session_id).copied() else {
             return;
         };
-        let session = &mut self.sessions[slot];
-        if let (Some(ip), Some(registration_id)) = (session.tunnel_ip, session.registration_id) {
-            self.routes.unregister(ip, registration_id);
+        let ip = {
+            let session = &mut self.sessions[slot];
+            let ip = session.tunnel_ip;
+            if let (Some(ip), Some(registration_id)) = (ip, session.registration_id) {
+                self.routes.unregister(ip, registration_id);
+            }
+            session.tunnel_ip = None;
+            session.registration_id = None;
+            session.pending_tunnel = false;
+            *lock_unpoison(&session.public.tunnel_ip) = None;
+            session.public.has_tunnel.store(false, Ordering::Release);
+            ip
+        };
+        if let Some(ip) = ip {
+            self.sync_downlink_profile(ip);
         }
-        session.tunnel_ip = None;
-        session.registration_id = None;
-        session.pending_tunnel = false;
-        *lock_unpoison(&session.public.tunnel_ip) = None;
-        session.public.has_tunnel.store(false, Ordering::Release);
+        self.stream_inventory_dirty = true;
     }
 
     fn update_epoch(
@@ -1970,38 +2638,53 @@ impl ProtocolEngine {
         let Some(slot) = self.by_id.get(&session_id).copied() else {
             return;
         };
-        let session = &mut self.sessions[slot];
-        session.device_id = device_id.clone();
-        session.generation_id = generation_id;
-        session.session_salt = session_salt.clone();
-        *lock_unpoison(&session.public.device_id) = device_id;
-        session
-            .public
-            .generation_id
-            .store(generation_id, Ordering::Release);
-        *lock_unpoison(&session.public.session_salt) = session_salt;
+        let replaced_ip = {
+            let session = &mut self.sessions[slot];
+            let identity_changed = session.device_id != device_id
+                || session.generation_id != generation_id
+                || session.session_salt != session_salt;
+            let ip = identity_changed.then_some(session.tunnel_ip).flatten();
+            session.device_id = device_id.clone();
+            session.generation_id = generation_id;
+            session.session_salt = session_salt.clone();
+            *lock_unpoison(&session.public.device_id) = device_id;
+            session
+                .public
+                .generation_id
+                .store(generation_id, Ordering::Release);
+            *lock_unpoison(&session.public.session_salt) = session_salt;
+            ip
+        };
+        if let Some(ip) = replaced_ip
+            && let Some(key) = RouteTable::tunnel_key(ip)
+        {
+            self.downlink.clear(key);
+        }
+        self.stream_inventory_dirty = true;
+    }
+
+    fn sync_downlink_profile(&mut self, ip: [u8; 4]) {
+        let Some(key) = RouteTable::tunnel_key(ip) else {
+            return;
+        };
+        self.downlink
+            .configure(key, self.routes.active_path_count(key));
     }
 
     fn send_down_endpoint(
         &mut self,
         endpoint: crate::tun_device::RouteEndpoint,
         packet: &[u8],
+        class: crate::striped_scheduler::PacketClass,
         sink: &mut PacketSink<'_>,
-        route_started: Option<u64>,
-    ) -> Option<bool> {
+    ) -> DownlinkSend {
         let Some(session) = self.sessions.get_mut(endpoint.slot) else {
-            self.crypto_profiler
-                .all
-                .finish(PerfStage::RouteReplay, route_started);
-            return None;
+            return DownlinkSend::Stale;
         };
         if session.id != endpoint.session_id
             || session.registration_id != Some(endpoint.registration_id)
         {
-            self.crypto_profiler
-                .all
-                .finish(PerfStage::RouteReplay, route_started);
-            return None;
+            return DownlinkSend::Stale;
         }
         let record_dpi = should_record_dpi(
             self.dpi_enabled,
@@ -2010,33 +2693,243 @@ impl ProtocolEngine {
             &mut self.dpi_last_sample_ms,
             packet,
         );
-        self.crypto_profiler
-            .all
-            .finish(PerfStage::RouteReplay, route_started);
-        let sent = send_plain(
+        let sent = send_plain_mode(
             session,
             packet,
             &mut self.rng,
             sink,
             &mut self.crypto_profiler,
             self.batch_now,
-            SendObservability {
-                record_dpi,
-                count_crypto: self.syscalls_enabled,
+            SendMode {
+                class,
+                observability: SendObservability {
+                    record_dpi,
+                    count_crypto: self.syscalls_enabled,
+                },
             },
         );
         if sent {
             session.down_total = session.down_total.saturating_add(packet.len() as u64);
-            if self.debug_enabled {
-                session.debug.down_bytes =
-                    session.debug.down_bytes.saturating_add(packet.len() as u64);
-                session.debug.down_packets = session.debug.down_packets.saturating_add(1);
-            }
+            session.record_debug_down(packet.len() as u64, self.debug_enabled);
+            DownlinkSend::Sent
+        } else {
+            DownlinkSend::Backpressured
         }
-        Some(sent)
     }
 
-    fn handle_tun_packet(&mut self, packet: &[u8], sink: &mut PacketSink<'_>) {
+    fn send_down_key(
+        &mut self,
+        key: usize,
+        packet: &[u8],
+        class: crate::striped_scheduler::PacketClass,
+        sink: &mut PacketSink<'_>,
+    ) -> DownlinkSend {
+        let Some(selection) = self.routes.select_key_window(key, class) else {
+            return DownlinkSend::Stale;
+        };
+        for offset in 0..selection.len() {
+            let Some(endpoint) = self.routes.endpoint_at(key, selection, offset) else {
+                break;
+            };
+            match self.send_down_endpoint(endpoint, packet, class, sink) {
+                DownlinkSend::Stale => continue,
+                result => return result,
+            }
+        }
+        DownlinkSend::Stale
+    }
+
+    fn drain_downlink(&mut self, sink: &mut PacketSink<'_>) {
+        let mut remaining = DOWNLINK_DRAIN_PACKET_LIMIT;
+        for class in [
+            crate::striped_scheduler::PacketClass::Latency,
+            crate::striped_scheduler::PacketClass::Priority,
+            crate::striped_scheduler::PacketClass::Bulk,
+        ] {
+            while remaining != 0 {
+                if !sink.has_udp_tx_slot() {
+                    return;
+                }
+                let Some((key, packet)) = self.downlink.dequeue(class) else {
+                    break;
+                };
+                match self.send_down_key(key, packet.as_slice(), class, sink) {
+                    DownlinkSend::Backpressured => {
+                        self.downlink.requeue_front(key, class, packet);
+                        return;
+                    }
+                    DownlinkSend::Sent | DownlinkSend::Stale => {
+                        self.downlink.recycle(key, class, packet);
+                        remaining -= 1;
+                    }
+                }
+            }
+        }
+    }
+
+    fn send_stream_control(
+        &mut self,
+        carriers: &[usize],
+        payload: &[u8],
+        sink: &mut PacketSink<'_>,
+    ) -> usize {
+        let mut sent = 0usize;
+        for slot in carriers.iter().copied() {
+            if sent >= STREAM_CONTROL_CARRIERS {
+                return sent;
+            }
+            let Some(session) = self.sessions.get_mut(slot) else {
+                continue;
+            };
+            if send_plain(
+                session,
+                payload,
+                &mut self.rng,
+                sink,
+                &mut self.crypto_profiler,
+                self.batch_now,
+                SendObservability {
+                    record_dpi: false,
+                    count_crypto: self.syscalls_enabled,
+                },
+            ) {
+                sent += 1;
+            }
+        }
+        sent
+    }
+
+    fn reconcile_streams(&mut self, sink: &mut PacketSink<'_>) {
+        if self
+            .monotonic_ms
+            .saturating_sub(self.last_stream_reconcile_ms)
+            < STREAM_RECONCILE_INTERVAL_MS
+        {
+            return;
+        }
+        self.last_stream_reconcile_ms = self.monotonic_ms;
+        let rebuild_inventory = self.stream_inventory_dirty
+            || self
+                .monotonic_ms
+                .saturating_sub(self.last_stream_inventory_resync_ms)
+                >= STREAM_INVENTORY_RESYNC_MS;
+        let mut inventory = std::mem::take(&mut self.stream_inventory);
+        if rebuild_inventory {
+            for streams in inventory.values_mut() {
+                streams.reset();
+            }
+            for (slot, session) in self.sessions.iter() {
+                let desired_count = usize::from(session.desired_stream_count);
+                if desired_count == 0
+                    || desired_count > MAX_STREAM_WORKERS
+                    || session.registration_id.is_none()
+                {
+                    continue;
+                }
+                let worker_id = session.public.worker_id.load(Ordering::Acquire) as usize;
+                if worker_id == 0 || worker_id > desired_count || worker_id > MAX_STREAM_WORKERS {
+                    continue;
+                }
+                inventory
+                    .entry(StreamIdentity {
+                        device_id: session.device_id.clone(),
+                        generation_id: session.generation_id,
+                        session_salt: session.session_salt.clone(),
+                    })
+                    .or_insert_with(StreamInventory::new)
+                    .observe(slot, session, worker_id);
+            }
+            inventory.retain(|_, streams| streams.seen);
+            self.stream_inventory_dirty = false;
+            self.last_stream_inventory_resync_ms = self.monotonic_ms;
+        }
+        let now_ms = self.monotonic_ms;
+        let mut actions = std::mem::take(&mut self.stream_actions);
+        for (identity, streams) in inventory.iter() {
+            let round = match self.stream_repairs.get_mut(identity) {
+                Some(round) => round,
+                None => self.stream_repairs.entry(identity.clone()).or_default(),
+            };
+            round.last_seen_ms = now_ms;
+            self.stream_missing_scratch.clear();
+            streams.fill_missing(&mut self.stream_missing_scratch);
+            let missing = self.stream_missing_scratch.as_slice();
+            if missing.is_empty() {
+                round.recovered(streams.desired_count, now_ms);
+                if let Some(payload) = round.alive_payload(now_ms) {
+                    actions.push(StreamControlAction {
+                        carriers: streams.carriers.clone(),
+                        payload,
+                        repair: None,
+                    });
+                }
+            } else if let Some(payload) =
+                round.repair_payload(missing, streams.desired_count, now_ms)
+            {
+                actions.push(StreamControlAction {
+                    carriers: streams.carriers.clone(),
+                    payload,
+                    repair: Some(StreamRepairLog {
+                        device_id: identity.device_id.clone(),
+                        generation_id: identity.generation_id,
+                        desired_count: streams.desired_count,
+                        sequence: round.sequence,
+                        missing: missing.to_vec(),
+                    }),
+                });
+            }
+        }
+        self.stream_repairs.retain(|identity, round| {
+            inventory.contains_key(identity)
+                || !round.active()
+                || now_ms.saturating_sub(round.last_seen_ms) < STREAM_ROUND_ORPHAN_TTL_MS
+        });
+        for action in actions.drain(..) {
+            let selected_carriers = action.carriers.len();
+            let sent_carriers = self.send_stream_control(&action.carriers, &action.payload, sink);
+            if let Some(repair) = action.repair {
+                let _ = self.control_tx.try_send(ControlEvent::StreamRepair {
+                    device_id: repair.device_id,
+                    generation_id: repair.generation_id,
+                    desired_count: repair.desired_count,
+                    sequence: repair.sequence,
+                    missing: repair.missing,
+                    selected_carriers,
+                    sent_carriers,
+                });
+            }
+        }
+        self.stream_inventory = inventory;
+        self.stream_actions = actions;
+        self.shrink_stream_bookkeeping();
+        self.publish_memory_gauges();
+    }
+
+    fn sweep_idle_epochs(&mut self) {
+        if self.monotonic_ms.saturating_sub(self.last_epoch_sweep_ms) < EPOCH_SWEEP_INTERVAL_MS {
+            return;
+        }
+        self.last_epoch_sweep_ms = self.monotonic_ms;
+        self.epoch_sweep_active.clear();
+        for (_, session) in self.sessions.iter() {
+            if !session.device_id.is_empty() {
+                self.epoch_sweep_active.insert(session.device_id.clone());
+            }
+        }
+        let before = self.epochs.len();
+        self.epochs.retain(|device_id, epoch| {
+            self.epoch_sweep_active.contains(device_id)
+                || self.monotonic_ms.saturating_sub(epoch.last_seen_ms) < EPOCH_IDLE_TTL_MS
+        });
+        self.shrink_epoch_bookkeeping();
+        if self.epochs.len() != before {
+            self.publish_epoch_state();
+        } else {
+            self.publish_memory_gauges();
+        }
+    }
+
+    fn handle_tun_packet(&mut self, packet: &[u8], _sink: &mut PacketSink<'_>) {
         let route_started = self
             .crypto_profiler
             .all
@@ -2047,29 +2940,44 @@ impl ProtocolEngine {
                 .finish(PerfStage::RouteReplay, route_started);
             return;
         };
-        let Some(endpoint) = self.routes.select_key(key, packet.len()) else {
-            self.crypto_profiler
-                .all
-                .finish(PerfStage::RouteReplay, route_started);
-            return;
-        };
-        let _ = self.send_down_endpoint(endpoint, packet, sink, route_started);
+        let class = crate::striped_scheduler::packet_class(packet);
+        self.crypto_profiler
+            .all
+            .finish(PerfStage::RouteReplay, route_started);
+        let _ = self.downlink.enqueue(key, class, packet);
     }
 }
 
 impl DataplaneLogic for ProtocolEngine {
     type Command = ProtocolCommand;
 
-    fn on_udp(&mut self, peer: SocketAddr, packet: &mut [u8], sink: &mut PacketSink<'_>) {
-        if let Some(slot) = self.by_peer.get(&peer).copied() {
-            self.handle_existing(slot, packet, sink);
+    fn on_udp(
+        &mut self,
+        peer: SocketAddr,
+        local_ip: Option<IpAddr>,
+        packet: &mut [u8],
+        sink: &mut PacketSink<'_>,
+    ) {
+        let key = EndpointKey::new(peer, local_ip);
+        if let Some(slot) = self.by_peer.get(&key).copied() {
+            self.handle_existing(slot, local_ip, packet, sink);
             return;
         }
-        self.handle_unknown_legacy(peer, packet, sink);
+        if local_ip.is_some()
+            && let Some(slot) = self.by_peer.get(&EndpointKey::new(peer, None)).copied()
+        {
+            self.handle_existing(slot, local_ip, packet, sink);
+            return;
+        }
+        self.handle_unknown_legacy(peer, local_ip, packet, sink);
     }
 
     fn on_tun(&mut self, packet: &mut [u8], sink: &mut PacketSink<'_>) {
         self.handle_tun_packet(packet, sink);
+    }
+
+    fn on_tun_batch_end(&mut self, sink: &mut PacketSink<'_>) {
+        self.drain_downlink(sink);
     }
 
     fn begin_batch(&mut self, now: Instant) {
@@ -2137,8 +3045,9 @@ impl DataplaneLogic for ProtocolEngine {
                 ip,
                 registration_id,
                 worker_id,
+                desired_count,
             } => {
-                self.activate_tunnel(session_id, ip, registration_id, worker_id);
+                self.activate_tunnel(session_id, ip, registration_id, worker_id, desired_count);
             }
             ProtocolCommand::DeactivateTunnel { session_id } => self.remove_tunnel(session_id),
             ProtocolCommand::InjectTun {
@@ -2146,15 +3055,14 @@ impl DataplaneLogic for ProtocolEngine {
                 payload,
             } => {
                 if let Some(slot) = self.by_id.get(&session_id).copied()
-                    && sink.write_tun(&payload)
+                    && sink.write_tun_priority(
+                        &payload,
+                        crate::striped_scheduler::packet_class(&payload),
+                    )
                 {
                     let session = &mut self.sessions[slot];
                     session.up_total = session.up_total.saturating_add(payload.len() as u64);
-                    if self.debug_enabled {
-                        session.debug.up_bytes =
-                            session.debug.up_bytes.saturating_add(payload.len() as u64);
-                        session.debug.up_packets = session.debug.up_packets.saturating_add(1);
-                    }
+                    session.record_debug_up(payload.len() as u64, self.debug_enabled);
                 }
             }
             ProtocolCommand::UpdateEpoch {
@@ -2189,17 +3097,15 @@ impl DataplaneLogic for ProtocolEngine {
                     EpochValue {
                         generation_id,
                         session_salt,
+                        last_seen_ms: self.monotonic_ms,
                     },
                 );
+                self.publish_epoch_state();
             }
             ProtocolCommand::DisconnectDevice {
                 device_id,
                 requester_session_id,
             } => {
-                // ACK and removal are one dataplane transaction. This avoids
-                // acknowledging a disconnect when a later per-session drop
-                // could not be queued, which was the remaining way to create
-                // immortal ghost sessions under backpressure.
                 if let Some(slot) = self.by_id.get(&requester_session_id).copied() {
                     let payload = b"OK:disconnected";
                     let record_dpi = should_record_dpi(
@@ -2238,9 +3144,6 @@ impl DataplaneLogic for ProtocolEngine {
                     self.remove_slot_with_reason(slot, "device-disconnect");
                 }
             }
-            ProtocolCommand::RemoveAuthoritativeEpoch { device_id } => {
-                self.epochs.remove(&device_id);
-            }
             ProtocolCommand::ReplaceCredentials(credentials) => {
                 self.stale_slots.clear();
                 for (slot, session) in self.sessions.iter() {
@@ -2255,7 +3158,7 @@ impl DataplaneLogic for ProtocolEngine {
             }
             ProtocolCommand::DropSession { session_id } => {
                 if let Some(slot) = self.by_id.get(&session_id).copied() {
-                    self.remove_slot_with_reason(slot, "janitor-or-command");
+                    self.remove_slot_with_reason(slot, "requested-session-drop");
                 }
             }
             ProtocolCommand::DropPassword { password } => {
@@ -2269,47 +3172,66 @@ impl DataplaneLogic for ProtocolEngine {
                     self.remove_slot_with_reason(slot, "credential-removed");
                 }
             }
+            ProtocolCommand::CompactMemory { completed } => {
+                self.compact_memory(true);
+                let _ = completed.send(crate::collect_allocator_thread_heap());
+            }
         }
     }
 
     fn on_tick(&mut self, _sink: &mut PacketSink<'_>) {
         self.monotonic_ms = self.started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64 + 1;
         self.wall_now = wall_clock();
-        self.debug_enabled = self.stream_debug_active.load(Ordering::Acquire);
-        self.dpi_enabled = DPI_BROADCAST.receiver_count() != 0;
-        self.syscalls_enabled = SYSCALLS_CLIENTS.load(Ordering::Acquire) != 0;
-        self.crypto_profiler.all.refresh_enabled();
-        self.crypto_profiler.enabled = self.crypto_profiler.all.enabled();
-        self.io_metrics_enabled = self.syscalls_enabled || self.crypto_profiler.all.enabled();
-        self.crypto_profiler.publish();
+        #[cfg(feature = "diagnostics")]
+        {
+            self.debug_enabled = self.stream_debug_active.load(Ordering::Acquire);
+            self.dpi_enabled = DPI_BROADCAST.receiver_count() != 0;
+            self.syscalls_enabled = SYSCALLS_CLIENTS.load(Ordering::Acquire) != 0;
+            self.crypto_profiler.all.refresh_enabled();
+            self.crypto_profiler.enabled = self.crypto_profiler.all.enabled();
+            self.io_metrics_enabled = self.syscalls_enabled || self.crypto_profiler.all.enabled();
+            self.crypto_profiler.publish();
+        }
+        #[cfg(not(feature = "diagnostics"))]
+        {
+            self.debug_enabled = false;
+            self.dpi_enabled = false;
+            self.syscalls_enabled = false;
+            self.io_metrics_enabled = false;
+        }
         self.setup_budget = SETUP_BUDGET_PER_TICK;
-        self.stale_slots.clear();
-        let global_up = &self.global_up;
-        let global_down = &self.global_down;
-        let monotonic_ms = self.monotonic_ms;
-        let wall_now = self.wall_now;
-        let debug_enabled = self.debug_enabled;
-        for (slot, session) in self.sessions.iter_mut() {
-            session.publish_counters(global_up, global_down, wall_now, debug_enabled);
-            let idle_ms = monotonic_ms.saturating_sub(session.last_inbound_ms);
-            if (session.registration_id.is_none() && idle_ms >= SESSION_SETUP_IDLE_MS)
-                || (session.registration_id.is_some() && idle_ms >= SESSION_AUTH_IDLE_MS)
-            {
-                self.stale_slots.push(slot);
+        if self
+            .monotonic_ms
+            .saturating_sub(self.last_session_maintenance_ms)
+            >= SESSION_MAINTENANCE_INTERVAL_MS
+        {
+            self.last_session_maintenance_ms = self.monotonic_ms;
+            self.stale_slots.clear();
+            let global_up = &self.global_up;
+            let global_down = &self.global_down;
+            let monotonic_ms = self.monotonic_ms;
+            let wall_now = self.wall_now;
+            let debug_enabled = self.debug_enabled;
+            for (slot, session) in self.sessions.iter_mut() {
+                session.publish_counters(global_up, global_down, wall_now, debug_enabled);
+                let idle_ms = monotonic_ms.saturating_sub(session.last_inbound_ms);
+                if (session.registration_id.is_none() && idle_ms >= SESSION_SETUP_IDLE_MS)
+                    || (session.registration_id.is_some() && idle_ms >= SESSION_AUTH_IDLE_MS)
+                {
+                    self.stale_slots.push(slot);
+                }
+            }
+            while let Some(slot) = self.stale_slots.pop() {
+                let reason = hot_session_idle_reason(
+                    self.sessions
+                        .get(slot)
+                        .is_some_and(|session| session.registration_id.is_some()),
+                );
+                self.remove_slot_with_reason(slot, reason);
             }
         }
-        while let Some(slot) = self.stale_slots.pop() {
-            let reason = if self
-                .sessions
-                .get(slot)
-                .is_some_and(|session| session.registration_id.is_some())
-            {
-                "authenticated-idle-8h"
-            } else {
-                "setup-idle-15s"
-            };
-            self.remove_slot_with_reason(slot, reason);
-        }
+        self.reconcile_streams(_sink);
+        self.sweep_idle_epochs();
         if self.memory_compact_pending
             && self
                 .monotonic_ms
@@ -2321,9 +3243,7 @@ impl DataplaneLogic for ProtocolEngine {
     }
 
     fn on_io_counters(&mut self, counters: IoCounters) {
-        if self.io_metrics_enabled
-            && let Ok(mut global) = GLOBAL_IO_COUNTERS.write()
-        {
+        if let Ok(mut global) = GLOBAL_IO_COUNTERS.write() {
             *global = counters;
         }
         let errors_changed = counters.udp_rx_errors != self.last_io_counters.udp_rx_errors
@@ -2332,8 +3252,9 @@ impl DataplaneLogic for ProtocolEngine {
             || counters.tun_tx_errors != self.last_io_counters.tun_tx_errors
             || counters.udp_tx_drops != self.last_io_counters.udp_tx_drops
             || counters.tun_tx_drops != self.last_io_counters.tun_tx_drops
-            || counters.cq_overflow != self.last_io_counters.cq_overflow
-            || counters.udp_rx_enobufs != self.last_io_counters.udp_rx_enobufs;
+            || counters.partial_sendmmsg != self.last_io_counters.partial_sendmmsg
+            || counters.udp_rx_enobufs != self.last_io_counters.udp_rx_enobufs
+            || counters.udp_tx_enobufs != self.last_io_counters.udp_tx_enobufs;
         if errors_changed {
             let _ = self.control_tx.try_send(ControlEvent::IoCounters(counters));
         }
@@ -2346,6 +3267,13 @@ fn wall_clock() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or(Duration::ZERO);
     duration.as_secs()
+}
+
+pub(crate) fn unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_millis() as u64
 }
 
 fn make_aes_key(key: &[u8; 32]) -> aes::Aes128 {
@@ -2531,6 +3459,18 @@ struct SendObservability {
     count_crypto: bool,
 }
 
+#[derive(Clone, Copy)]
+struct SendMode {
+    class: crate::striped_scheduler::PacketClass,
+    observability: SendObservability,
+}
+
+enum DownlinkSend {
+    Sent,
+    Stale,
+    Backpressured,
+}
+
 fn send_plain(
     session: &mut HotSession,
     plain: &[u8],
@@ -2540,15 +3480,30 @@ fn send_plain(
     batch_now: Instant,
     observability: SendObservability,
 ) -> bool {
-    send_legacy_plain(
+    send_plain_mode(
         session,
         plain,
         rng,
         sink,
         profiler,
         batch_now,
-        observability,
+        SendMode {
+            class: crate::striped_scheduler::PacketClass::Bulk,
+            observability,
+        },
     )
+}
+
+fn send_plain_mode(
+    session: &mut HotSession,
+    plain: &[u8],
+    rng: &mut StdRng,
+    sink: &mut PacketSink<'_>,
+    profiler: &mut CryptoProfiler,
+    batch_now: Instant,
+    mode: SendMode,
+) -> bool {
+    send_legacy_plain(session, plain, rng, sink, profiler, batch_now, mode)
 }
 
 fn send_legacy_plain(
@@ -2558,10 +3513,13 @@ fn send_legacy_plain(
     sink: &mut PacketSink<'_>,
     profiler: &mut CryptoProfiler,
     batch_now: Instant,
-    observability: SendObservability,
+    mode: SendMode,
 ) -> bool {
     let peer = session.peer;
-    let duplicate = selective_fec::should_duplicate(plain) && session.fec_budget.allow();
+    let local_ip = session.local_ip;
+    let duplicate = session.fec_profile == FecProfile::Safe
+        && selective_fec::should_duplicate(plain)
+        && session.fec_budget.allow();
     let mut wire_len = 0usize;
     let kind = if session.is_srtp {
         CryptoKind::Srtp
@@ -2569,27 +3527,34 @@ fn send_legacy_plain(
         CryptoKind::Chacha
     };
     let queue_started = profiler.all.begin(PerfStage::UdpQueue, plain.len());
-    let sent = sink.send_udp_with_duplicate(peer, duplicate, |output| {
-        let started = profiler.begin(kind, CryptoDirection::Wrap, plain.len());
-        let wrapped = match wrap_legacy_into(
-            session,
-            plain,
-            rng,
-            output,
-            batch_now,
-            observability.count_crypto,
-        ) {
-            Ok(length) => {
-                wire_len = length;
-                true
-            }
-            Err(_) => false,
-        };
-        profiler.finish(kind, CryptoDirection::Wrap, started);
-        wrapped
-    });
+    let sent =
+        sink.send_udp_with_duplicate_priority(peer, local_ip, duplicate, mode.class, |output| {
+            let started = profiler.begin(kind, CryptoDirection::Wrap, plain.len());
+            let wrapped = match wrap_legacy_into(
+                session,
+                plain,
+                rng,
+                output,
+                batch_now,
+                mode.observability.count_crypto,
+            ) {
+                Ok(length) => {
+                    wire_len = length;
+                    true
+                }
+                Err(_) => false,
+            };
+            profiler.finish(kind, CryptoDirection::Wrap, started);
+            wrapped
+        });
     profiler.all.finish(PerfStage::UdpQueue, queue_started);
-    if sent && observability.record_dpi {
+    if sent
+        && (mode.class == crate::striped_scheduler::PacketClass::Latency
+            || should_flush_udp_immediately(plain))
+    {
+        sink.request_udp_flush();
+    }
+    if sent && mode.observability.record_dpi {
         record_packet_dpi(
             "OUTBOUND",
             "TUN-Server",
@@ -2615,7 +3580,7 @@ fn wrap_legacy_into(
     session: &mut HotSession,
     plain: &[u8],
     rng: &mut StdRng,
-    output: &mut PacketBuffer,
+    output: &mut PacketBuf,
     batch_now: Instant,
     count_crypto: bool,
 ) -> Result<usize> {
@@ -2720,6 +3685,24 @@ fn wrap_legacy_into(
     Ok(total)
 }
 
+fn stream_control_payload(
+    prefix: &[u8],
+    sequence: u64,
+    desired_count: u16,
+    worker_ids: &[u16],
+) -> Vec<u8> {
+    let count = worker_ids.len().min(u8::MAX as usize);
+    let mut payload = Vec::with_capacity(prefix.len() + 11 + count * 2);
+    payload.extend_from_slice(prefix);
+    payload.extend_from_slice(&sequence.to_be_bytes());
+    payload.extend_from_slice(&desired_count.to_be_bytes());
+    payload.push(count as u8);
+    for worker_id in worker_ids.iter().take(count) {
+        payload.extend_from_slice(&worker_id.to_be_bytes());
+    }
+    payload
+}
+
 fn parse_generation_id(value: &str) -> Option<u64> {
     if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
         return None;
@@ -2742,48 +3725,30 @@ fn parse_getconf_epoch(payload: &[u8]) -> Option<(&str, u64, &str)> {
     Some((device_id, generation_id, session_salt))
 }
 
-fn is_smart_ping(payload: &[u8]) -> bool {
-    payload.len() >= 25
-        && payload[0] == 0xff
-        && payload[1..25].iter().any(|byte| *byte != 0xff)
-        && (payload[25..].iter().all(|byte| *byte == 0xff)
-            || parse_path_probe_v2(payload).is_some())
-}
-
-fn parse_path_probe_v2(payload: &[u8]) -> Option<(u16, u64)> {
-    if payload.len() < 39
-        || &payload[25..29] != PATH_PROBE_V2_MAGIC
-        || !payload[39..].iter().all(|byte| *byte == 0xff)
-    {
-        return None;
-    }
-    let worker = u16::from_be_bytes(payload[29..31].try_into().ok()?);
-    let sequence = u64::from_be_bytes(payload[31..39].try_into().ok()?);
-    (worker != 0 && worker <= 162 && sequence != 0).then_some((worker, sequence))
-}
-
-fn smart_ping_ack(payload: &[u8]) -> ([u8; 32], usize) {
-    let mut ack = [0u8; 32];
-    if let Some((worker, sequence)) = parse_path_probe_v2(payload) {
-        let len = PATH_RECEIPT_ACK.len() + 10;
-        ack[..PATH_RECEIPT_ACK.len()].copy_from_slice(PATH_RECEIPT_ACK);
-        ack[PATH_RECEIPT_ACK.len()..PATH_RECEIPT_ACK.len() + 2]
-            .copy_from_slice(&worker.to_be_bytes());
-        ack[PATH_RECEIPT_ACK.len() + 2..len].copy_from_slice(&sequence.to_be_bytes());
-        (ack, len)
-    } else {
-        ack[0] = 0xff;
-        (ack, 1)
-    }
-}
-
 fn is_control_payload(payload: &[u8]) -> bool {
     payload.starts_with(b"GETCONF:")
         || payload.starts_with(b"DISCONNECT:")
         || payload == b"READY"
-        || payload == PATH_LEASE
-        || is_smart_ping(payload)
-        || (!payload.is_empty() && payload.iter().all(|byte| *byte == 0xff))
+        || payload.first().is_some_and(|byte| *byte == 0xff)
+}
+
+#[inline(always)]
+fn is_idle_keepalive(payload: &[u8]) -> bool {
+    (!payload.is_empty() && payload.iter().all(|byte| *byte == 0xff))
+        || ((4..=9).contains(&payload.len()) && payload.first() == Some(&0xff))
+}
+
+#[inline(always)]
+fn should_flush_udp_immediately(payload: &[u8]) -> bool {
+    payload.starts_with(b"GETCONF:")
+        || payload.starts_with(b"TUNCONF:")
+        || payload.starts_with(b"DENIED:")
+        || payload.starts_with(b"DISCONNECT:")
+        || payload.starts_with(STREAM_REPAIR_PREFIX)
+        || payload.starts_with(STREAM_ALIVE_PREFIX)
+        || payload == b"READY"
+        || payload == b"READY_OK"
+        || payload == PANEL_RESTART_NOTICE
 }
 
 fn session_is_retired_by_epoch(
@@ -2862,24 +3827,28 @@ fn getconf_reconnect_action_hot(
 
 async fn control_loop(app: Arc<App>, mut receiver: mpsc::Receiver<ControlEvent>) {
     let mut last_io = IoCounters::default();
+    let jobs = Arc::new(Semaphore::new(CONTROL_TASK_CAPACITY));
     while let Some(event) = receiver.recv().await {
         match event {
             ControlEvent::SessionCreated(session) => {
-                if let Some((_, old)) = app.sessions.remove(&session.address) {
+                prune_public_sessions(&app, now().max(0) as u64);
+                if let Some((_, old)) = app.sessions.remove(&session.id) {
                     old.cancel_token.cancel();
                 }
-                app.total_connections.fetch_add(1, Ordering::Relaxed);
-                log_event(
-                    &app,
-                    "INFO",
-                    "SESSION",
-                    &format!(
-                        "Created {} session for {}",
-                        if session.is_srtp { "SRTP" } else { "RTP" },
-                        session.address
-                    ),
-                );
-                app.sessions.insert(session.address, session);
+                if app.sessions.len() < PUBLIC_SESSION_LIMIT {
+                    app.total_connections.fetch_add(1, Ordering::Relaxed);
+                    log_event(
+                        &app,
+                        "INFO",
+                        "SESSION",
+                        &format!(
+                            "Created {} session for {}",
+                            if session.is_srtp { "SRTP" } else { "RTP" },
+                            session.address
+                        ),
+                    );
+                    app.sessions.insert(session.id, session);
+                }
             }
             ControlEvent::SessionClosed {
                 address,
@@ -2888,7 +3857,7 @@ async fn control_loop(app: Arc<App>, mut receiver: mpsc::Receiver<ControlEvent>)
             } => {
                 if let Some((_, session)) = app
                     .sessions
-                    .remove_if(&address, |_, current| current.id == session_id)
+                    .remove_if(&session_id, |_, current| current.id == session_id)
                 {
                     session.cancel_token.cancel();
                     log_event(
@@ -2904,47 +3873,46 @@ async fn control_loop(app: Arc<App>, mut receiver: mpsc::Receiver<ControlEvent>)
                 session_id,
                 payload,
             } => {
-                let session = app.sessions.get(&address).and_then(|entry| {
-                    (entry.value().id == session_id).then(|| entry.value().clone())
+                let Ok(permit) = jobs.clone().acquire_owned().await else {
+                    return;
+                };
+                let app = app.clone();
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    process_control_payload_event(app, address, session_id, payload).await;
                 });
-                if let Some(session) = session
-                    && let Err(error) = process_control_payload(&app, &session, &payload).await
-                {
-                    log_event(
-                        &app,
-                        "WARN",
-                        "SESSION",
-                        &format!("{address}: control payload rejected: {error}"),
-                    );
-                }
             }
             ControlEvent::IngressBeforeTunnel {
                 address,
                 session_id,
                 payload,
             } => {
-                let session = app.sessions.get(&address).and_then(|entry| {
-                    (entry.value().id == session_id).then(|| entry.value().clone())
+                let Ok(permit) = jobs.clone().acquire_owned().await else {
+                    return;
+                };
+                let app = app.clone();
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    process_ingress_before_tunnel_event(app, address, session_id, payload).await;
                 });
-                if let Some(session) = session {
-                    if let Err(error) = ensure_control_tunnel(&app, &session).await {
-                        log_event(
-                            &app,
-                            "WARN",
-                            "TUN",
-                            &format!("{address}: tunnel setup failed: {error}"),
-                        );
-                        drop_exact_session(&app, &session);
-                    } else {
-                        let _ = command(
-                            &app,
-                            ProtocolCommand::InjectTun {
-                                session_id,
-                                payload,
-                            },
-                        );
-                    }
-                }
+            }
+            ControlEvent::StreamRepair {
+                device_id,
+                generation_id,
+                desired_count,
+                sequence,
+                missing,
+                selected_carriers,
+                sent_carriers,
+            } => {
+                log_event(
+                    &app,
+                    "WARN",
+                    "STREAM",
+                    &format!(
+                        "Repair requested: device={device_id} gen={generation_id} missing={missing:?}/{desired_count} sequence={sequence} carriers={sent_carriers}/{selected_carriers}",
+                    ),
+                );
             }
             ControlEvent::IoCounters(counters) => {
                 let delta_errors = counters
@@ -2959,7 +3927,7 @@ async fn control_loop(app: Arc<App>, mut receiver: mpsc::Receiver<ControlEvent>)
                     log_event(
                         &app,
                         "WARN",
-                        "URING",
+                        "DATAPLANE",
                         &format!(
                             "I/O errors +{delta_errors}, UDP TX drops +{delta_udp_drops}, TUN TX drops +{delta_tun_drops}; udp_rx={}, udp_tx={}, tun_rx={}, tun_tx={}",
                             counters.udp_rx_packets,
@@ -2971,6 +3939,59 @@ async fn control_loop(app: Arc<App>, mut receiver: mpsc::Receiver<ControlEvent>)
                 }
                 last_io = counters;
             }
+        }
+    }
+}
+
+async fn process_control_payload_event(
+    app: Arc<App>,
+    address: SocketAddr,
+    session_id: u64,
+    payload: Vec<u8>,
+) {
+    let session = app
+        .sessions
+        .get(&session_id)
+        .and_then(|entry| (entry.value().id == session_id).then(|| entry.value().clone()));
+    if let Some(session) = session
+        && let Err(error) = process_control_payload(&app, &session, &payload).await
+    {
+        log_event(
+            &app,
+            "WARN",
+            "SESSION",
+            &format!("{address}: control payload rejected: {error}"),
+        );
+    }
+}
+
+async fn process_ingress_before_tunnel_event(
+    app: Arc<App>,
+    address: SocketAddr,
+    session_id: u64,
+    payload: Vec<u8>,
+) {
+    let session = app
+        .sessions
+        .get(&session_id)
+        .and_then(|entry| (entry.value().id == session_id).then(|| entry.value().clone()));
+    if let Some(session) = session {
+        if let Err(error) = ensure_control_tunnel(&app, &session).await {
+            log_event(
+                &app,
+                "WARN",
+                "TUN",
+                &format!("{address}: tunnel setup failed: {error}"),
+            );
+            drop_exact_session(&app, &session);
+        } else {
+            let _ = command(
+                &app,
+                ProtocolCommand::InjectTun {
+                    session_id,
+                    payload,
+                },
+            );
         }
     }
 }
@@ -3012,15 +4033,10 @@ async fn process_control_payload(
         let device_id = parts.next().unwrap_or("").trim();
         let salt = parts.next().unwrap_or("").trim();
         match handle_disconnect(app, session, device_id, salt).await {
-            // The successful path is acknowledged and removed atomically by
-            // DisconnectDevice inside the dataplane.
             Ok(_) => {}
             Err(response) => writer.write(response.as_bytes()).await?,
         }
         return Ok(());
-    }
-    if is_smart_ping(payload) {
-        return handle_smart_ping(app, &writer, session, payload).await;
     }
     Ok(())
 }
@@ -3094,34 +4110,6 @@ fn device_control_authorized(db: &Database, password: &str, device_id: &str) -> 
             .is_some_and(|device| device.bound_password == password)
 }
 
-fn smart_ping_decision(
-    db: &Database,
-    password: &str,
-    identity: &SessionEpochIdentity,
-    device_id: &str,
-    generation_id: u64,
-    epoch: &DeviceEpochState,
-) -> SmartPingDecision {
-    if !device_control_authorized(db, password, device_id) || epoch.session_salt.is_empty() {
-        return SmartPingDecision::Reject;
-    }
-    if identity.device_id.is_empty() {
-        return if epoch.generation_id == generation_id {
-            SmartPingDecision::Bind
-        } else {
-            SmartPingDecision::Reject
-        };
-    }
-    if identity.device_id == device_id
-        && identity.generation_id == generation_id
-        && epoch.matches(generation_id, &identity.session_salt)
-    {
-        SmartPingDecision::Current
-    } else {
-        SmartPingDecision::Reject
-    }
-}
-
 fn session_epoch_identity(session: &Session) -> SessionEpochIdentity {
     SessionEpochIdentity {
         device_id: lock_unpoison(&session.device_id).clone(),
@@ -3138,36 +4126,52 @@ fn set_public_epoch(session: &Session, device_id: &str, generation_id: u64, sess
     *lock_unpoison(&session.session_salt) = session_salt.to_owned();
 }
 
-fn current_device_epoch(
-    app: &Arc<App>,
-    device_id: &str,
-    lock: &Arc<Mutex<DeviceEpochState>>,
-) -> bool {
+fn current_device_epoch(app: &Arc<App>, device_id: &str, slot: &Arc<DeviceEpochSlot>) -> bool {
     app.device_epochs
         .get(device_id)
-        .is_some_and(|entry| Arc::ptr_eq(entry.value(), lock))
+        .is_some_and(|entry| Arc::ptr_eq(entry.value(), slot))
+}
+
+async fn fresh_device_epoch_slot(app: &Arc<App>, device_id: &str) -> DeviceEpochSlot {
+    let state = match db_read(app).await {
+        Ok(db) => db
+            .devices
+            .get(device_id)
+            .map(|device| {
+                DeviceEpochState::new(device.last_generation_id, device.last_session_salt.clone())
+            })
+            .unwrap_or_default(),
+        Err(_) => DeviceEpochState::default(),
+    };
+    DeviceEpochSlot::new(state, unix_time_ms())
 }
 
 async fn lock_device_epoch(
     app: &Arc<App>,
     device_id: &str,
 ) -> (
-    Arc<Mutex<DeviceEpochState>>,
+    Arc<DeviceEpochSlot>,
     OwnedMutexGuard<DeviceEpochState>,
     bool,
 ) {
     loop {
-        let (lock, created) = match app.device_epochs.entry(device_id.to_owned()) {
-            dashmap::mapref::entry::Entry::Occupied(entry) => (entry.get().clone(), false),
-            dashmap::mapref::entry::Entry::Vacant(entry) => {
-                let lock = Arc::new(Mutex::new(DeviceEpochState::default()));
-                entry.insert(lock.clone());
-                (lock, true)
-            }
-        };
-        let guard = lock.clone().lock_owned().await;
-        if current_device_epoch(app, device_id, &lock) {
-            return (lock, guard, created);
+        let (slot, created) =
+            if let Some(existing) = app.device_epochs.get(device_id).map(|e| e.value().clone()) {
+                (existing, false)
+            } else {
+                let fresh = Arc::new(fresh_device_epoch_slot(app, device_id).await);
+                match app.device_epochs.entry(device_id.to_owned()) {
+                    dashmap::mapref::entry::Entry::Occupied(entry) => (entry.get().clone(), false),
+                    dashmap::mapref::entry::Entry::Vacant(entry) => {
+                        entry.insert(fresh.clone());
+                        (fresh, true)
+                    }
+                }
+            };
+        let guard = slot.epoch.clone().lock_owned().await;
+        slot.last_used_ms.store(unix_time_ms(), Ordering::Relaxed);
+        if current_device_epoch(app, device_id, &slot) {
+            return (slot, guard, created);
         }
     }
 }
@@ -3175,18 +4179,16 @@ async fn lock_device_epoch(
 async fn lock_existing_device_epoch(
     app: &Arc<App>,
     device_id: &str,
-) -> Option<(
-    Arc<Mutex<DeviceEpochState>>,
-    OwnedMutexGuard<DeviceEpochState>,
-)> {
+) -> Option<(Arc<DeviceEpochSlot>, OwnedMutexGuard<DeviceEpochState>)> {
     loop {
-        let lock = app
+        let slot = app
             .device_epochs
             .get(device_id)
             .map(|entry| entry.value().clone())?;
-        let guard = lock.clone().lock_owned().await;
-        if current_device_epoch(app, device_id, &lock) {
-            return Some((lock, guard));
+        let guard = slot.epoch.clone().lock_owned().await;
+        slot.last_used_ms.store(unix_time_ms(), Ordering::Relaxed);
+        if current_device_epoch(app, device_id, &slot) {
+            return Some((slot, guard));
         }
     }
 }
@@ -3213,10 +4215,52 @@ fn drop_exact_session(app: &Arc<App>, session: &Arc<Session>) {
     );
     if let Some((_, removed)) = app
         .sessions
-        .remove_if(&session.address, |_, current| current.id == session.id)
+        .remove_if(&session.id, |_, current| current.id == session.id)
     {
         removed.cancel_token.cancel();
     }
+}
+
+fn getconf_log_status(response: &str) -> &str {
+    if response.starts_with("TUNCONF:") {
+        "TUNCONF"
+    } else {
+        response
+    }
+}
+
+fn log_getconf_result(
+    app: &Arc<App>,
+    session: &Arc<Session>,
+    device_id: &str,
+    generation_id: Option<u64>,
+    worker_id: Option<u16>,
+    desired_count: Option<u16>,
+    response: &str,
+) {
+    let generation = generation_id
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "?".to_owned());
+    let worker = worker_id
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "?".to_owned());
+    let desired = desired_count
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "?".to_owned());
+    log_event(
+        app,
+        "INFO",
+        "GETCONF",
+        &format!(
+            "GETCONF {} device={} gen={} worker={}/{} -> {}",
+            session.address,
+            device_id,
+            generation,
+            worker,
+            desired,
+            getconf_log_status(response)
+        ),
+    );
 }
 
 pub fn purge_stale_device_sessions(
@@ -3238,14 +4282,14 @@ pub fn purge_stale_device_sessions(
             (identity.device_id == device_id
                 && (identity.generation_id != generation_id
                     || identity.session_salt != session_salt))
-                .then_some((*entry.key(), session.id))
+                .then_some((session.id, session.address))
         })
         .collect::<Vec<_>>();
-    for (address, session_id) in candidates {
+    for (session_id, address) in candidates {
         let _ = command(app, ProtocolCommand::DropSession { session_id });
         if let Some((_, removed)) = app
             .sessions
-            .remove_if(&address, |_, current| current.id == session_id)
+            .remove_if(&session_id, |_, current| current.id == session_id)
         {
             removed.cancel_token.cancel();
             log_event(
@@ -3280,14 +4324,14 @@ fn purge_replaced_worker_sessions(
             (identity.device_id == device_id
                 && identity.generation_id == generation_id
                 && identity.session_salt == session_salt)
-                .then_some((*entry.key(), session.id))
+                .then_some(session.id)
         })
         .collect::<Vec<_>>();
-    for (address, session_id) in candidates {
+    for session_id in candidates {
         let _ = command(app, ProtocolCommand::DropSession { session_id });
         if let Some((_, removed)) = app
             .sessions
-            .remove_if(&address, |_, current| current.id == session_id)
+            .remove_if(&session_id, |_, current| current.id == session_id)
         {
             removed.cancel_token.cancel();
         }
@@ -3301,42 +4345,137 @@ async fn handle_getconf(
     text: &str,
 ) -> Result<()> {
     let content = text.strip_prefix("GETCONF:").unwrap_or_default().trim();
-    let mut parts = content.splitn(6, '|');
+    let mut parts = content.splitn(7, '|');
     let client_port = parts.next().unwrap_or("9000").trim();
     let device_id = parts.next().unwrap_or("unknown").trim();
     let password = parts.next().unwrap_or("").trim();
     let generation_text = parts.next().unwrap_or("").trim();
     let session_salt = parts.next().unwrap_or("").trim();
     let worker_text = parts.next().unwrap_or("").trim();
+    let desired_text = parts.next().unwrap_or("").trim();
     let Some(generation_id) = parse_generation_id(generation_text) else {
+        log_getconf_result(
+            app,
+            session,
+            device_id,
+            None,
+            None,
+            None,
+            "DENIED:invalid_epoch",
+        );
         writer.write(b"DENIED:invalid_epoch").await?;
         return Ok(());
     };
     if password != session.password {
+        log_getconf_result(
+            app,
+            session,
+            device_id,
+            Some(generation_id),
+            None,
+            None,
+            "DENIED:wrong_password",
+        );
         writer.write(b"DENIED:wrong_password").await?;
         return Ok(());
     }
     if device_id.is_empty() || device_id.len() > 128 {
+        log_getconf_result(
+            app,
+            session,
+            device_id,
+            Some(generation_id),
+            None,
+            None,
+            "DENIED:invalid_device",
+        );
         writer.write(b"DENIED:invalid_device").await?;
         return Ok(());
     }
     if client_port.parse::<u16>().is_err() {
+        log_getconf_result(
+            app,
+            session,
+            device_id,
+            Some(generation_id),
+            None,
+            None,
+            "DENIED:invalid_port",
+        );
         writer.write(b"DENIED:invalid_port").await?;
         return Ok(());
     }
     if session_salt.len() > 128 {
+        log_getconf_result(
+            app,
+            session,
+            device_id,
+            Some(generation_id),
+            None,
+            None,
+            "DENIED:invalid_epoch",
+        );
         writer.write(b"DENIED:invalid_epoch").await?;
         return Ok(());
     }
-    let Ok(worker_id @ 1..=162) = worker_text.parse::<u16>() else {
+    let Ok(worker_id @ 1..=MAX_STREAM_WORKERS_U16) = worker_text.parse::<u16>() else {
+        log_getconf_result(
+            app,
+            session,
+            device_id,
+            Some(generation_id),
+            None,
+            None,
+            "DENIED:invalid_worker",
+        );
         writer.write(b"DENIED:invalid_worker").await?;
         return Ok(());
     };
+    let desired_count = if desired_text.is_empty() {
+        0
+    } else {
+        let Ok(count @ 1..=MAX_STREAM_WORKERS_U16) = desired_text.parse::<u16>() else {
+            log_getconf_result(
+                app,
+                session,
+                device_id,
+                Some(generation_id),
+                Some(worker_id),
+                None,
+                "DENIED:invalid_worker_count",
+            );
+            writer.write(b"DENIED:invalid_worker_count").await?;
+            return Ok(());
+        };
+        if worker_id > count {
+            log_getconf_result(
+                app,
+                session,
+                device_id,
+                Some(generation_id),
+                Some(worker_id),
+                Some(count),
+                "DENIED:invalid_worker_count",
+            );
+            writer.write(b"DENIED:invalid_worker_count").await?;
+            return Ok(());
+        }
+        count
+    };
     let preliminary = {
-        let db = app.db.read().await;
+        let db = db_read(app).await?;
         getconf_credential_access(&db, password, device_id)
     };
     if let Err(response) = preliminary {
+        log_getconf_result(
+            app,
+            session,
+            device_id,
+            Some(generation_id),
+            Some(worker_id),
+            Some(desired_count),
+            response,
+        );
         writer.write(response.as_bytes()).await?;
         if rejected_session_is_request(session, device_id, generation_id, session_salt) {
             drop_exact_session(app, session);
@@ -3346,7 +4485,7 @@ async fn handle_getconf(
     let (epoch_lock, mut epoch, created_epoch) = lock_device_epoch(app, device_id).await;
     let dns = app.dns.read().await.clone();
     let (response, reject_session, authorization_rejected, tunnel_ip, changed) = {
-        let mut db = app.db.write().await;
+        let mut db = db_write(app).await?;
         let mut changed = false;
         let mut reject_session = false;
         let access = getconf_credential_access(&db, password, device_id);
@@ -3371,6 +4510,9 @@ async fn handle_getconf(
                     session
                         .worker_id
                         .store(u64::from(worker_id), Ordering::Release);
+                    session
+                        .desired_stream_count
+                        .store(u64::from(desired_count), Ordering::Release);
                     purge_stale_device_sessions(
                         app,
                         device_id,
@@ -3472,6 +4614,15 @@ async fn handle_getconf(
             },
         )?;
     }
+    log_getconf_result(
+        app,
+        session,
+        device_id,
+        Some(generation_id),
+        Some(worker_id),
+        Some(desired_count),
+        &response,
+    );
     writer.write(response.as_bytes()).await?;
     if !reject_session && let Some(ip) = tunnel_ip {
         *lock_unpoison(&session.tunnel_ip) = Some(ip);
@@ -3484,6 +4635,7 @@ async fn handle_getconf(
                 ip,
                 registration_id,
                 worker_id,
+                desired_count,
             },
         )?;
     }
@@ -3508,7 +4660,7 @@ async fn ensure_control_tunnel(app: &Arc<App>, session: &Arc<Session>) -> Result
     } else {
         let identity = session_epoch_identity(session);
         let ip = {
-            let db = app.db.read().await;
+            let db = db_read(app).await?;
             resolve_session_ip(&db, &session.password, &identity.device_id)
         }
         .ok_or_else(|| anyhow!("no device IP assigned for this session"))?;
@@ -3520,8 +4672,12 @@ async fn ensure_control_tunnel(app: &Arc<App>, session: &Arc<Session>) -> Result
     let registration_id = ROUTE_REGISTRATION_COUNTER.fetch_add(1, Ordering::Relaxed);
     let worker_id = u16::try_from(session.worker_id.load(Ordering::Acquire))
         .ok()
-        .filter(|worker| (1..=162).contains(worker))
+        .filter(|worker| (1..=MAX_STREAM_WORKERS_U16).contains(worker))
         .ok_or_else(|| anyhow!("session has no valid worker id"))?;
+    let desired_count = u16::try_from(session.desired_stream_count.load(Ordering::Acquire))
+        .ok()
+        .filter(|count| (1..=MAX_STREAM_WORKERS_U16).contains(count) && worker_id <= *count)
+        .unwrap_or_default();
     command(
         app,
         ProtocolCommand::ActivateTunnel {
@@ -3529,75 +4685,11 @@ async fn ensure_control_tunnel(app: &Arc<App>, session: &Arc<Session>) -> Result
             ip,
             registration_id,
             worker_id,
+            desired_count,
         },
     )?;
     session.has_tunnel.store(true, Ordering::Release);
     Ok(())
-}
-
-async fn handle_smart_ping(
-    app: &Arc<App>,
-    writer: &ControlWriter<'_>,
-    session: &Arc<Session>,
-    payload: &[u8],
-) -> Result<()> {
-    let device_id = String::from_utf8_lossy(&payload[1..17])
-        .trim_matches(char::from(0))
-        .to_string();
-    let mut generation_bytes = [0u8; 8];
-    generation_bytes.copy_from_slice(&payload[17..25]);
-    let generation_id = u64::from_be_bytes(generation_bytes);
-    let preliminary_authorized = if device_id.is_empty() {
-        false
-    } else {
-        let db = app.db.read().await;
-        device_control_authorized(&db, &session.password, &device_id)
-    };
-    let mut bind_salt = None;
-    let accepted = if preliminary_authorized {
-        if let Some((_epoch_lock, epoch)) = lock_existing_device_epoch(app, &device_id).await {
-            let db = app.db.read().await;
-            let identity = session_epoch_identity(session);
-            match smart_ping_decision(
-                &db,
-                &session.password,
-                &identity,
-                &device_id,
-                generation_id,
-                &epoch,
-            ) {
-                SmartPingDecision::Current => true,
-                SmartPingDecision::Bind => {
-                    bind_salt = Some(epoch.session_salt.clone());
-                    true
-                }
-                SmartPingDecision::Reject => false,
-            }
-        } else {
-            false
-        }
-    } else {
-        false
-    };
-    if !accepted {
-        drop_exact_session(app, session);
-        return Ok(());
-    }
-    if let Some(salt) = bind_salt {
-        set_public_epoch(session, &device_id, generation_id, &salt);
-        purge_stale_device_sessions(app, &device_id, generation_id, &salt, session.id);
-        let _ = command(
-            app,
-            ProtocolCommand::UpdateEpoch {
-                session_id: session.id,
-                device_id: device_id.clone(),
-                generation_id,
-                session_salt: salt,
-            },
-        );
-    }
-    let (ack, ack_len) = smart_ping_ack(payload);
-    writer.write(&ack[..ack_len]).await
 }
 
 fn disconnect_request_authorized(
@@ -3629,10 +4721,14 @@ pub async fn handle_disconnect(
     }
     let preliminary = session_epoch_identity(requester);
     let preliminary_authorized = {
-        let db = app.db.read().await;
-        device_control_authorized(&db, &requester.password, device_id)
-            && preliminary.device_id == device_id
-            && preliminary.session_salt == target_salt
+        match db_read(app).await {
+            Ok(db) => {
+                device_control_authorized(&db, &requester.password, device_id)
+                    && preliminary.device_id == device_id
+                    && preliminary.session_salt == target_salt
+            }
+            Err(_) => false,
+        }
     };
     if !preliminary_authorized {
         return Err("DENIED:not_owner");
@@ -3640,7 +4736,7 @@ pub async fn handle_disconnect(
     let Some((_epoch_lock, epoch)) = lock_existing_device_epoch(app, device_id).await else {
         return Err("DENIED:not_owner");
     };
-    let db = app.db.read().await;
+    let db = db_read(app).await.map_err(|_| "DENIED:server_busy")?;
     let requester_identity = session_epoch_identity(requester);
     if !disconnect_request_authorized(
         &db,
@@ -3659,7 +4755,7 @@ pub async fn handle_disconnect(
         .filter_map(|entry| {
             let session = entry.value();
             (session.id == requester.id || session_epoch_identity(session).device_id == device_id)
-                .then_some((*entry.key(), session.id))
+                .then_some(session.id)
         })
         .collect::<Vec<_>>();
     command(
@@ -3671,8 +4767,8 @@ pub async fn handle_disconnect(
     )
     .map_err(|_| "DENIED:server_busy")?;
     let mut removed = 0usize;
-    for (address, session_id) in candidates {
-        if let Some((_, session)) = app.sessions.remove_if(&address, |_, current| {
+    for session_id in candidates {
+        if let Some((_, session)) = app.sessions.remove_if(&session_id, |_, current| {
             current.id == session_id
                 && (current.id == requester.id
                     || session_epoch_identity(current).device_id == device_id)
@@ -3686,8 +4782,10 @@ pub async fn handle_disconnect(
 
 #[inline(always)]
 pub async fn flush_traffic(app: &Arc<App>) {
-    let mut db = app.db.write().await;
-    let mut changed = false;
+    let Ok(mut db) = db_write(app).await else {
+        return;
+    };
+    let mut traffic = TrafficSnapshot::default();
     for entry in app.sessions.iter() {
         let session = entry.value();
         let up = session.up_bytes.swap(0, Ordering::Relaxed);
@@ -3695,30 +4793,53 @@ pub async fn flush_traffic(app: &Arc<App>) {
         if up == 0 && down == 0 {
             continue;
         }
-        changed = true;
         if let Some(password) = db.passwords.get_mut(&session.password) {
             password.up_bytes = password.up_bytes.saturating_add(up as i64);
             password.down_bytes = password.down_bytes.saturating_add(down as i64);
+            traffic.passwords.insert(
+                session.password.clone(),
+                TrafficCounters {
+                    up_bytes: password.up_bytes,
+                    down_bytes: password.down_bytes,
+                },
+            );
             let device_id = password.device_id.clone();
             if let Some(device) = db.devices.get_mut(&device_id) {
                 device.up_bytes = device.up_bytes.saturating_add(up as i64);
                 device.down_bytes = device.down_bytes.saturating_add(down as i64);
+                traffic.devices.insert(
+                    device_id,
+                    TrafficCounters {
+                        up_bytes: device.up_bytes,
+                        down_bytes: device.down_bytes,
+                    },
+                );
             }
         } else if session.password == db.main_password {
             db.main_up_bytes = db.main_up_bytes.saturating_add(up as i64);
             db.main_down_bytes = db.main_down_bytes.saturating_add(down as i64);
+            traffic.main = Some(TrafficCounters {
+                up_bytes: db.main_up_bytes,
+                down_bytes: db.main_down_bytes,
+            });
             let device_id = lock_unpoison(&session.device_id).clone();
             if !device_id.is_empty()
                 && let Some(device) = db.devices.get_mut(&device_id)
             {
                 device.up_bytes = device.up_bytes.saturating_add(up as i64);
                 device.down_bytes = device.down_bytes.saturating_add(down as i64);
+                traffic.devices.insert(
+                    device_id,
+                    TrafficCounters {
+                        up_bytes: device.up_bytes,
+                        down_bytes: device.down_bytes,
+                    },
+                );
             }
         }
     }
-    if changed {
-        app.db_persistence.submit(db.clone());
-    }
+    drop(db);
+    app.db_persistence.submit_traffic(traffic);
 }
 
 pub(crate) fn refresh_monotonic_millis() -> u64 {
@@ -3733,146 +4854,119 @@ pub(crate) fn refresh_monotonic_millis() -> u64 {
     current
 }
 
+#[inline]
+fn hot_session_idle_reason(is_authenticated: bool) -> &'static str {
+    if is_authenticated {
+        "authenticated-idle-10h"
+    } else {
+        "setup-idle-15s"
+    }
+}
+
+#[inline]
+fn public_session_is_stale(has_tunnel: bool, last_seen: u64, current_wall: u64) -> bool {
+    let idle_limit = if has_tunnel {
+        PUBLIC_AUTH_GHOST_IDLE_SECS
+    } else {
+        PUBLIC_SETUP_GHOST_IDLE_SECS
+    };
+    current_wall.saturating_sub(last_seen) >= idle_limit
+}
+
 pub async fn session_janitor(app: Arc<App>) {
     let mut timer = tokio::time::interval(Duration::from_secs(5));
+    timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last_traffic_flush = Instant::now() - TRAFFIC_FLUSH_INTERVAL;
     loop {
         timer.tick().await;
-        flush_traffic(&app).await;
-        let current = now();
-        let current_wall = wall_clock();
-        // SessionClosed is intentionally emitted with try_send from the
-        // io_uring thread. Under a control-plane burst that notification may
-        // be dropped even though the hot session is already gone. Reconcile
-        // the public table from its last dataplane heartbeat so a panel-only
-        // ghost cannot survive until a server restart.
-        let stale_public = app
-            .sessions
-            .iter()
-            .filter_map(|entry| {
-                let session = entry.value();
-                let idle_limit = if session.has_tunnel.load(Ordering::Acquire) {
-                    PUBLIC_AUTH_GHOST_IDLE_SECS
-                } else {
-                    PUBLIC_SETUP_GHOST_IDLE_SECS
-                };
-                (current_wall.saturating_sub(session.last_seen.load(Ordering::Acquire))
-                    >= idle_limit)
-                    .then_some((*entry.key(), session.id))
-            })
-            .collect::<Vec<_>>();
-        for (address, session_id) in stale_public {
-            let _ = command(&app, ProtocolCommand::DropSession { session_id });
-            if let Some((_, removed)) = app
-                .sessions
-                .remove_if(&address, |_, session| session.id == session_id)
-            {
-                removed.cancel_token.cancel();
-            }
+        if last_traffic_flush.elapsed() >= TRAFFIC_FLUSH_INTERVAL {
+            flush_traffic(&app).await;
+            last_traffic_flush = Instant::now();
         }
+        let current_wall = wall_clock();
+        prune_public_sessions(&app, current_wall);
         if app.sessions.len().saturating_mul(4) < app.sessions.capacity() {
             app.sessions.shrink_to_fit();
-        }
-        let expired_web = app
-            .web_sessions
-            .iter()
-            .filter(|entry| *entry.value() <= current)
-            .map(|entry| entry.key().clone())
-            .collect::<Vec<_>>();
-        for key in expired_web {
-            app.web_sessions.remove(&key);
-        }
-        if app.web_sessions.len().saturating_mul(4) < app.web_sessions.capacity() {
-            app.web_sessions.shrink_to_fit();
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ExpiredPasswordCandidate {
-    password: String,
-    device_id: String,
-    generation_id: u64,
-    session_salt: String,
-}
-
-fn expired_password_candidates(db: &Database) -> Vec<ExpiredPasswordCandidate> {
-    db.passwords
+fn prune_public_sessions(app: &Arc<App>, current_wall: u64) {
+    let stale_public = app
+        .sessions
         .iter()
-        .filter(|(_, entry)| is_expired(entry))
-        .map(|(password, entry)| {
-            let device = db.devices.get(&entry.device_id);
-            ExpiredPasswordCandidate {
-                password: password.clone(),
-                device_id: entry.device_id.clone(),
-                generation_id: device.map_or(0, |device| device.last_generation_id),
-                session_salt: device
-                    .map_or_else(String::new, |device| device.last_session_salt.clone()),
-            }
+        .filter_map(|entry| {
+            let session = entry.value();
+            public_session_is_stale(
+                session.has_tunnel.load(Ordering::Acquire),
+                session.last_seen.load(Ordering::Acquire),
+                current_wall,
+            )
+            .then_some(session.id)
         })
-        .collect()
-}
-
-fn expired_device_matches(
-    device: &ClientDevice,
-    candidate: &ExpiredPasswordCandidate,
-    epoch: Option<&DeviceEpochState>,
-) -> bool {
-    device.device_id == candidate.device_id
-        && device.bound_password == candidate.password
-        && device.last_generation_id == candidate.generation_id
-        && device.last_session_salt == candidate.session_salt
-        && epoch.is_none_or(|epoch| epoch.matches(candidate.generation_id, &candidate.session_salt))
+        .collect::<Vec<_>>();
+    for session_id in stale_public {
+        let _ = command(app, ProtocolCommand::DropSession { session_id });
+        if let Some((_, removed)) = app
+            .sessions
+            .remove_if(&session_id, |_, session| session.id == session_id)
+        {
+            removed.cancel_token.cancel();
+        }
+    }
+    let overflow = app.sessions.len().saturating_sub(PUBLIC_SESSION_LIMIT);
+    if overflow == 0 {
+        return;
+    }
+    let mut inactive = app
+        .sessions
+        .iter()
+        .filter(|entry| !entry.value().has_tunnel.load(Ordering::Acquire))
+        .map(|entry| {
+            (
+                entry.value().last_seen.load(Ordering::Acquire),
+                entry.value().id,
+            )
+        })
+        .collect::<Vec<_>>();
+    inactive.sort_unstable();
+    for (_, session_id) in inactive.into_iter().take(overflow) {
+        if let Some((_, removed)) = app
+            .sessions
+            .remove_if(&session_id, |_, session| session.id == session_id)
+        {
+            removed.cancel_token.cancel();
+        }
+    }
 }
 
 async fn run_password_janitor_cycle(app: &Arc<App>) {
-    let candidates = {
-        let db = app.db.read().await;
-        expired_password_candidates(&db)
+    let expired = {
+        let Ok(db) = db_read(app).await else {
+            return;
+        };
+        db.passwords
+            .iter()
+            .filter(|(_, entry)| is_expired(entry))
+            .map(|(password, _)| password.clone())
+            .collect::<Vec<String>>()
     };
     let mut credentials_changed = false;
-    for candidate in candidates {
-        let locked_epoch = if candidate.device_id.is_empty() {
-            None
-        } else {
-            lock_existing_device_epoch(app, &candidate.device_id).await
-        };
-        let mut db = app.db.write().await;
-        let still_expired = db
-            .passwords
-            .get(&candidate.password)
-            .is_some_and(|entry| is_expired(entry) && entry.device_id == candidate.device_id);
-        if !still_expired {
-            continue;
+    for password in expired {
+        {
+            let Ok(mut db) = db_write(app).await else {
+                continue;
+            };
+            if !db.passwords.get(&password).is_some_and(is_expired) {
+                continue;
+            }
+            db.passwords.remove(&password);
+            db.clear_device_binding(&password);
+            app.db_persistence.submit(db.clone());
         }
-        let remove_device = !candidate.device_id.is_empty()
-            && db.devices.get(&candidate.device_id).is_some_and(|device| {
-                expired_device_matches(
-                    device,
-                    &candidate,
-                    locked_epoch.as_ref().map(|(_, epoch)| &**epoch),
-                )
-            });
-        db.passwords.remove(&candidate.password);
-        if remove_device {
-            db.devices.remove(&candidate.device_id);
-        }
-        app.db_persistence.submit(db.clone());
-        drop(db);
-        app.derived_keys.remove(&candidate.password);
-        drop_password_sessions(app, &candidate.password);
+        app.derived_keys.remove(&password);
+        drop_password_sessions(app, &password);
         credentials_changed = true;
-        if remove_device && let Some((epoch_lock, _epoch)) = locked_epoch {
-            app.device_epochs
-                .remove_if(&candidate.device_id, |_, current| {
-                    Arc::ptr_eq(current, &epoch_lock)
-                });
-            let _ = command(
-                app,
-                ProtocolCommand::RemoveAuthoritativeEpoch {
-                    device_id: candidate.device_id,
-                },
-            );
-        }
     }
     if credentials_changed {
         let _ = refresh_credentials(app).await;
@@ -3890,6 +4984,120 @@ pub async fn password_janitor(app: Arc<App>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_json_client_remains_authorized_after_runtime_epoch_reset() {
+        use crate::model::{ClientDevice, Database, PasswordEntry, load_database};
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("csqtt-legacy-getconf-{unique}"));
+        std::fs::create_dir_all(&directory).unwrap();
+
+        let mut legacy = Database::default();
+        legacy.passwords.insert(
+            "legacy-password".to_owned(),
+            PasswordEntry {
+                device_id: "legacy-device".to_owned(),
+                ..PasswordEntry::default()
+            },
+        );
+        legacy.devices.insert(
+            "legacy-device".to_owned(),
+            ClientDevice {
+                device_id: "legacy-device".to_owned(),
+                ip: "10.66.67.2".to_owned(),
+                bound_password: "legacy-password".to_owned(),
+                last_generation_id: 1_786_000_000_000,
+                last_session_salt: "retired-salt".to_owned(),
+                ..ClientDevice::default()
+            },
+        );
+        std::fs::write(
+            directory.join("passwords.json"),
+            serde_json::to_vec_pretty(&legacy).unwrap(),
+        )
+        .unwrap();
+
+        let migrated = load_database(&directory).unwrap();
+        assert_eq!(
+            getconf_credential_access(&migrated, "legacy-password", "legacy-device"),
+            Ok(CredentialAccess::Bound)
+        );
+        let device = &migrated.devices["legacy-device"];
+        assert_eq!(device.last_generation_id, 0);
+        assert!(device.last_session_salt.is_empty());
+
+        let mut epoch =
+            DeviceEpochState::new(device.last_generation_id, device.last_session_salt.clone());
+        assert_eq!(
+            epoch.admit(1_786_000_000, "fresh-session-salt"),
+            DeviceEpochDecision::Advanced
+        );
+        assert!(!directory.join("passwords.json").exists());
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test]
+    async fn diagnostic_request_reader_accepts_128_bytes_and_rejects_more() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut writer, mut reader) = tokio::io::duplex(512);
+        let expected = "x".repeat(DIAGNOSTIC_REQUEST_MAX_BYTES);
+        writer
+            .write_all(format!("{expected}\n").as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(
+            read_diagnostic_request(&mut reader).await.unwrap(),
+            Some(expected)
+        );
+
+        let (mut writer, mut reader) = tokio::io::duplex(512);
+        writer
+            .write_all("x".repeat(DIAGNOSTIC_REQUEST_MAX_BYTES + 1).as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(
+            read_diagnostic_request(&mut reader)
+                .await
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn public_auth_ghost_ttl_is_two_minutes_and_does_not_underflow() {
+        assert!(!public_session_is_stale(true, 1_000, 1_119));
+        assert!(public_session_is_stale(true, 1_000, 1_120));
+        assert!(!public_session_is_stale(true, 1_000, 999));
+        assert!(public_session_is_stale(false, 1_000, 1_030));
+    }
+
+    #[test]
+    fn hot_authenticated_idle_timeout_is_ten_hours() {
+        assert_eq!(SESSION_AUTH_IDLE_MS, 10 * 60 * 60 * 1_000);
+        assert_eq!(hot_session_idle_reason(true), "authenticated-idle-10h");
+        assert_eq!(hot_session_idle_reason(false), "setup-idle-15s");
+    }
+
+    #[test]
+    fn idle_keepalives_are_ignored_after_refreshing_session_activity() {
+        assert!(is_idle_keepalive(&[0xff; 16]));
+        assert!(is_idle_keepalive(&[0xff, 0x11, 0x22, 0x33]));
+        assert!(is_idle_keepalive(&[0xff, 1, 2, 3, 4, 5, 6, 7, 8]));
+        assert!(!is_idle_keepalive(&[]));
+        assert!(!is_idle_keepalive(&[0xff, 1, 2]));
+    }
+
+    #[test]
+    fn epoch_cache_is_swept_regularly_and_expires_after_one_hour() {
+        assert_eq!(EPOCH_SWEEP_INTERVAL_MS, 5 * 60_000);
+        assert_eq!(EPOCH_IDLE_TTL_MS, 60 * 60_000);
+    }
 
     #[test]
     fn rtp_clocks_follow_elapsed_media_time() {
@@ -3918,38 +5126,70 @@ mod tests {
             parse_getconf_epoch(max.as_bytes()),
             Some(("device", u64::MAX, "salt"))
         );
+        let max_with_count = format!("GETCONF:9000|device|password|{}|salt|4|36", u64::MAX);
+        assert_eq!(
+            parse_getconf_epoch(max_with_count.as_bytes()),
+            Some(("device", u64::MAX, "salt"))
+        );
         assert!(parse_getconf_epoch(b"GETCONF:9000|device|password|-1|salt").is_none());
         assert!(parse_getconf_epoch(b"GETCONF:9000|device|password|+1|salt").is_none());
         assert!(parse_getconf_epoch(b"GETCONF:9000||password|1|salt").is_none());
     }
 
     #[test]
-    fn smart_ping_accepts_legacy_and_sequence_probes() {
-        let mut packet = [0xff; 45];
-        packet[1..17].fill(0);
-        packet[1..7].copy_from_slice(b"device");
-        packet[17..25].copy_from_slice(&42u64.to_be_bytes());
-        assert!(is_smart_ping(&packet));
-        assert_eq!(smart_ping_ack(&packet).1, 1);
-
-        packet[25..29].copy_from_slice(PATH_PROBE_V2_MAGIC);
-        packet[29..31].copy_from_slice(&27u16.to_be_bytes());
-        packet[31..39].copy_from_slice(&91u64.to_be_bytes());
-        assert!(is_smart_ping(&packet));
-        let (ack, len) = smart_ping_ack(&packet);
-        let mut expected = Vec::from(27u16.to_be_bytes());
-        expected.extend_from_slice(&91u64.to_be_bytes());
-        assert_eq!(&ack[..PATH_RECEIPT_ACK.len()], PATH_RECEIPT_ACK);
-        assert_eq!(&ack[PATH_RECEIPT_ACK.len()..len], expected);
-
-        packet[40] = 0;
-        assert!(!is_smart_ping(&packet));
+    fn stream_control_payload_is_compact_and_deterministic() {
+        let payload = stream_control_payload(STREAM_REPAIR_PREFIX, 7, 36, &[14, 28]);
+        assert!(payload.starts_with(STREAM_REPAIR_PREFIX));
+        let offset = STREAM_REPAIR_PREFIX.len();
+        assert_eq!(&payload[offset..offset + 8], &7u64.to_be_bytes());
+        assert_eq!(&payload[offset + 8..offset + 10], &36u16.to_be_bytes());
+        assert_eq!(payload[offset + 10], 2);
+        assert_eq!(&payload[offset + 11..offset + 13], &14u16.to_be_bytes());
+        assert_eq!(&payload[offset + 13..offset + 15], &28u16.to_be_bytes());
+        assert_eq!(payload.len(), STREAM_REPAIR_PREFIX.len() + 15);
     }
 
     #[test]
-    fn path_lease_is_control_without_being_a_ping() {
-        assert!(is_control_payload(PATH_LEASE));
-        assert!(!is_smart_ping(PATH_LEASE));
+    fn stream_repair_round_deduplicates_and_escalates_by_sequence() {
+        let mut round = StreamRepairRound::default();
+        assert!(round.repair_payload(&[14, 28], 36, 0).is_none());
+        let first = round.repair_payload(&[14, 28], 36, 30_000).unwrap();
+        assert!(round.repair_payload(&[14, 28], 36, 31_000).is_none());
+        let next = round.repair_payload(&[14, 28], 36, 90_000).unwrap();
+        assert_ne!(first, next);
+    }
+
+    #[test]
+    fn stream_repair_round_emits_alive_after_recovery() {
+        let mut round = StreamRepairRound::default();
+        assert!(round.repair_payload(&[14], 36, 0).is_none());
+        let repair = round.repair_payload(&[14], 36, 30_000).unwrap();
+        round.recovered(36, 30_100);
+        let alive = round.alive_payload(30_100).unwrap();
+        assert!(alive.starts_with(STREAM_ALIVE_PREFIX));
+        assert_ne!(repair, alive);
+        assert!(round.alive_payload(5_500).is_none());
+        assert!(round.alive_payload(10_100).is_some());
+        assert!(round.alive_payload(15_100).is_none());
+    }
+
+    #[test]
+    fn session_lease_is_control() {
+        assert!(is_control_payload(SESSION_LEASE));
+    }
+
+    #[test]
+    fn udp_flushes_control_without_flushing_regular_data() {
+        assert!(should_flush_udp_immediately(b"GETCONF:9000|device"));
+        assert!(should_flush_udp_immediately(STREAM_REPAIR_PREFIX));
+        assert!(should_flush_udp_immediately(b"READY"));
+        assert!(!should_flush_udp_immediately(&[0x45, 0, 0, 28]));
+    }
+
+    #[test]
+    fn fec_profile_is_safe_by_default_and_can_be_disabled() {
+        assert_eq!(FecProfile::default(), FecProfile::Safe);
+        assert_ne!(FecProfile::Off, FecProfile::Safe);
     }
 
     #[test]
@@ -3957,6 +5197,7 @@ mod tests {
         let epoch = EpochValue {
             generation_id: 77,
             session_salt: "salt-a".to_owned(),
+            last_seen_ms: 0,
         };
         assert_eq!(
             getconf_reconnect_action_hot(Some(&epoch), "device", 77, "salt-a", "device", 76, "old",),

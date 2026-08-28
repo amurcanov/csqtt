@@ -131,7 +131,8 @@ class ManlCaptchaActivity : ComponentActivity() {
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
+        val discardStaleUiState = UpdateLaunchGuard.consumeStaleSavedState(this)
+        super.onCreate(if (discardStaleUiState) null else savedInstanceState)
         ManlCaptchaWebViewManager.activeActivity = this
         val redirectUri = intent.getStringExtra("redirectUri") ?: return finish()
         if (!CaptchaUriPolicy.isAllowed(redirectUri)) {

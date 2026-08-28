@@ -14,23 +14,43 @@ set "CLIPPY_TARGET_DIR=%PROJECT_ROOT%build\csqtt-uring-linux-clippy"
 set "CARGO_TARGET_DIR=%LINUX_TARGET_DIR%"
 set "ASSETS_DIR=%PROJECT_ROOT%app\src\main\assets"
 set "RUN_TESTS="
+set "DIAGNOSTICS="
 set "ZIG_WRAPPER_DIR="
 
-if /I "%~1"=="--tests" set "RUN_TESTS=1"
-if /I "%~1"=="--no-tests" set "RUN_TESTS=0"
-if not "%~1"=="" if not defined RUN_TESTS (
-    echo Usage: build_linux.bat [--tests^|--no-tests]
-    goto fail
+:parse_args
+if "%~1"=="" goto args_ready
+if /I "%~1"=="--tests" (
+    set "RUN_TESTS=1"
+    shift
+    goto parse_args
 )
+if /I "%~1"=="--no-tests" (
+    set "RUN_TESTS=0"
+    shift
+    goto parse_args
+)
+if /I "%~1"=="--diagnostics" (
+    set "DIAGNOSTICS=1"
+    shift
+    goto parse_args
+)
+echo Usage: build_linux.bat [--tests^|--no-tests] [--diagnostics]
+goto fail
+
+:args_ready
+if defined CI if not defined RUN_TESTS set "RUN_TESTS=1"
 
 if not defined RUN_TESTS (
-    choice /C YN /N /M "Run fmt, clippy and tests before build? [Y/N]: "
+    choice /C YN /N /M "Run fmt, clippy and Linux test compilation before build? [Y/N]: "
     if errorlevel 2 (
         set "RUN_TESTS=0"
     ) else (
         set "RUN_TESTS=1"
     )
 )
+
+set "CARGO_FEATURES="
+if defined DIAGNOSTICS set "CARGO_FEATURES=--features diagnostics"
 
 cd /d "%SERVER_DIR%"
 
@@ -68,6 +88,9 @@ if errorlevel 1 (
 for /f "delims=" %%V in ('zig version') do echo Using Zig: %%V
 echo Cargo target directory: %LINUX_TARGET_DIR%
 
+call :setup_zig_wrappers
+if errorlevel 1 goto fail
+
 echo Adding musl target...
 rustup target add x86_64-unknown-linux-musl
 if errorlevel 1 goto fail
@@ -78,24 +101,24 @@ if "%RUN_TESTS%"=="1" (
     if !errorlevel! neq 0 goto fail
 
     set "CARGO_TARGET_DIR=%CLIPPY_TARGET_DIR%"
-    call :setup_zig_wrappers
+    cargo clippy --release --target x86_64-unknown-linux-musl !CARGO_FEATURES! --all-targets -- -D warnings
     if !errorlevel! neq 0 goto fail
-    cargo clippy --release --target x86_64-unknown-linux-musl --all-targets -- -D warnings
-    if !errorlevel! neq 0 goto fail
-    call :cleanup_zig_wrappers
     set "CARGO_TARGET_DIR=%LINUX_TARGET_DIR%"
 
-    echo Compiling Linux tests...
-    cargo zigbuild --target x86_64-unknown-linux-musl --tests
+    echo Compiling Linux musl test binaries - they cannot run on Windows...
+    cargo zigbuild --target x86_64-unknown-linux-musl !CARGO_FEATURES! --tests
     if !errorlevel! neq 0 goto fail
+    echo Linux musl tests compiled successfully. Run build_linux.sh --tests on Linux to execute them.
 ) else (
     echo Pre-build checks skipped
 )
 
 echo Building for Linux using cargo-zigbuild...
-cargo zigbuild --release --target x86_64-unknown-linux-musl
+cargo zigbuild --release --target x86_64-unknown-linux-musl !CARGO_FEATURES!
 
 if errorlevel 1 goto fail
+
+call :cleanup_zig_wrappers
 
 echo Copying binaries to assets directory...
 if not exist "%ASSETS_DIR%" mkdir "%ASSETS_DIR%"

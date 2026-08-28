@@ -14,7 +14,6 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.HelpOutline
 import androidx.compose.material.icons.filled.Delete
@@ -58,10 +57,10 @@ internal fun ServerActionBar(
             OutlinedButton(
                 onClick = { onAction(DeployAction.EditAuthorization) },
                 modifier = Modifier.weight(1f).height(52.dp),
-                shape = RoundedCornerShape(16.dp),
+                shape = CsqttShapes.Pill,
                 colors = ButtonDefaults.outlinedButtonColors(
-                    containerColor = if (state.authorizationConfigured) Color.Transparent else MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.8f),
-                    contentColor = if (state.authorizationConfigured) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onErrorContainer,
+                    containerColor = Color.Transparent,
+                    contentColor = MaterialTheme.colorScheme.onSurface,
                 ),
                 border = BorderStroke(
                     1.dp,
@@ -78,7 +77,7 @@ internal fun ServerActionBar(
                 onClick = { onAction(DeployAction.Install) },
                 enabled = !state.isDeploying,
                 modifier = Modifier.weight(1f).height(52.dp),
-                shape = RoundedCornerShape(16.dp),
+                shape = CsqttShapes.Pill,
                 contentPadding = PaddingValues(horizontal = 8.dp),
                 elevation = ButtonDefaults.buttonElevation(defaultElevation = 0.dp, pressedElevation = 0.dp)
             ) {
@@ -109,10 +108,10 @@ internal fun ServerActionBar(
             OutlinedButton(
                 onClick = { onAction(DeployAction.OpenControlPanel) },
                 modifier = Modifier.weight(1f).height(52.dp),
-                shape = RoundedCornerShape(16.dp),
+                shape = CsqttShapes.Pill,
                 colors = ButtonDefaults.outlinedButtonColors(
                     containerColor = Color.Transparent,
-                    contentColor = MaterialTheme.colorScheme.primary,
+                    contentColor = MaterialTheme.colorScheme.onSurface,
                 ),
                 contentPadding = PaddingValues(horizontal = 4.dp),
                 border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.4f))
@@ -141,7 +140,7 @@ internal fun ServerActionBar(
                 onClick = { onAction(DeployAction.Uninstall) },
                 enabled = !state.isDeploying && state.canUninstall,
                 modifier = Modifier.weight(1f).height(52.dp),
-                shape = RoundedCornerShape(16.dp),
+                shape = CsqttShapes.Pill,
                 contentPadding = PaddingValues(horizontal = 8.dp),
                 colors = ButtonDefaults.buttonColors(
                     containerColor = MaterialTheme.colorScheme.error,

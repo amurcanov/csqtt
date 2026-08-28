@@ -8,6 +8,59 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
+val localProperties = Properties()
+val localPropertiesFile = rootProject.file("local.properties")
+if (localPropertiesFile.isFile) {
+    localPropertiesFile.inputStream().use { input -> localProperties.load(input) }
+}
+
+fun releaseSigningValue(name: String): String? =
+    providers.gradleProperty(name).orNull
+        ?: providers.environmentVariable(name).orNull
+        ?: localProperties.getProperty(name)
+
+fun requiredReleaseSigningValue(name: String): String? =
+    releaseSigningValue(name)?.takeIf { it.isNotBlank() }
+
+val releaseKeystorePath = requiredReleaseSigningValue("KEYSTORE_FILE")?.trim()
+val releaseKeystoreFile = releaseKeystorePath?.let { path ->
+    // Keep supporting the existing ../release.keystore convention relative to
+    // the repository root, while also accepting absolute and root-relative paths.
+    if (path.startsWith("../") || path.startsWith("..\\")) {
+        rootProject.file(path.substring(3))
+    } else {
+        rootProject.file(path)
+    }
+}
+val releaseStorePassword = requiredReleaseSigningValue("KEYSTORE_PASSWORD")
+val releaseKeyAlias = requiredReleaseSigningValue("KEY_ALIAS")
+val releaseKeyPassword = requiredReleaseSigningValue("KEY_PASSWORD")
+val releaseSigningProblems = mutableListOf<String>().apply {
+    when {
+        releaseKeystoreFile == null -> add("KEYSTORE_FILE is not configured")
+        !releaseKeystoreFile.isFile -> add("the configured release keystore is unavailable")
+        !releaseKeystoreFile.canRead() -> add("the configured release keystore is not readable")
+    }
+    if (releaseStorePassword == null) add("KEYSTORE_PASSWORD is not configured")
+    if (releaseKeyAlias == null) add("KEY_ALIAS is not configured")
+    if (releaseKeyPassword == null) add("KEY_PASSWORD is not configured")
+}
+val releaseSigningReady = releaseSigningProblems.isEmpty()
+
+val verifyReleaseSigning = tasks.register("verifyReleaseSigning") {
+    group = "verification"
+    description = "Verifies that a release build has an explicit, readable signing configuration."
+    inputs.property("releaseSigningProblems", releaseSigningProblems.joinToString("; "))
+    doLast {
+        val signingProblems = inputs.properties["releaseSigningProblems"] as String
+        check(signingProblems.isEmpty()) {
+            "Release signing is not configured: $signingProblems. " +
+                "Provide the required values through Gradle properties, environment variables, " +
+                "or an untracked local.properties file."
+        }
+    }
+}
+
 android {
     namespace = "com.csqtt.client"
     compileSdk = 37
@@ -16,8 +69,8 @@ android {
         applicationId = "csqtt.quic.amurcanov"
         minSdk = 26
         targetSdk = 37
-        versionCode = 200
-        versionName = "2.0.0"
+        versionCode = 215
+        versionName = "2.1.5"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -38,31 +91,13 @@ android {
         }
     }
 
-    val localProperties = Properties()
-    val localPropertiesFile = rootProject.file("local.properties")
-    if (localPropertiesFile.exists()) {
-        localProperties.load(localPropertiesFile.inputStream())
-    }
-
     signingConfigs {
         create("release") {
-            val keyFile = localProperties.getProperty("KEYSTORE_FILE")
-            if (keyFile != null) {
-                // Резолвим путь: если начинается с "..", берём от корня проекта
-                val resolvedFile = if (keyFile.startsWith("..")) {
-                    // ../release.keystore -> корень проекта / release.keystore
-                    file(rootDir.resolve(keyFile.substring(3)))
-                } else {
-                    file(keyFile)
-                }
-                if (resolvedFile.exists()) {
-                    storeFile = resolvedFile
-                    storePassword = localProperties.getProperty("KEYSTORE_PASSWORD")
-                    keyAlias = localProperties.getProperty("KEY_ALIAS")
-                    keyPassword = localProperties.getProperty("KEY_PASSWORD")
-                } else {
-                    println("WARNING: Keystore file not found: $keyFile (resolved: ${resolvedFile.absolutePath})")
-                }
+            if (releaseSigningReady) {
+                storeFile = requireNotNull(releaseKeystoreFile)
+                storePassword = releaseStorePassword
+                keyAlias = releaseKeyAlias
+                keyPassword = releaseKeyPassword
             }
             enableV1Signing = true
             enableV2Signing = true
@@ -78,19 +113,8 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
-            val keyFile = localProperties.getProperty("KEYSTORE_FILE")
-            val resolvedFile = if (keyFile != null && keyFile.startsWith("..")) {
-                file(rootDir.resolve(keyFile.substring(3)))
-            } else if (keyFile != null) {
-                file(keyFile)
-            } else null
-            
-            if (resolvedFile != null && resolvedFile.exists()) {
+            if (releaseSigningReady) {
                 signingConfig = signingConfigs.getByName("release")
-                println("✅ Signing config applied: ${resolvedFile.absolutePath}")
-            } else {
-                println("⚠️ WARNING: Keystore not found, using debug signing")
-                println("   Looked for: ${resolvedFile?.absolutePath ?: keyFile}")
             }
         }
     }
@@ -128,6 +152,22 @@ android {
         getByName("main") {
             jniLibs.directories.add("src/main/jniLibs")
         }
+    }
+}
+
+tasks.configureEach {
+    val taskName = name.lowercase()
+    val preparesReleaseBuild = taskName == "prereleasebuild"
+    val producesReleaseArtifact = taskName.contains("release") &&
+        (taskName.startsWith("assemble") ||
+            taskName.startsWith("bundle") ||
+            taskName.startsWith("package") ||
+            taskName.startsWith("sign") ||
+            taskName.startsWith("install") ||
+            taskName.startsWith("publish") ||
+            taskName.startsWith("upload"))
+    if (preparesReleaseBuild || producesReleaseArtifact) {
+        dependsOn(verifyReleaseSigning)
     }
 }
 

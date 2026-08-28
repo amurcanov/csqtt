@@ -6,6 +6,7 @@
     <string name="app_name">CSQTT</string>
     <string name="widget_disconnected">Отключено</string>
     <string name="widget_toggle_vpn">Переключить VPN</string>
+    <string name="nav_connection">Подкл.</string>
     <string name="nav_tunnel">Туннель</string>
     <string name="nav_deploy">Деплой</string>
     <string name="nav_exceptions">Исключ.</string>

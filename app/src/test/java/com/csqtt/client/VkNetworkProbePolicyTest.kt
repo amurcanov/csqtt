@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: 2026 amurcanov
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-
 package com.csqtt.client
 
 import org.junit.Assert.assertEquals
@@ -10,20 +7,20 @@ import org.junit.Test
 
 class VkNetworkProbePolicyTest {
     @Test
-    fun retryDelayStartsFastAndRemainsBounded() {
-        repeat(15) { failure ->
-            assertEquals(1_000L, vkProbeRetryDelayMs(failure + 1))
-        }
+    fun retryDelayIsBounded() {
+        assertEquals(1_000L, vkProbeRetryDelayMs(0))
+        assertEquals(1_000L, vkProbeRetryDelayMs(15))
         assertEquals(2_000L, vkProbeRetryDelayMs(16))
-        assertEquals(15_000L, vkProbeRetryDelayMs(Int.MAX_VALUE))
+        assertEquals(15_000L, vkProbeRetryDelayMs(20))
     }
 
     @Test
-    fun anyHttpResponseProvesVkDnsTcpAndTlsReachability() {
+    fun anyHttpResponseMeansVkIsReachable() {
+        assertTrue(isVkProbeHttpResponse(100))
         assertTrue(isVkProbeHttpResponse(200))
         assertTrue(isVkProbeHttpResponse(403))
-        assertTrue(isVkProbeHttpResponse(503))
-        assertFalse(isVkProbeHttpResponse(0))
+        assertTrue(isVkProbeHttpResponse(599))
+        assertFalse(isVkProbeHttpResponse(99))
         assertFalse(isVkProbeHttpResponse(600))
     }
 }

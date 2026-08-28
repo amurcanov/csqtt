@@ -4,15 +4,23 @@
 #[cfg(test)]
 use crate::turn_core::{AF_IPV4, NativeAddress};
 use crate::{
+    client_perf::{self, Stage as PerfStage},
     dns,
-    packet::{PACKET_CAPACITY, PACKET_HEADROOM, PacketBuf, PacketPool},
+    packet::{PACKET_CAPACITY, PACKET_HEADROOM, PACKET_POOL_PER_WORKER, PacketBuf, PacketPool},
     turn_core::{
-        EVENT_CHANNEL_BOUND, EVENT_CONTROL_OVERFLOW, EVENT_DATA_REJECTED, EVENT_EVENT_OVERFLOW,
-        EVENT_FORCED_DESTROY, EVENT_RELAY_ADDRESS, EVENT_REQUEST_COMPLETE, EVENT_STATE,
-        METHOD_ALLOCATE, METHOD_CHANNEL_BIND, METHOD_CREATE_PERMISSION, METHOD_REFRESH, NativeCore,
-        RESULT_INVALID_ARGUMENT, RESULT_NOT_CONTROL, STATE_DEALLOCATED, STATE_DESTROYING,
-        STATE_READY, native_status_text,
+        EVENT_CHANNEL_BOUND, EVENT_CHANNEL_REBIND_EXHAUSTED, EVENT_CONTROL_OVERFLOW,
+        EVENT_DATA_REJECTED, EVENT_EVENT_OVERFLOW, EVENT_FORCED_DESTROY, EVENT_RELAY_ADDRESS,
+        EVENT_REQUEST_COMPLETE, EVENT_STATE, EVENT_STUN_RESPONSE_ERROR, METHOD_ALLOCATE,
+        METHOD_CHANNEL_BIND, METHOD_CREATE_PERMISSION, METHOD_REFRESH, NativeCore,
+        RESULT_AUTHENTICATION, RESULT_INVALID_ARGUMENT, RESULT_NOT_CONTROL, RESULT_PROTOCOL,
+        RESULT_TIMEOUT, STATE_DEALLOCATED, STATE_DESTROYING, STATE_READY, TurnControlTransport,
+        native_status_text,
     },
+    turn_endpoint::{TurnEndpoint, TurnTransportMode, TurnWireTransport, resolve_turn_endpoints},
+    turn_stream::{
+        self, TurnStreamFrame, TurnStreamReader, TurnStreamWriteFailure, TurnStreamWriter,
+    },
+    udp_batch,
 };
 use anyhow::{Context, Result, bail};
 use socket2::SockRef;
@@ -35,14 +43,32 @@ const MAGIC_COOKIE: [u8; 4] = [0x21, 0x12, 0xa4, 0x42];
 const UDP_RECEIVE_BUFFER_BYTES: usize = 1024 * 1024;
 const UDP_SEND_BUFFER_BYTES: usize = 512 * 1024;
 const _: () = assert!(UDP_RECEIVE_BUFFER_BYTES + UDP_SEND_BUFFER_BYTES <= 2 * 1024 * 1024);
-const INCOMING_QUEUE_CAPACITY: usize = 64;
+// Ingress buffers up to one worker's PacketPool share: deep enough to absorb
+// downlink bursts while a stalled consumer catches up, shallow enough that a
+// single stream cannot starve the other workers of pool buffers.
+const INCOMING_QUEUE_CAPACITY: usize = PACKET_POOL_PER_WORKER;
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(12);
 const ALLOCATION_TIMEOUT: Duration = Duration::from_secs(25);
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(35);
 const READY_CLEANUP_TIMEOUT: Duration = Duration::from_secs(12);
 const CLEANUP_ERROR_RETRY: Duration = Duration::from_millis(100);
 const MAX_BACKGROUND_CLEANUPS: usize = 128;
-const TURN_RESUME_VALIDATION_STALL: Duration = Duration::from_secs(5);
+
+#[inline]
+fn is_retryable_maintenance(method: u32) -> bool {
+    matches!(
+        method,
+        METHOD_CREATE_PERMISSION | METHOD_CHANNEL_BIND | METHOD_REFRESH
+    )
+}
+
+#[inline]
+fn is_silent_native_status(status: i32) -> bool {
+    matches!(
+        status,
+        RESULT_TIMEOUT | RESULT_AUTHENTICATION | RESULT_PROTOCOL
+    )
+}
 
 #[derive(Debug)]
 pub struct TurnRequestError {
@@ -167,7 +193,7 @@ impl DriverShared {
 }
 
 pub struct TurnAllocation {
-    socket: Arc<UdpSocket>,
+    outbound: TurnOutbound,
     core: Arc<NativeCore>,
     incoming: Mutex<Option<mpsc::Receiver<PacketBuf>>>,
     shared: Arc<DriverShared>,
@@ -175,6 +201,24 @@ pub struct TurnAllocation {
     prepare_lock: tokio::sync::Mutex<()>,
     driver: Mutex<Option<JoinHandle<()>>>,
     deallocated: AtomicBool,
+}
+
+pub struct TurnConnectTarget<'a> {
+    pub address: &'a str,
+    pub override_host: Option<&'a str>,
+    pub override_port: Option<&'a str>,
+    pub transport_mode: TurnTransportMode,
+}
+
+#[derive(Clone)]
+enum TurnOutbound {
+    Udp(Arc<UdpSocket>),
+    Stream(Arc<TurnStreamWriter>),
+}
+
+enum TurnInbound {
+    Udp(Arc<UdpSocket>),
+    Stream(TurnStreamReader, TurnStreamWriteFailure),
 }
 
 pub struct TurnReceiver {
@@ -213,7 +257,7 @@ impl TurnReceiver {
 
 impl TurnAllocation {
     pub async fn connect(
-        turn_address: &str,
+        target: TurnConnectTarget<'_>,
         username: Arc<str>,
         password: Arc<str>,
         peer: SocketAddr,
@@ -225,19 +269,26 @@ impl TurnAllocation {
         if password.len() > 512 {
             bail!("TURN password превышает 512 байт");
         }
-        let server = dns::resolve_socket(turn_address).await?;
-        let bind = if server.is_ipv4() {
-            SocketAddr::from(([0, 0, 0, 0], 0))
+        let endpoints = resolve_turn_endpoints(
+            target.address,
+            target.override_host,
+            target.override_port,
+            target.transport_mode,
+        )?;
+        let (outbound, inbound, server, transport) = connect_transport(&endpoints).await?;
+        crate::log_error!("[TURN] Транспорт: {}", transport.as_str());
+        let control_transport = if transport == TurnWireTransport::Udp {
+            TurnControlTransport::Datagram
         } else {
-            SocketAddr::from(([0u16; 8], 0))
+            TurnControlTransport::Stream
         };
-        let socket = Arc::new(UdpSocket::bind(bind).await.context("TURN UDP bind")?);
-        configure_udp_socket_buffers(&socket);
-        socket
-            .connect(server)
-            .await
-            .with_context(|| format!("TURN UDP connect {server}"))?;
-        let core = NativeCore::create(server, &username, &password, peer)?;
+        let core = NativeCore::create_with_transport(
+            server,
+            &username,
+            &password,
+            peer,
+            control_transport,
+        )?;
         let (snapshot, _) = watch::channel(CoreSnapshot::default());
         let shared = Arc::new(DriverShared {
             snapshot,
@@ -253,7 +304,8 @@ impl TurnAllocation {
         });
         let (incoming_tx, incoming_rx) = mpsc::channel(INCOMING_QUEUE_CAPACITY);
         let driver = tokio::spawn(driver_loop(DriverRuntime {
-            socket: socket.clone(),
+            outbound: outbound.clone(),
+            inbound,
             core: core.clone(),
             pool: pool.clone(),
             incoming: incoming_tx,
@@ -262,7 +314,7 @@ impl TurnAllocation {
             peer,
         }));
         let allocation = Arc::new(Self {
-            socket,
+            outbound,
             core,
             incoming: Mutex::new(Some(incoming_rx)),
             shared,
@@ -326,20 +378,15 @@ impl TurnAllocation {
         if self.shared.channel.load(Ordering::Acquire) != 0 {
             return Ok(());
         }
-        let permission_baseline = self.completion_sequence(METHOD_CREATE_PERMISSION);
+        self.bind_channel(true).await
+    }
+
+    async fn bind_channel(&self, log_ready: bool) -> Result<()> {
+        let channel_baseline = self.completion_sequence(METHOD_CHANNEL_BIND);
         if let Err(error) = self.core.start_permission() {
             self.shared.fail(Arc::from(format!("{error:#}")));
             return Err(error);
         }
-        self.shared.wake.notify_one();
-        self.wait_for_completion(
-            METHOD_CREATE_PERMISSION,
-            permission_baseline,
-            CONTROL_TIMEOUT,
-        )
-        .await?;
-        crate::log_error!("[TURN] CreatePermission подтверждён ✓");
-        let channel_baseline = self.completion_sequence(METHOD_CHANNEL_BIND);
         if let Err(error) = self.core.start_channel() {
             self.shared.fail(Arc::from(format!("{error:#}")));
             return Err(error);
@@ -365,25 +412,94 @@ impl TurnAllocation {
         })
         .await
         .context("TURN ChannelBind confirmation timeout")??;
-        let channel = self.shared.channel.load(Ordering::Acquire);
-        crate::log_error!("[TURN] ChannelBind активен: канал 0x{channel:04X}");
-        crate::log_error!("[TURN] Сессия готова к передаче данных ✓");
+        if log_ready {
+            crate::log_error!("[TURN] Сессия готова к передаче данных ✓");
+        }
         Ok(())
     }
 
-    pub async fn send_with_duplicate(&self, packet: &mut PacketBuf, duplicate: bool) -> Result<()> {
+    pub async fn send_with_duplicate(&self, mut packet: PacketBuf, duplicate: bool) -> Result<()> {
         self.ensure_open()?;
         let channel = self.shared.channel.load(Ordering::Acquire);
         if channel == 0 {
             bail!("TURN ChannelBind обязателен");
         }
-        encode_channel_data(packet, channel)?;
-        self.socket
-            .send(packet.as_slice())
-            .await
-            .context("TURN UDP send")?;
-        if duplicate {
-            let _ = self.socket.try_send(packet.as_slice());
+        client_perf::measure_sampled(PerfStage::TurnTx, 64, || {
+            encode_channel_data(&mut packet, channel)
+        })?;
+        match &self.outbound {
+            TurnOutbound::Udp(socket) => {
+                client_perf::measure_wall_sampled(
+                    PerfStage::TurnTx,
+                    64,
+                    socket.send(packet.as_slice()),
+                )
+                .await
+                .context("TURN UDP send")?;
+                if duplicate {
+                    let _ = socket.try_send(packet.as_slice());
+                }
+            }
+            TurnOutbound::Stream(writer) => {
+                let _ = client_perf::measure_sampled(PerfStage::TurnTx, 64, || {
+                    writer.try_write_data(packet)
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Send ordinary TURN ChannelData packets in bounded kernel batches.
+    ///
+    /// FEC-bearing packets deliberately stay on [`Self::send_with_duplicate`]
+    /// so their primary datagram and best-effort duplicate retain their exact
+    /// on-wire order. This method is only for the non-FEC prefix/suffixes.
+    pub async fn send_data_batch(&self, packets: &mut Vec<PacketBuf>) -> Result<()> {
+        if packets.is_empty() {
+            return Ok(());
+        }
+        self.ensure_open()?;
+        let channel = self.shared.channel.load(Ordering::Acquire);
+        if channel == 0 {
+            bail!("TURN ChannelBind обязателен");
+        }
+
+        // Validate every packet before mutating any one of them. If a bad
+        // packet reaches this point, the caller can drop the whole unsent
+        // batch rather than accidentally retaining a half-encoded prefix.
+        for packet in packets.iter() {
+            let _ = channel_data_padding(packet, channel)?;
+        }
+        for packet in packets.iter_mut() {
+            client_perf::measure_sampled(PerfStage::TurnTx, 64, || {
+                encode_channel_data(packet, channel)
+            })?;
+        }
+
+        match &self.outbound {
+            TurnOutbound::Udp(socket) => {
+                for chunk in packets.chunks(udp_batch::MAX_DATAGRAMS) {
+                    let mut datagrams: [&[u8]; udp_batch::MAX_DATAGRAMS] =
+                        std::array::from_fn(|_| &[] as &[u8]);
+                    for (slot, packet) in chunk.iter().enumerate() {
+                        datagrams[slot] = packet.as_slice();
+                    }
+                    client_perf::measure_wall_sampled(
+                        PerfStage::TurnTx,
+                        64,
+                        udp_batch::send_connected(socket, &datagrams[..chunk.len()]),
+                    )
+                    .await
+                    .context("TURN UDP batch send")?;
+                }
+            }
+            TurnOutbound::Stream(writer) => {
+                for packet in packets.drain(..) {
+                    let _ = client_perf::measure_sampled(PerfStage::TurnTx, 64, || {
+                        writer.try_write_data(packet)
+                    })?;
+                }
+            }
         }
         Ok(())
     }
@@ -506,8 +622,71 @@ impl Drop for TurnAllocation {
     }
 }
 
+async fn connect_transport(
+    endpoints: &[TurnEndpoint],
+) -> Result<(TurnOutbound, TurnInbound, SocketAddr, TurnWireTransport)> {
+    let mut failures = Vec::with_capacity(endpoints.len());
+    for endpoint in endpoints {
+        let authority = endpoint.socket_authority();
+        let attempt: Result<(TurnOutbound, TurnInbound, SocketAddr, TurnWireTransport)> = async {
+            let server = dns::resolve_socket(&authority).await?;
+            match endpoint.transport {
+                TurnWireTransport::Udp => {
+                    let bind = if server.is_ipv4() {
+                        SocketAddr::from(([0, 0, 0, 0], 0))
+                    } else {
+                        SocketAddr::from(([0u16; 8], 0))
+                    };
+                    let socket = Arc::new(UdpSocket::bind(bind).await.context("TURN UDP bind")?);
+                    configure_udp_socket_buffers(&socket);
+                    socket
+                        .connect(server)
+                        .await
+                        .with_context(|| format!("TURN UDP connect {server}"))?;
+                    Ok((
+                        TurnOutbound::Udp(socket.clone()),
+                        TurnInbound::Udp(socket),
+                        server,
+                        TurnWireTransport::Udp,
+                    ))
+                }
+                TurnWireTransport::Tcp | TurnWireTransport::Tls => {
+                    let (writer, reader, write_failure) =
+                        turn_stream::connect(endpoint, server).await?;
+                    Ok((
+                        TurnOutbound::Stream(writer),
+                        TurnInbound::Stream(reader, write_failure),
+                        server,
+                        endpoint.transport,
+                    ))
+                }
+            }
+        }
+        .await;
+        match attempt {
+            Ok(value) => return Ok(value),
+            Err(error) => failures.push(format!("{}: {error:#}", endpoint.transport.as_str())),
+        }
+    }
+    bail!(
+        "TURN transport endpoints are unavailable: {}",
+        failures.join(" | ")
+    )
+}
+
 struct DriverRuntime {
-    socket: Arc<UdpSocket>,
+    outbound: TurnOutbound,
+    inbound: TurnInbound,
+    core: Arc<NativeCore>,
+    pool: Arc<PacketPool>,
+    incoming: mpsc::Sender<PacketBuf>,
+    shared: Arc<DriverShared>,
+    server: SocketAddr,
+    peer: SocketAddr,
+}
+
+struct DriverCommon {
+    outbound: TurnOutbound,
     core: Arc<NativeCore>,
     pool: Arc<PacketPool>,
     incoming: mpsc::Sender<PacketBuf>,
@@ -518,7 +697,8 @@ struct DriverRuntime {
 
 async fn driver_loop(runtime: DriverRuntime) {
     let DriverRuntime {
-        socket,
+        outbound,
+        inbound,
         core,
         pool,
         incoming,
@@ -526,12 +706,44 @@ async fn driver_loop(runtime: DriverRuntime) {
         server,
         peer,
     } = runtime;
+    let common = DriverCommon {
+        outbound,
+        core,
+        pool,
+        incoming,
+        shared,
+        server,
+        peer,
+    };
+    match inbound {
+        TurnInbound::Udp(socket) => driver_loop_udp(common, socket).await,
+        TurnInbound::Stream(reader, write_failure) => {
+            driver_loop_stream(common, reader, write_failure).await
+        }
+    }
+}
+
+async fn driver_loop_udp(common: DriverCommon, socket: Arc<UdpSocket>) {
+    let DriverCommon {
+        outbound,
+        core,
+        pool,
+        incoming,
+        shared,
+        server,
+        peer,
+    } = common;
     let mut deficit_buffer = [0u8; PACKET_CAPACITY - PACKET_HEADROOM];
     let mut cleanup_deadline = None;
     let mut cleanup_permit: Option<OwnedSemaphorePermit> = None;
     let mut shutdown_requested = false;
     let mut native_deadline = Instant::now();
     let mut pump_needed = true;
+    // Metadata for recvmmsg lives on the stack in udp_batch; this Vec only
+    // holds packet-pool leases while a batch is actively being drained.
+    // It is always cleared before an idle readiness wait.
+    let mut receive_batch = Vec::with_capacity(udp_batch::MAX_DATAGRAMS);
+    let mut receive_batch_limit = udp_batch::MIN_DATAGRAMS;
     loop {
         if shared.closing.load(Ordering::Acquire) {
             if !shared.control_sent.load(Ordering::Acquire) {
@@ -552,17 +764,8 @@ async fn driver_loop(runtime: DriverRuntime) {
             }
         }
         let now = Instant::now();
-        if resume_validation_due(
-            now,
-            native_deadline,
-            shared.snapshot.borrow().state,
-            shared.closing.load(Ordering::Acquire),
-        ) {
-            let _ = core.start_channel();
-            pump_needed = true;
-        }
         if pump_needed || now >= native_deadline {
-            match pump_native(&socket, &core, &shared, server, peer).await {
+            match pump_native(&outbound, &core, &shared, server, peer).await {
                 Ok(delay) => {
                     native_deadline =
                         Instant::now() + delay.unwrap_or(Duration::from_secs(24 * 60 * 60));
@@ -623,43 +826,24 @@ async fn driver_loop(runtime: DriverRuntime) {
                     pump_needed = true;
                     tokio::time::sleep(CLEANUP_ERROR_RETRY).await;
                 }
+                DriverEvent::Readable(_) => {}
                 DriverEvent::OwnerClosed => {}
             }
         } else {
-            // High-throughput batch draining: drain up to 64 packets in tight synchronous loop
-            const MAX_BURST_BATCH: usize = 64;
+            const MAX_BURST_BATCH: usize = udp_batch::MAX_DATAGRAMS;
             let mut burst_count = 0usize;
             let mut socket_empty = false;
             while burst_count < MAX_BURST_BATCH {
-                if let Some(mut packet) = pool.try_acquire() {
-                    match socket.try_recv(packet.read_area()) {
-                        Ok(length) => {
-                            burst_count += 1;
-                            if packet.set_read_len(length).is_err() {
-                                continue;
-                            }
-                            let action = process_packet(&core, &shared, &incoming, packet);
-                            match action {
-                                PacketAction::Wait => {}
-                                PacketAction::Pump => pump_needed = true,
-                                PacketAction::OwnerClosed => {
-                                    shared.request_cleanup();
-                                    break;
-                                }
-                            }
-                        }
-                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            socket_empty = true;
-                            break;
-                        }
-                        Err(error) => {
-                            shared.fail(Arc::from(format!("TURN UDP receive failed: {error}")));
-                            shared.request_cleanup();
-                            pump_needed = true;
-                            break;
-                        }
-                    }
-                } else {
+                receive_batch.clear();
+                let wanted = (MAX_BURST_BATCH - burst_count).min(receive_batch_limit);
+                while receive_batch.len() < wanted {
+                    let Some(packet) = pool.try_acquire() else {
+                        break;
+                    };
+                    receive_batch.push(packet);
+                }
+
+                if receive_batch.is_empty() {
                     // Pool deficit: process with stack deficit_buffer
                     match socket.try_recv(&mut deficit_buffer) {
                         Ok(length) => {
@@ -682,89 +866,232 @@ async fn driver_loop(runtime: DriverRuntime) {
                             break;
                         }
                     }
+                    continue;
+                }
+
+                let slots = receive_batch.len();
+                match udp_batch::try_recv_connected(&socket, receive_batch.as_mut_slice()) {
+                    Ok(0) => {
+                        receive_batch_limit = udp_batch::adapt_batch_limit(receive_batch_limit, 0);
+                        receive_batch.clear();
+                        socket_empty = true;
+                        break;
+                    }
+                    Ok(received) if received <= slots => {
+                        burst_count += received;
+                        if slots == receive_batch_limit {
+                            receive_batch_limit =
+                                udp_batch::adapt_batch_limit(receive_batch_limit, received);
+                        }
+                        let mut owner_closed = false;
+                        for packet in receive_batch.drain(..received) {
+                            match process_packet(&core, &shared, &incoming, packet) {
+                                PacketAction::Wait => {}
+                                PacketAction::Pump => pump_needed = true,
+                                PacketAction::OwnerClosed => {
+                                    owner_closed = true;
+                                    break;
+                                }
+                            }
+                        }
+                        // Return slots not populated by the kernel immediately;
+                        // keeping them through socket.readable() would starve
+                        // idle allocations of their shared packet budget.
+                        receive_batch.clear();
+                        if owner_closed {
+                            shared.request_cleanup();
+                            break;
+                        }
+                    }
+                    Ok(_) => {
+                        receive_batch.clear();
+                        shared.fail("TURN UDP batch receive returned an invalid count");
+                        shared.request_cleanup();
+                        pump_needed = true;
+                        break;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        receive_batch_limit = udp_batch::adapt_batch_limit(receive_batch_limit, 0);
+                        receive_batch.clear();
+                        socket_empty = true;
+                        break;
+                    }
+                    Err(error) => {
+                        receive_batch.clear();
+                        shared.fail(Arc::from(format!("TURN UDP receive failed: {error}")));
+                        shared.request_cleanup();
+                        pump_needed = true;
+                        break;
+                    }
                 }
             }
 
+            // A STUN packet may have made native control immediately ready.
+            // Do not park on UDP readiness first, or a ChannelBind/Refresh
+            // acknowledgement can wait until the next unrelated datagram.
+            if pump_needed {
+                continue;
+            }
             if burst_count > 0 && !socket_empty {
                 // Yield gracefully after full burst to prevent task starvation
                 tokio::task::yield_now().await;
                 continue;
             }
 
-            if let Some(mut packet) = pool.try_acquire() {
-                let event = tokio::select! {
-                    biased;
-                    _ = shared.wake.notified() => DriverEvent::Wake,
-                    _ = tokio::time::sleep(wait) => DriverEvent::Timer,
-                    _ = incoming.closed() => DriverEvent::OwnerClosed,
-                    result = socket.recv(packet.read_area()) => DriverEvent::Packet(result),
-                };
-                match event {
-                    DriverEvent::Wake | DriverEvent::Timer => {
-                        pump_needed = true;
-                    }
-                    DriverEvent::OwnerClosed => {
-                        shared.request_cleanup();
-                    }
-                    DriverEvent::Packet(Ok(length)) => {
-                        if packet.set_read_len(length).is_err() {
-                            continue;
-                        }
-                        let action = process_packet(&core, &shared, &incoming, packet);
-                        match action {
-                            PacketAction::Wait => {}
-                            PacketAction::Pump => pump_needed = true,
-                            PacketAction::OwnerClosed => shared.request_cleanup(),
-                        }
-                    }
-                    DriverEvent::Packet(Err(error)) => {
-                        shared.fail(Arc::from(format!("TURN UDP receive failed: {error}")));
-                        shared.request_cleanup();
-                        pump_needed = true;
-                    }
+            // Wait only for readiness, then acquire PacketBufs and execute the
+            // nonblocking mmsg drain on the next loop iteration. This avoids
+            // reserving 16 pool buffers for every idle TURN allocation.
+            let event = tokio::select! {
+                biased;
+                _ = shared.wake.notified() => DriverEvent::Wake,
+                _ = tokio::time::sleep(wait) => DriverEvent::Timer,
+                _ = incoming.closed() => DriverEvent::OwnerClosed,
+                result = socket.readable() => DriverEvent::Readable(result),
+            };
+            match event {
+                DriverEvent::Wake | DriverEvent::Timer => {
+                    pump_needed = true;
                 }
-            } else {
-                let event = tokio::select! {
-                    biased;
-                    _ = shared.wake.notified() => DriverEvent::Wake,
-                    _ = tokio::time::sleep(wait) => DriverEvent::Timer,
-                    _ = incoming.closed() => DriverEvent::OwnerClosed,
-                    result = socket.recv(&mut deficit_buffer) => DriverEvent::Packet(result),
-                };
-                match event {
-                    DriverEvent::Wake | DriverEvent::Timer => {
-                        pump_needed = true;
-                    }
-                    DriverEvent::OwnerClosed => {
-                        shared.request_cleanup();
-                    }
-                    DriverEvent::Packet(Ok(length)) => {
-                        pump_needed = matches!(
-                            process_deficit_packet(&core, &shared, &deficit_buffer[..length]),
-                            PacketAction::Pump
-                        );
-                    }
-                    DriverEvent::Packet(Err(error)) => {
-                        shared.fail(Arc::from(format!("TURN UDP receive failed: {error}")));
-                        shared.request_cleanup();
-                        pump_needed = true;
-                    }
+                DriverEvent::OwnerClosed => {
+                    shared.request_cleanup();
                 }
+                DriverEvent::Readable(Ok(())) => {}
+                DriverEvent::Readable(Err(error)) => {
+                    shared.fail(Arc::from(format!("TURN UDP readiness failed: {error}")));
+                    shared.request_cleanup();
+                    pump_needed = true;
+                }
+                DriverEvent::Packet(_) => {}
             }
         }
     }
     core.force_destroy(0);
 }
 
-fn resume_validation_due(
-    now: Instant,
-    native_deadline: Instant,
-    state: u32,
-    closing: bool,
-) -> bool {
-    !closing
-        && state == STATE_READY
-        && now.saturating_duration_since(native_deadline) >= TURN_RESUME_VALIDATION_STALL
+async fn driver_loop_stream(
+    common: DriverCommon,
+    mut reader: TurnStreamReader,
+    mut write_failure: TurnStreamWriteFailure,
+) {
+    let DriverCommon {
+        outbound,
+        core,
+        pool,
+        incoming,
+        shared,
+        server,
+        peer,
+    } = common;
+    let mut cleanup_deadline = None;
+    let mut cleanup_permit: Option<OwnedSemaphorePermit> = None;
+    let mut shutdown_requested = false;
+    let mut native_deadline = Instant::now();
+    let mut pump_needed = true;
+    loop {
+        if shared.closing.load(Ordering::Acquire) {
+            if !shared.control_sent.load(Ordering::Acquire) {
+                break;
+            }
+            if cleanup_permit.is_none() {
+                cleanup_permit = match cleanup_limiter().clone().try_acquire_owned() {
+                    Ok(permit) => Some(permit),
+                    Err(_) => break,
+                };
+            }
+            let state = shared.snapshot.borrow().state;
+            let (deadline, started) =
+                start_driver_cleanup(&core, &mut cleanup_deadline, &mut shutdown_requested, state);
+            pump_needed |= started;
+            if state >= STATE_DEALLOCATED || Instant::now() >= deadline {
+                break;
+            }
+        }
+        let now = Instant::now();
+        if pump_needed || now >= native_deadline {
+            match pump_native(&outbound, &core, &shared, server, peer).await {
+                Ok(delay) => {
+                    native_deadline =
+                        Instant::now() + delay.unwrap_or(Duration::from_secs(24 * 60 * 60));
+                    pump_needed = false;
+                    continue;
+                }
+                Err(error) => {
+                    shared.fail(Arc::from(format!("{error:#}")));
+                    shared.request_cleanup();
+                    if !shared.control_sent.load(Ordering::Acquire) {
+                        break;
+                    }
+                    if let Some(deadline) = cleanup_deadline {
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        if remaining.is_zero() {
+                            break;
+                        }
+                        tokio::time::sleep(CLEANUP_ERROR_RETRY.min(remaining)).await;
+                    }
+                    pump_needed = true;
+                    continue;
+                }
+            }
+        }
+        let wait_deadline =
+            cleanup_deadline.map_or(native_deadline, |deadline| deadline.min(native_deadline));
+        let mut wait = wait_deadline.saturating_duration_since(Instant::now());
+        if wait.is_zero() {
+            wait = Duration::from_millis(1);
+        }
+        let event = tokio::select! {
+            biased;
+            _ = shared.wake.notified() => StreamDriverEvent::Wake,
+            _ = tokio::time::sleep(wait) => StreamDriverEvent::Timer,
+            _ = incoming.closed() => StreamDriverEvent::OwnerClosed,
+            changed = write_failure.changed() => StreamDriverEvent::WriteFailure(changed),
+            result = reader.read_frame(&pool) => StreamDriverEvent::Frame(result),
+        };
+        match event {
+            StreamDriverEvent::Wake | StreamDriverEvent::Timer => {
+                pump_needed = true;
+            }
+            StreamDriverEvent::OwnerClosed => {
+                shared.request_cleanup();
+            }
+            StreamDriverEvent::WriteFailure(Ok(())) => {
+                if let Some(reason) = write_failure.borrow().clone()
+                    && !shared.closing.load(Ordering::Acquire)
+                {
+                    shared.fail(Arc::from(format!("TURN stream transmit failed: {reason}")));
+                    shared.request_cleanup();
+                    pump_needed = true;
+                }
+            }
+            StreamDriverEvent::WriteFailure(Err(_)) => {}
+            StreamDriverEvent::Frame(Ok(TurnStreamFrame::Control(frame))) => {
+                if matches!(
+                    process_deficit_packet(&core, &shared, &frame),
+                    PacketAction::Pump
+                ) {
+                    pump_needed = true;
+                }
+            }
+            StreamDriverEvent::Frame(Ok(TurnStreamFrame::Data(packet))) => {
+                match process_packet(&core, &shared, &incoming, packet) {
+                    PacketAction::Wait => {}
+                    PacketAction::Pump => pump_needed = true,
+                    PacketAction::OwnerClosed => shared.request_cleanup(),
+                }
+            }
+            StreamDriverEvent::Frame(Ok(TurnStreamFrame::DataDropped)) => {
+                shared.pool_deficit_drops.fetch_add(1, Ordering::Relaxed);
+            }
+            StreamDriverEvent::Frame(Err(error)) => {
+                if !shared.closing.load(Ordering::Acquire) {
+                    shared.fail(Arc::from(format!("TURN stream receive failed: {error:#}")));
+                }
+                shared.request_cleanup();
+                pump_needed = true;
+            }
+        }
+    }
+    core.force_destroy(0);
 }
 
 enum DriverEvent {
@@ -772,6 +1099,15 @@ enum DriverEvent {
     Timer,
     OwnerClosed,
     Packet(std::io::Result<usize>),
+    Readable(std::io::Result<()>),
+}
+
+enum StreamDriverEvent {
+    Wake,
+    Timer,
+    OwnerClosed,
+    WriteFailure(Result<(), tokio::sync::watch::error::RecvError>),
+    Frame(Result<TurnStreamFrame>),
 }
 
 fn start_driver_cleanup(
@@ -806,7 +1142,7 @@ fn cleanup_limiter() -> &'static Arc<Semaphore> {
 }
 
 async fn pump_native(
-    socket: &UdpSocket,
+    outbound: &TurnOutbound,
     core: &NativeCore,
     shared: &DriverShared,
     server: SocketAddr,
@@ -814,20 +1150,28 @@ async fn pump_native(
 ) -> Result<Option<Duration>> {
     #[cfg(test)]
     shared.native_pumps.fetch_add(1, Ordering::Relaxed);
-    let next_timer = core.poll()?;
+    let next_timer = client_perf::measure(PerfStage::TurnControl, || core.poll())?;
     let mut control = [0u8; CONTROL_MAX];
-    while let Some((length, destination)) = core.pull_control(&mut control)? {
+    while let Some((length, destination)) =
+        client_perf::measure(PerfStage::TurnControl, || core.pull_control(&mut control))?
+    {
         if destination != server {
             bail!("TURN core attempted control send to unexpected destination {destination}");
         }
-        socket
-            .send(&control[..length])
-            .await
-            .context("TURN control UDP send")?;
+        match outbound {
+            TurnOutbound::Udp(socket) => {
+                socket
+                    .send(&control[..length])
+                    .await
+                    .context("TURN control UDP send")?;
+            }
+            TurnOutbound::Stream(writer) => writer.write_control(&control[..length]).await?,
+        }
         shared.control_sent.store(true, Ordering::Release);
     }
     let mut unexpected_destroy = false;
-    while let Some(event) = core.pull_event()? {
+    let mut channel_rebind_exhausted = false;
+    while let Some(event) = client_perf::measure(PerfStage::TurnControl, || core.pull_event())? {
         match event.kind {
             EVENT_STATE => {
                 if event.state != STATE_READY {
@@ -854,11 +1198,32 @@ async fn pump_native(
                         completion.stun_code = event.stun_code;
                     }
                 });
-                if event.method == METHOD_REFRESH && event.status == 0 && event.stun_code == 0 {
-                    crate::log_error!("[TURN] Refresh аллокации подтверждён ✓");
+                if event.status == 0 && event.stun_code == 0 {
+                    match event.method {
+                        METHOD_CHANNEL_BIND => {
+                            let channel = event.channel;
+                            crate::log_error!("[TURN] ChannelBind активен: канал 0x{channel:04X}");
+                        }
+                        METHOD_REFRESH => {
+                            crate::log_error!("[TURN] Refresh аллокации подтверждён ✓");
+                        }
+                        _ => {}
+                    }
+                }
+                if (event.status != 0 || event.stun_code != 0)
+                    && event.stun_code == 0
+                    && !shared.closing.load(Ordering::Acquire)
+                    && !is_silent_native_status(event.status)
+                {
+                    crate::log_error!(
+                        "[TURN][ERROR] {}: {}",
+                        method_name(event.method),
+                        native_status_text(event.status)
+                    );
                 }
                 if (event.status != 0 || event.stun_code != 0)
                     && !shared.closing.load(Ordering::Acquire)
+                    && !is_retryable_maintenance(event.method)
                 {
                     shared.fail(Arc::from(format!(
                         "TURN {} failed: {}{}",
@@ -866,6 +1231,33 @@ async fn pump_native(
                         native_status_text(event.status),
                         stun_suffix(event.stun_code)
                     )));
+                }
+            }
+            EVENT_STUN_RESPONSE_ERROR => {
+                if !shared.closing.load(Ordering::Acquire) && !is_silent_native_status(event.status)
+                {
+                    if event.stun_code != 0 {
+                        if event.status == 0 {
+                            crate::log_error!(
+                                "[TURN][STUN] {}: STUN error {}",
+                                method_name(event.method),
+                                event.stun_code,
+                            );
+                        } else {
+                            crate::log_error!(
+                                "[TURN][STUN] {}: unverified STUN error {} after {}",
+                                method_name(event.method),
+                                event.stun_code,
+                                native_status_text(event.status),
+                            );
+                        }
+                    } else {
+                        crate::log_error!(
+                            "[TURN][STUN] {}: {}",
+                            method_name(event.method),
+                            native_status_text(event.status),
+                        );
+                    }
                 }
             }
             EVENT_CHANNEL_BOUND => {
@@ -908,6 +1300,9 @@ async fn pump_native(
                     shared.fail("TURN core was force-destroyed");
                 }
             }
+            EVENT_CHANNEL_REBIND_EXHAUSTED => {
+                channel_rebind_exhausted = true;
+            }
             EVENT_EVENT_OVERFLOW => {
                 shared.fail(Arc::from(format!(
                     "TURN event ring overflow dropped {} events",
@@ -922,12 +1317,27 @@ async fn pump_native(
         }
     }
     if unexpected_destroy && shared.terminal().is_none() {
-        shared.fail("TURN allocation entered DESTROYING unexpectedly");
+        if channel_rebind_exhausted {
+            shared.fail("TURN channel rebind retry exhausted");
+        } else {
+            shared.fail("TURN allocation entered DESTROYING unexpectedly");
+        }
     }
     Ok(next_timer)
 }
 
 fn process_packet(
+    core: &NativeCore,
+    shared: &DriverShared,
+    incoming: &mpsc::Sender<PacketBuf>,
+    packet: PacketBuf,
+) -> PacketAction {
+    client_perf::measure_sampled(PerfStage::TurnRx, 64, || {
+        process_packet_measured(core, shared, incoming, packet)
+    })
+}
+
+fn process_packet_measured(
     core: &NativeCore,
     shared: &DriverShared,
     incoming: &mpsc::Sender<PacketBuf>,
@@ -962,6 +1372,16 @@ fn process_packet(
 }
 
 fn process_deficit_packet(core: &NativeCore, shared: &DriverShared, wire: &[u8]) -> PacketAction {
+    client_perf::measure_sampled(PerfStage::TurnRx, 64, || {
+        process_deficit_packet_measured(core, shared, wire)
+    })
+}
+
+fn process_deficit_packet_measured(
+    core: &NativeCore,
+    shared: &DriverShared,
+    wire: &[u8],
+) -> PacketAction {
     if let Some((channel, _)) = channel_data_header(wire) {
         if channel == shared.channel.load(Ordering::Acquire) {
             shared.pool_deficit_drops.fetch_add(1, Ordering::Relaxed);
@@ -1004,6 +1424,16 @@ fn is_stun(wire: &[u8]) -> bool {
 }
 
 fn encode_channel_data(packet: &mut PacketBuf, channel: u16) -> Result<()> {
+    let padding = channel_data_padding(packet, channel)?;
+    let payload_length = packet.len();
+    packet.extend_tail(padding)?.fill(0);
+    let header = packet.prepend(4)?;
+    header[..2].copy_from_slice(&channel.to_be_bytes());
+    header[2..4].copy_from_slice(&(payload_length as u16).to_be_bytes());
+    Ok(())
+}
+
+fn channel_data_padding(packet: &PacketBuf, channel: u16) -> Result<usize> {
     if !(0x4000..=0x7fff).contains(&channel) {
         bail!("TURN channel is invalid");
     }
@@ -1021,11 +1451,7 @@ fn encode_channel_data(packet: &mut PacketBuf, channel: u16) -> Result<()> {
     {
         bail!("TURN ChannelData exceeds packet buffer");
     }
-    packet.extend_tail(padding)?.fill(0);
-    let header = packet.prepend(4)?;
-    header[..2].copy_from_slice(&channel.to_be_bytes());
-    header[2..4].copy_from_slice(&(payload_length as u16).to_be_bytes());
-    Ok(())
+    Ok(padding)
 }
 
 fn configure_udp_socket_buffers(socket: &UdpSocket) {
@@ -1060,6 +1486,15 @@ mod tests {
     fn turn_socket_buffer_budget_is_bounded_per_worker() {
         assert_eq!(UDP_RECEIVE_BUFFER_BYTES, 1024 * 1024);
         assert_eq!(UDP_SEND_BUFFER_BYTES, 512 * 1024);
+    }
+
+    #[test]
+    fn native_transport_failures_are_silent_in_the_user_log() {
+        assert!(is_silent_native_status(RESULT_TIMEOUT));
+        assert!(is_silent_native_status(RESULT_AUTHENTICATION));
+        assert!(is_silent_native_status(RESULT_PROTOCOL));
+        assert!(!is_silent_native_status(RESULT_INVALID_ARGUMENT));
+        assert!(!is_silent_native_status(0));
     }
 
     #[test]
@@ -1134,47 +1569,18 @@ mod tests {
         let mut snapshot = CoreSnapshot::default();
         snapshot.completion_mut(METHOD_ALLOCATE).unwrap().sequence = 1;
         snapshot
-            .completion_mut(METHOD_CREATE_PERMISSION)
-            .unwrap()
-            .sequence = 2;
-        snapshot
             .completion_mut(METHOD_CHANNEL_BIND)
             .unwrap()
-            .sequence = 3;
-        snapshot.completion_mut(METHOD_REFRESH).unwrap().sequence = 4;
+            .sequence = 2;
+        snapshot.completion_mut(METHOD_REFRESH).unwrap().sequence = 3;
+        snapshot
+            .completion_mut(METHOD_CREATE_PERMISSION)
+            .unwrap()
+            .sequence = 4;
         assert_eq!(snapshot.completion(METHOD_ALLOCATE).sequence, 1);
-        assert_eq!(snapshot.completion(METHOD_CREATE_PERMISSION).sequence, 2);
-        assert_eq!(snapshot.completion(METHOD_CHANNEL_BIND).sequence, 3);
-        assert_eq!(snapshot.completion(METHOD_REFRESH).sequence, 4);
-    }
-
-    #[test]
-    fn resume_validation_requires_a_late_ready_session() {
-        let deadline = Instant::now();
-        assert!(!resume_validation_due(
-            deadline + TURN_RESUME_VALIDATION_STALL - Duration::from_millis(1),
-            deadline,
-            STATE_READY,
-            false,
-        ));
-        assert!(resume_validation_due(
-            deadline + TURN_RESUME_VALIDATION_STALL,
-            deadline,
-            STATE_READY,
-            false,
-        ));
-        assert!(!resume_validation_due(
-            deadline + TURN_RESUME_VALIDATION_STALL,
-            deadline,
-            STATE_READY - 1,
-            false,
-        ));
-        assert!(!resume_validation_due(
-            deadline + TURN_RESUME_VALIDATION_STALL,
-            deadline,
-            STATE_READY,
-            true,
-        ));
+        assert_eq!(snapshot.completion(METHOD_CHANNEL_BIND).sequence, 2);
+        assert_eq!(snapshot.completion(METHOD_REFRESH).sequence, 3);
+        assert_eq!(snapshot.completion(METHOD_CREATE_PERMISSION).sequence, 4);
     }
 
     #[test]

@@ -6,6 +6,8 @@
 mod auth;
 mod captcha;
 mod captcha_slider;
+mod client_perf;
+mod cpu_task;
 mod dispatcher;
 mod dns;
 mod events;
@@ -13,9 +15,9 @@ mod logging;
 mod namegen;
 mod obfs;
 mod packet;
-mod path_validation;
 mod profiles;
 mod protocol;
+mod repair;
 #[path = "../shared/selective_fec.rs"]
 mod selective_fec;
 mod session;
@@ -26,6 +28,9 @@ mod stun_codec;
 mod tun;
 mod turn;
 mod turn_core;
+mod turn_endpoint;
+mod turn_stream;
+mod udp_batch;
 mod vk_js_calls;
 mod worker;
 mod wrap;
@@ -39,6 +44,8 @@ use dispatcher::Dispatcher;
 use events::Events;
 use obfs::ObfsMode;
 use packet::{PacketPool, packet_pool_size};
+use repair::RepairState;
+use session::ShutdownCoordinator;
 use stats::Stats;
 use std::{
     collections::HashSet,
@@ -51,14 +58,17 @@ use std::{
 };
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio_util::sync::CancellationToken;
+use turn_endpoint::TurnTransportMode;
 use worker::{
-    GROUPS_PER_CREDENTIAL, GroupContext, RuntimeParams, WORKER_START_INTERVAL, WORKERS_PER_GROUP,
-    WorkerStartPacer, parse_hashes, run_groups,
+    GROUPS_PER_CREDENTIAL, GroupContext, PauseGate, RuntimeParams, WORKER_START_INTERVAL,
+    WORKERS_PER_GROUP, WorkerStartPacer, parse_hashes, run_groups,
 };
 
 const GROUPS_PER_VK_HASH: usize = 3;
 const MAX_VK_HASHES: usize = 6;
-const MAX_WORKERS: usize = MAX_VK_HASHES * GROUPS_PER_VK_HASH * WORKERS_PER_GROUP;
+const MAX_WORKERS: usize = 126;
+const STREAMS_PER_RUNTIME_WORKER: usize = 12;
+const MAX_RUNTIME_WORKER_THREADS: usize = 4;
 use wrap::derive_wrap_key;
 
 #[derive(Parser)]
@@ -94,6 +104,8 @@ struct Arguments {
     client_ids: String,
     #[arg(long, default_value = "audio")]
     obfs: String,
+    #[arg(long, default_value = "udp")]
+    turn_transport: String,
     #[arg(long = "gen", default_value_t = 0)]
     generation: u64,
     #[arg(long, default_value = "")]
@@ -104,8 +116,7 @@ struct Arguments {
     validate_vk_hashes: bool,
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
     std::panic::set_hook(Box::new(|_| {
         #[cfg(unix)]
         unsafe {
@@ -113,11 +124,21 @@ async fn main() {
             let _ = libc::write(libc::STDERR_FILENO, MESSAGE.as_ptr().cast(), MESSAGE.len());
         }
     }));
-    let failure = match tokio::spawn(run()).await {
-        Ok(Ok(())) => None,
-        Ok(Err(error)) => Some(format!("{error:#}")),
-        Err(error) => Some(format!("паника верхнего уровня изолирована: {error}")),
+    let arguments = Arguments::parse_from(normalized_arguments());
+    let runtime = match build_runtime(runtime_worker_threads(arguments.workers)) {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("[ФАТАЛ] {error:#}");
+            std::process::exit(1);
+        }
     };
+    let failure = runtime.block_on(async {
+        match tokio::spawn(run(arguments)).await {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(format!("{error:#}")),
+            Err(error) => Some(format!("паника верхнего уровня изолирована: {error}")),
+        }
+    });
     if let Some(failure) = failure {
         crate::log_error!("[ФАТАЛ] {failure}");
         let _ = logging::shutdown(Duration::from_secs(1));
@@ -125,8 +146,22 @@ async fn main() {
     }
 }
 
-async fn run() -> Result<()> {
-    let arguments = Arguments::parse_from(normalized_arguments());
+fn build_runtime(default_worker_threads: usize) -> Result<tokio::runtime::Runtime> {
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder.worker_threads(default_worker_threads);
+    builder
+        .enable_all()
+        .build()
+        .context("создание Tokio runtime")
+}
+
+fn runtime_worker_threads(requested_workers: usize) -> usize {
+    normalize_worker_count(requested_workers)
+        .div_ceil(STREAMS_PER_RUNTIME_WORKER)
+        .clamp(1, MAX_RUNTIME_WORKER_THREADS)
+}
+
+async fn run(arguments: Arguments) -> Result<()> {
     if arguments.validate_vk_hashes {
         return run_vk_hash_validation(&arguments).await;
     }
@@ -143,12 +178,20 @@ async fn run() -> Result<()> {
     }
     let peer = resolve_peer(&arguments.peer).await?;
     let mode = ObfsMode::parse(&arguments.obfs)?;
+    let turn_transport = TurnTransportMode::parse(&arguments.turn_transport)?;
     let wrap_key = derive_wrap_key(&arguments.password)?;
+    let session_profile = profiles::random_profile(&arguments.fingerprint);
     let mut js_calls = None;
     let mut js_credential_broker = None;
     let hash_source = if js_hash_mode {
         let bootstrap = read_vk_js_bootstrap().await?;
-        let started = vk_js_calls::start(bootstrap, &arguments.device_id, js_auth_mode).await?;
+        let started = vk_js_calls::start(
+            bootstrap,
+            &arguments.device_id,
+            js_auth_mode,
+            &session_profile,
+        )
+        .await?;
         let hashes = started.hashes.join(",");
         js_calls = Some(started.active);
         js_credential_broker = Some(started.credential_broker);
@@ -181,15 +224,23 @@ async fn run() -> Result<()> {
         .collect();
     let auth = Arc::new(VkAuth::new(
         &arguments.vk_auth_mode,
-        &arguments.fingerprint,
+        session_profile,
         &client_ids,
         captcha.clone(),
         js_credential_broker,
     ));
     let stats = Arc::new(Stats::default());
-    let paused = Arc::new(AtomicBool::new(false));
-    let control_task = start_control_input(cancel.clone(), paused.clone(), captcha, events.clone());
+    let paused = Arc::new(PauseGate::new());
+    let finish_js_calls = Arc::new(AtomicBool::new(false));
+    let control_task = start_control_input(
+        cancel.clone(),
+        paused.clone(),
+        captcha,
+        events.clone(),
+        finish_js_calls.clone(),
+    );
     let parent_task = start_parent_monitor(cancel.clone());
+    events.process(std::process::id());
     let pool = PacketPool::new(packet_pool_size(workers));
     let tun_uds = (!arguments.tun_uds.is_empty()).then_some(arguments.tun_uds.clone());
     let dispatcher_result = Dispatcher::start(
@@ -204,7 +255,7 @@ async fn run() -> Result<()> {
         Ok(value) => value,
         Err(error) => {
             if let Some(active) = js_calls.take() {
-                active.finish().await;
+                active.leave_creator().await;
             }
             return Err(error);
         }
@@ -214,6 +265,7 @@ async fn run() -> Result<()> {
         peer,
         turn_host: (!arguments.turn.is_empty()).then(|| Arc::from(arguments.turn.as_str())),
         turn_port: (!arguments.port.is_empty()).then(|| Arc::from(arguments.port.as_str())),
+        turn_transport,
         hashes: hashes.into(),
         wrap_key,
         mode,
@@ -222,6 +274,7 @@ async fn run() -> Result<()> {
         local_port: local_port.clone(),
         device_id: Arc::from(arguments.device_id.as_str()),
         password: Arc::from(arguments.password.as_str()),
+        workers,
     });
     print_configuration(
         &arguments,
@@ -230,7 +283,9 @@ async fn run() -> Result<()> {
         groups,
         params.hashes.len(),
         &local_port,
+        params.turn_transport,
     );
+    let repair = RepairState::new(workers);
     let stats_task = tokio::spawn(stats.clone().run(events.clone(), cancel.clone()));
     let (config_tx, mut config_rx) = tokio::sync::mpsc::channel::<String>(32);
     let config_events = events.clone();
@@ -241,6 +296,7 @@ async fn run() -> Result<()> {
                 continue;
             }
             if let Some(value) = config.strip_prefix("TUNCONF:") {
+                dns::mark_tunnel_active();
                 let mut fields = value.splitn(3, ':');
                 let ip = fields.next().unwrap_or_default();
                 let dns = fields.next().unwrap_or_default();
@@ -271,6 +327,8 @@ async fn run() -> Result<()> {
         ready_credential_tx,
         config_sent: Arc::new(AtomicBool::new(false)),
         config_in_flight: Arc::new(AtomicBool::new(false)),
+        repair,
+        shutdown: Arc::new(ShutdownCoordinator::new()),
         cancel: cancel.clone(),
     });
     let required_ready_bots = required_js_ready_bots(groups);
@@ -320,7 +378,11 @@ async fn run() -> Result<()> {
         let _ = task.await;
     }
     if let Some(active) = js_calls.take() {
-        active.finish().await;
+        if finish_js_calls.load(Ordering::Acquire) {
+            active.finish().await;
+        } else {
+            active.leave_creator().await;
+        }
     }
     shutdown_events.stopped();
     crate::log_error!("[КЛИЕНТ] Все воркеры завершены");
@@ -405,6 +467,7 @@ fn normalize_cli_argument(argument: String) -> String {
         "fingerprint",
         "client-ids",
         "obfs",
+        "turn-transport",
         "gen",
         "salt",
         "tun-uds",
@@ -498,9 +561,10 @@ async fn resolve_peer(peer: &str) -> Result<SocketAddr> {
 
 fn start_control_input(
     cancel: CancellationToken,
-    paused: Arc<AtomicBool>,
+    paused: Arc<PauseGate>,
     captcha: Arc<CaptchaSolver>,
     events: Events,
+    finish_js_calls: Arc<AtomicBool>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let control_required = events.enabled();
@@ -527,21 +591,21 @@ fn start_control_input(
                 },
             };
             let line = line.trim();
-            if !line.contains("error:tunnel stopped") {
+            client_perf::observe(client_perf::Stage::ControlStdin);
+            if !line.contains("error:tunnel stopped") && line != "FINISH_VK_CALLS" {
                 crate::log_error!("[STDIN] {line}");
             }
             match line {
-                "PAUSE" => paused.store(true, Ordering::Release),
-                "RESUME" => paused.store(false, Ordering::Release),
+                "PAUSE" => paused.set_paused(true),
+                "RESUME" => paused.set_paused(false),
+                "FINISH_VK_CALLS" => finish_js_calls.store(true, Ordering::Release),
                 "STOP" => {
                     crate::log_error!("[КЛИЕНТ] Получена команда STOP");
                     cancel.cancel();
                     return;
                 }
                 _ => {
-                    if line.starts_with("PATH_VALIDATE:") {
-                        path_validation::request();
-                    } else if let Some(result) = line.strip_prefix("CAPTCHA_RESULT|") {
+                    if let Some(result) = line.strip_prefix("CAPTCHA_RESULT|") {
                         if captcha.submit_result(result.to_owned()) {
                             crate::log_error!("[КАПЧА] Результат от Kotlin записан в канал");
                         } else {
@@ -584,6 +648,7 @@ fn print_configuration(
     groups: usize,
     hashes: usize,
     local_port: &str,
+    turn_transport: TurnTransportMode,
 ) {
     let captcha = match arguments.captcha_mode.as_str() {
         "wv" => "WBV selected in Android",
@@ -602,8 +667,9 @@ fn print_configuration(
         arguments.peer
     );
     crate::log_error!(
-        "[КЛИЕНТ] Протокол: UDP | WRAP: ON | obfs={}",
-        arguments.obfs
+        "[КЛИЕНТ] TURN: {} | WRAP: ON | obfs={}",
+        turn_transport.as_str(),
+        arguments.obfs,
     );
     crate::log_error!("[WRAP] WRAP Ключ вычислен ✓");
     crate::log_error!("[КЛИЕНТ] Device ID: {}", arguments.device_id);
@@ -622,7 +688,7 @@ mod worker_count_tests {
             assert_eq!(normalize_worker_count(workers), workers);
             assert_eq!(workers / WORKERS_PER_GROUP, groups);
         }
-        assert_eq!(normalize_worker_count(MAX_WORKERS), 162);
+        assert_eq!(normalize_worker_count(MAX_WORKERS), 126);
     }
 
     #[test]
@@ -635,30 +701,41 @@ mod worker_count_tests {
     }
 
     #[test]
+    fn runtime_thread_budget_follows_stream_budget() {
+        assert_eq!(runtime_worker_threads(9), 1);
+        assert_eq!(runtime_worker_threads(18), 2);
+        assert_eq!(runtime_worker_threads(27), 3);
+        assert_eq!(runtime_worker_threads(36), 3);
+        assert_eq!(runtime_worker_threads(45), 4);
+        assert_eq!(runtime_worker_threads(54), 4);
+        assert_eq!(runtime_worker_threads(126), 4);
+    }
+
+    #[test]
     fn hash_count_caps_native_worker_admission_to_twenty_seven_each() {
         assert_eq!(normalize_worker_count_for_hashes(usize::MAX, 1, false), 27);
         assert_eq!(normalize_worker_count_for_hashes(usize::MAX, 4, false), 108);
-        assert_eq!(normalize_worker_count_for_hashes(usize::MAX, 5, false), 135);
-        assert_eq!(normalize_worker_count_for_hashes(usize::MAX, 6, false), 162);
+        assert_eq!(normalize_worker_count_for_hashes(usize::MAX, 5, false), 126);
+        assert_eq!(normalize_worker_count_for_hashes(usize::MAX, 6, false), 126);
         assert_eq!(
             normalize_worker_count_for_hashes(usize::MAX, 100, false),
-            162
+            126
         );
     }
 
     #[test]
     fn automatic_call_failure_may_redistribute_complete_groups() {
-        assert_eq!(normalize_worker_count_for_hashes(162, 5, true), 162);
+        assert_eq!(normalize_worker_count_for_hashes(162, 5, true), 126);
         assert_eq!(normalize_worker_count_for_hashes(54, 1, true), 54);
         assert_eq!(normalize_worker_count_for_hashes(50, 1, true), 45);
     }
 
     #[test]
     fn auto_js_account_auth_supports_nine_credentials_in_one_call() {
-        assert_eq!(normalize_worker_count_for_hashes(162, 1, true), 162);
-        assert_eq!(
-            MAX_WORKERS.div_ceil(worker::WORKERS_PER_CREDENTIAL),
-            vk_js_calls::MAX_ACCOUNT_CREDENTIALS
+        assert_eq!(normalize_worker_count_for_hashes(162, 1, true), 126);
+        assert!(
+            MAX_WORKERS.div_ceil(worker::WORKERS_PER_CREDENTIAL)
+                <= vk_js_calls::MAX_ACCOUNT_CREDENTIALS
         );
     }
 
@@ -675,7 +752,7 @@ mod worker_count_tests {
         assert_eq!(required_js_ready_bots(1), 1);
         assert_eq!(required_js_ready_bots(2), 1);
         assert_eq!(required_js_ready_bots(3), 2);
-        assert_eq!(required_js_ready_bots(18), 2);
+        assert_eq!(required_js_ready_bots(13), 2);
     }
 
     #[test]

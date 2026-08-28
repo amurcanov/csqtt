@@ -73,7 +73,7 @@ impl std::error::Error for CallUnavailable {}
 pub struct VkAuth {
     mode: Arc<str>,
     auto_js: Option<Arc<CredentialBroker>>,
-    fingerprint: Arc<str>,
+    profile: Profile,
     credentials: Arc<[VkCredentials]>,
     captcha: Arc<CaptchaSolver>,
     captcha_lockout_until: AtomicI64,
@@ -89,7 +89,7 @@ struct LegacyAttempt<'a> {
 impl VkAuth {
     pub fn new(
         mode: &str,
-        fingerprint: &str,
+        profile: Profile,
         client_ids: &[String],
         captcha: Arc<CaptchaSolver>,
         auto_js: Option<Arc<CredentialBroker>>,
@@ -104,7 +104,7 @@ impl VkAuth {
         Self {
             mode: Arc::from(mode),
             auto_js,
-            fingerprint: Arc::from(fingerprint),
+            profile,
             credentials: load_credentials(client_ids).into(),
             captcha,
             captcha_lockout_until: AtomicI64::new(0),
@@ -181,7 +181,7 @@ impl VkAuth {
                 credential.client_id,
                 attempt + 1
             );
-            let profile = random_profile(&self.fingerprint);
+            let profile = self.profile.clone();
             let client = browser_client_for_profile(cookie_jar.clone(), &profile)?;
             let captcha_client = captcha_client_for_profile(cookie_jar.clone(), &profile)?;
             let saved_profile = load_saved_profile();
@@ -244,9 +244,6 @@ impl VkAuth {
                     return Ok(credentials);
                 }
                 Err(error) if error.downcast_ref::<CallUnavailable>().is_some() => {
-                    crate::log_error!(
-                        "[STREAM {stream_id}] [VK Auth] VK Calls path returned non-retryable call error: {error}"
-                    );
                     return Err(error);
                 }
                 Err(error) => {
@@ -264,7 +261,7 @@ impl VkAuth {
         if std::env::var("VK_SKIP_VKCALLS").as_deref() == Ok("1") {
             bail!("step=preflight kind=skipped: disabled by VK_SKIP_VKCALLS=1");
         }
-        let profile = random_profile(&self.fingerprint);
+        let profile = self.profile.clone();
         let client = browser_client_for_profile(Arc::new(Jar::default()), &profile)?;
         let device_id = Uuid::new_v4().to_string();
         let name = generate_name();
@@ -454,9 +451,10 @@ pub async fn check_vk_hashes(
     _client_ids: &[String],
     hashes: &[String],
 ) -> Vec<(String, VkHashCheck)> {
+    let profile = random_profile(fingerprint);
     let mut results = Vec::with_capacity(hashes.len());
     for (index, hash) in hashes.iter().enumerate() {
-        let result = check_vk_hash(fingerprint, hash).await;
+        let result = check_vk_hash(&profile, hash).await;
         results.push((hash.clone(), result));
         if index + 1 < hashes.len() {
             random_delay(180, 260).await;
@@ -465,10 +463,10 @@ pub async fn check_vk_hashes(
     results
 }
 
-async fn check_vk_hash(fingerprint: &str, hash: &str) -> VkHashCheck {
+async fn check_vk_hash(profile: &Profile, hash: &str) -> VkHashCheck {
     let mut last_error = None;
     for _ in 0..2 {
-        match check_vk_hash_attempt(fingerprint, hash).await {
+        match check_vk_hash_attempt(profile, hash).await {
             Ok(result) => return result,
             Err(error) => last_error = Some(format!("{error:#}")),
         }
@@ -479,9 +477,8 @@ async fn check_vk_hash(fingerprint: &str, hash: &str) -> VkHashCheck {
     }
 }
 
-async fn check_vk_hash_attempt(fingerprint: &str, hash: &str) -> Result<VkHashCheck> {
-    let profile = random_profile(fingerprint);
-    let client = browser_client_for_profile(Arc::new(Jar::default()), &profile)?;
+async fn check_vk_hash_attempt(profile: &Profile, hash: &str) -> Result<VkHashCheck> {
+    let client = browser_client_for_profile(Arc::new(Jar::default()), profile)?;
     let device_id = Uuid::new_v4().to_string();
     let name = generate_name();
     let link_url = query_escape(&format!("https://vk.com/call/join/{hash}"));
@@ -489,7 +486,7 @@ async fn check_vk_hash_attempt(fingerprint: &str, hash: &str) -> Result<VkHashCh
     let token_url = format!(
         "https://{VK_CALLS_API_HOST}/method/auth.getAnonymToken?v={VK_CALLS_API_VERSION}&client_id={VK_CONNECT_CLIENT_ID}&link={link_url}&device_id={device_id}&anonymName={name_encoded}&lang=en"
     );
-    let token_response = post_empty(&client, &token_url, &profile).await?;
+    let token_response = post_empty(&client, &token_url, profile).await?;
     if let Some(result) = classify_vk_hash_error(&token_response)? {
         return Ok(result);
     }
@@ -497,7 +494,7 @@ async fn check_vk_hash_attempt(fingerprint: &str, hash: &str) -> Result<VkHashCh
     let preview_url = format!(
         "https://{VK_CALLS_API_HOST}/method/messages.getCallPreview?v={VK_CALLS_API_VERSION}&anonymous_token={anonymous_token}&device_id={device_id}&extended=1&fields=first_name,last_name,photo_200&lang=en&link={link_url}"
     );
-    let preview_response = post_empty(&client, &preview_url, &profile).await?;
+    let preview_response = post_empty(&client, &preview_url, profile).await?;
     if let Some(result) = classify_vk_hash_error(&preview_response)? {
         return Ok(result);
     }
@@ -801,7 +798,8 @@ pub(crate) fn parse_turn_credentials(response: &Value) -> Result<TurnCredentials
         .context("missing or empty urls in turn_server")?
         .iter()
         .filter_map(Value::as_str)
-        .filter_map(udp_turn_authority)
+        .map(str::trim)
+        .filter(|value| crate::turn_endpoint::is_supported_turn_uri(value))
         .map(Arc::from)
         .collect();
     if addresses.is_empty() {
@@ -812,30 +810,6 @@ pub(crate) fn parse_turn_credentials(response: &Value) -> Result<TurnCredentials
         password,
         server_addresses: addresses.into(),
     })
-}
-
-fn udp_turn_authority(value: &str) -> Option<&str> {
-    let value = value.trim();
-    let lower = value.to_ascii_lowercase();
-    if lower.starts_with("turns:") {
-        return None;
-    }
-    let value = if lower.starts_with("turn:") {
-        &value["turn:".len()..]
-    } else {
-        value
-    };
-    let (authority, query) = value.split_once('?').unwrap_or((value, ""));
-    if authority.is_empty() {
-        return None;
-    }
-    for parameter in query.split('&').filter(|parameter| !parameter.is_empty()) {
-        let (key, value) = parameter.split_once('=').unwrap_or((parameter, ""));
-        if key.eq_ignore_ascii_case("transport") && !value.eq_ignore_ascii_case("udp") {
-            return None;
-        }
-    }
-    Some(authority)
 }
 
 fn json_string<'a>(value: &'a Value, path: &[&str]) -> Result<&'a str> {
@@ -1051,9 +1025,13 @@ mod tests {
         let firefox = random_profile("firefox");
         let safari = random_profile("safari");
         let chrome = random_profile("chrome");
+        let edge = random_profile("edge");
+        let opera = random_profile("opera");
         let (fb, _fo) = browser_identity(&firefox);
         let (sb, _so) = browser_identity(&safari);
         let (cb, _co) = browser_identity(&chrome);
+        let (eb, _eo) = browser_identity(&edge);
+        let (ob, _oo) = browser_identity(&opera);
         assert!(
             matches!(
                 fb,
@@ -1086,6 +1064,31 @@ mod tests {
             cb
         );
         assert!(
+            matches!(
+                eb,
+                Impersonate::EdgeV144
+                    | Impersonate::EdgeV145
+                    | Impersonate::EdgeV146
+                    | Impersonate::EdgeV147
+                    | Impersonate::EdgeV148
+            ),
+            "Edge profile should have Edge impersonate, got {:?}",
+            eb
+        );
+        assert!(
+            matches!(
+                ob,
+                Impersonate::OperaV126
+                    | Impersonate::OperaV127
+                    | Impersonate::OperaV128
+                    | Impersonate::OperaV129
+                    | Impersonate::OperaV130
+                    | Impersonate::OperaV131
+            ),
+            "Opera profile should have Opera impersonate, got {:?}",
+            ob
+        );
+        assert!(
             browser_headers(&firefox)
                 .unwrap()
                 .get("sec-ch-ua")
@@ -1097,7 +1100,11 @@ mod tests {
                 .get("sec-ch-ua-platform")
                 .is_none()
         );
-        assert_eq!(_so, ImpersonateOS::MacOS, "Safari profile should be macOS");
+        assert!(
+            matches!(_so, ImpersonateOS::MacOS | ImpersonateOS::IOS),
+            "Safari profile should use an Apple platform, got {:?}",
+            _so
+        );
     }
 
     #[test]
@@ -1110,7 +1117,7 @@ mod tests {
     }
 
     #[test]
-    fn turn_credentials_keep_only_udp_endpoints_from_mixed_vk_list() {
+    fn turn_credentials_keep_all_standard_turn_endpoints_from_mixed_vk_list() {
         let credentials = parse_turn_credentials(&serde_json::json!({
             "turn_server": {
                 "username": "user",
@@ -1132,15 +1139,17 @@ mod tests {
                 .map(AsRef::as_ref)
                 .collect::<Vec<&str>>(),
             vec![
-                "udp-one.example:3478",
+                "turn:udp-one.example:3478?transport=udp",
+                "turn:tcp.example:3478?transport=tcp",
+                "turns:tls.example:5349?transport=tcp",
                 "udp-two.example:3478",
-                "udp-three.example:3478"
+                "TURN:udp-three.example:3478?TRANSPORT=UDP"
             ]
         );
     }
 
     #[test]
-    fn turn_credentials_fail_when_vk_returns_no_udp_endpoint() {
+    fn turn_credentials_accept_tcp_tls_only_turn_lists() {
         let result = parse_turn_credentials(&serde_json::json!({
             "turn_server": {
                 "username": "user",
@@ -1151,6 +1160,6 @@ mod tests {
                 ]
             }
         }));
-        assert!(result.is_err());
+        assert!(result.is_ok());
     }
 }

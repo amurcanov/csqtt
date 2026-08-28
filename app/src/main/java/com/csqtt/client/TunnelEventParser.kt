@@ -11,24 +11,17 @@ object TunnelEventParser {
     sealed class Event {
         data class Started(val message: String = "") : Event()
         data class Stopped(val message: String = "") : Event()
+        data class Process(val pid: Int) : Event()
         data class Ready(val worker: Int, val message: String = "") : Event()
         data class ActiveZero(val message: String = "") : Event()
+        data class CallUnavailable(val hash: String, val code: Int) : Event()
+        data object NetworkSuspect : Event()
         data object ServerRestart : Event()
         data class Config(val config: String) : Event()
         data class Stats(
             val active: Int,
             val bytesUp: Long,
             val bytesDown: Long
-        ) : Event()
-
-        data class PathHealth(
-            val active: Int,
-            val sent: Long,
-            val acked: Long,
-            val missed: Long,
-            val sendErrors: Long,
-            val unresponsive: Long,
-            val schedulerResets: Long,
         ) : Event()
 
         data class Error(
@@ -67,11 +60,22 @@ object TunnelEventParser {
         return when (type) {
             "STARTED" -> Event.Started(payload.optString("message", ""))
             "STOPPED" -> Event.Stopped(payload.optString("message", ""))
+            "PROCESS" -> payload.optInt("pid", 0)
+                .takeIf { it > 0 }
+                ?.let { Event.Process(it) }
             "READY" -> Event.Ready(
-                worker = payload.optInt("worker", 0).coerceIn(0, 162),
+                worker = payload.optInt("worker", 0).coerceIn(0, CsqttConstants.Tunnel.MAX_WORKERS),
                 message = payload.optString("message", ""),
             )
             "ACTIVE_ZERO" -> Event.ActiveZero(payload.optString("message", ""))
+            "CALL_UNAVAILABLE" -> {
+                val hash = payload.optString("hash", "").trim()
+                if (hash.isBlank()) null else Event.CallUnavailable(
+                    hash = hash,
+                    code = payload.optInt("code", 951).coerceAtLeast(0),
+                )
+            }
+            "NETWORK_SUSPECT" -> Event.NetworkSuspect
             "SERVER_RESTART" -> if (payload.optString("source", "") == "panel") {
                 Event.ServerRestart
             } else {
@@ -82,15 +86,6 @@ object TunnelEventParser {
                 active = payload.optInt("active", 0).coerceAtLeast(0),
                 bytesUp = payload.optLong("bytes_up", 0L).coerceAtLeast(0L),
                 bytesDown = payload.optLong("bytes_down", 0L).coerceAtLeast(0L)
-            )
-            "PATH_HEALTH" -> Event.PathHealth(
-                active = payload.optInt("active", 0).coerceAtLeast(0),
-                sent = payload.optLong("sent", 0L).coerceAtLeast(0L),
-                acked = payload.optLong("acked", 0L).coerceAtLeast(0L),
-                missed = payload.optLong("missed", 0L).coerceAtLeast(0L),
-                sendErrors = payload.optLong("send_errors", 0L).coerceAtLeast(0L),
-                unresponsive = payload.optLong("unresponsive", 0L).coerceAtLeast(0L),
-                schedulerResets = payload.optLong("scheduler_resets", 0L).coerceAtLeast(0L),
             )
             "ERROR" -> Event.Error(
                 code = payload.optString("code", ""),

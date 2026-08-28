@@ -10,11 +10,11 @@ import androidx.compose.ui.unit.dp
 
 @Immutable
 object CsqttShapes {
-    val Small = RoundedCornerShape(16.dp)
-    val Control = RoundedCornerShape(20.dp)
-    val Card = RoundedCornerShape(26.dp)
-    val LargeCard = RoundedCornerShape(28.dp)
-    val Dialog = RoundedCornerShape(32.dp)
+    val Small = RoundedCornerShape(22.dp)
+    val Control = RoundedCornerShape(percent = 50)
+    val Card = RoundedCornerShape(34.dp)
+    val LargeCard = RoundedCornerShape(42.dp)
+    val Dialog = RoundedCornerShape(40.dp)
     val Pill = RoundedCornerShape(percent = 50)
 }
 

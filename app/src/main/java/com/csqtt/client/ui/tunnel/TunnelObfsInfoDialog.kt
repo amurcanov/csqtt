@@ -9,7 +9,6 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.MaterialTheme
@@ -22,6 +21,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import com.csqtt.client.ui.design.CsqttShapes
 
 @Composable
 internal fun ObfsInfoDialog(mode: String? = null, onDismiss: () -> Unit) {
@@ -41,7 +41,7 @@ internal fun ObfsInfoDialog(mode: String? = null, onDismiss: () -> Unit) {
             • В конце пакета добавляется аутентификационный тег HMAC-SHA1 длиной 10 байт, что полностью соответствует спецификации SRTP.
             • Дополняется случайным паддингом до 60 байт.
             
-            На проводе это полностью идентично защищённому видеопотоку WebRTC (videowebrtc SNI).
+            На проводе полезная нагрузка имеет формат, близкий к защищённому видеопотоку SRTP. Этот режим не подменяет TLS SNI или сертификаты TURN.
         """.trimIndent()
         else -> "Маскировка трафика" to """
             • По умолчанию используется «Средняя» маскировка.
@@ -55,7 +55,7 @@ internal fun ObfsInfoDialog(mode: String? = null, onDismiss: () -> Unit) {
         properties = DialogProperties(usePlatformDefaultWidth = false),
     ) {
         Surface(
-            shape = RoundedCornerShape(28.dp),
+            shape = CsqttShapes.Dialog,
             color = MaterialTheme.colorScheme.surface,
             contentColor = MaterialTheme.colorScheme.onSurface,
             tonalElevation = 6.dp,
@@ -76,7 +76,7 @@ internal fun ObfsInfoDialog(mode: String? = null, onDismiss: () -> Unit) {
                 Button(
                     onClick = onDismiss,
                     modifier = Modifier.fillMaxWidth().height(48.dp),
-                    shape = RoundedCornerShape(16.dp),
+                    shape = CsqttShapes.Pill,
                     colors = ButtonDefaults.buttonColors(contentColor = MaterialTheme.colorScheme.onPrimary),
                 ) {
                     Text("Понятно", fontWeight = FontWeight.SemiBold)

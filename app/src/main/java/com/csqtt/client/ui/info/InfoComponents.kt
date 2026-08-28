@@ -10,6 +10,7 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.text.TextAutoSize
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -24,7 +25,6 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.material.icons.filled.KeyboardArrowDown
@@ -45,55 +45,77 @@ import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.csqtt.client.CSQTTColors
 import com.csqtt.client.R
+import com.csqtt.client.ui.design.CsqttShapes
 import com.csqtt.client.ui.design.CsqttSpacing
 
-import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.ui.graphics.Brush
-import androidx.compose.ui.graphics.luminance
 
 import androidx.compose.material.icons.filled.Favorite
 
 @Composable
 internal fun InfoHeroCard(
     currentVersion: String,
+    onSupportClick: () -> Unit,
     onCryptoClick: () -> Unit,
 ) {
     val colors = MaterialTheme.colorScheme
-    val isDark = colors.background.luminance() < 0.22f
 
-    Surface(
-        shape = RoundedCornerShape(26.dp),
-        color = if (isDark) colors.surfaceVariant.copy(alpha = 0.45f) else colors.surface,
-        border = BorderStroke(1.dp, colors.primary.copy(alpha = if (isDark) 0.30f else 0.18f)),
-        shadowElevation = if (isDark) 0.dp else 2.dp,
-        modifier = Modifier.fillMaxWidth()
+    AppSectionCard(
+        contentPadding = PaddingValues(20.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(20.dp),
+            modifier = Modifier.fillMaxWidth(),
             verticalArrangement = Arrangement.spacedBy(12.dp),
-            horizontalAlignment = Alignment.CenterHorizontally
+            horizontalAlignment = Alignment.CenterHorizontally,
         ) {
             Text(
                 text = "Поддержать разработчика Amurcanov",
                 style = MaterialTheme.typography.titleMedium,
                 fontWeight = FontWeight.Bold,
                 color = colors.onSurface,
-                textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                maxLines = 1,
+                softWrap = false,
+                overflow = TextOverflow.Clip,
+                autoSize = TextAutoSize.StepBased(
+                    minFontSize = 12.sp,
+                    maxFontSize = MaterialTheme.typography.titleMedium.fontSize,
+                    stepSize = 0.5.sp,
+                ),
+                modifier = Modifier.fillMaxWidth(),
             )
+
+            Button(
+                onClick = onSupportClick,
+                modifier = Modifier.fillMaxWidth().height(52.dp),
+                shape = CsqttShapes.Pill,
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = CSQTTColors.donate,
+                    contentColor = Color.White,
+                ),
+                contentPadding = PaddingValues(horizontal = 16.dp)
+            ) {
+                Icon(
+                    painter = painterResource(R.drawable.ic_yoomoney),
+                    contentDescription = "ЮMoney",
+                    tint = Color.Unspecified,
+                    modifier = Modifier.height(26.dp)
+                )
+            }
 
             Button(
                 onClick = onCryptoClick,
                 modifier = Modifier.fillMaxWidth().height(52.dp),
-                shape = RoundedCornerShape(18.dp),
+                shape = CsqttShapes.Pill,
                 colors = ButtonDefaults.buttonColors(
                     containerColor = Color(0xFF1E293B),
                     contentColor = Color.White,
@@ -131,13 +153,13 @@ internal fun ExpandableSectionCard(
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .clip(RoundedCornerShape(24.dp))
+                .clip(CsqttShapes.Control)
                 .clickable(onClick = onToggle)
                 .padding(vertical = 2.dp),
             horizontalArrangement = Arrangement.spacedBy(12.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            Surface(shape = RoundedCornerShape(18.dp), color = MaterialTheme.colorScheme.primaryContainer) {
+            Surface(shape = CsqttShapes.Pill, color = MaterialTheme.colorScheme.primaryContainer) {
                 Box(modifier = Modifier.size(40.dp), contentAlignment = Alignment.Center) { icon() }
             }
             Text(
@@ -176,17 +198,17 @@ internal fun WideActionTile(
     icon: @Composable () -> Unit,
 ) {
     Surface(
-        shape = RoundedCornerShape(24.dp),
+        shape = CsqttShapes.Card,
         color = MaterialTheme.colorScheme.surface.copy(alpha = 0.70f),
         contentColor = MaterialTheme.colorScheme.onSurface,
-        modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(24.dp)).clickable(onClick = onClick),
+        modifier = Modifier.fillMaxWidth().clip(CsqttShapes.Card).clickable(onClick = onClick),
     ) {
         Row(
             modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 15.dp),
             horizontalArrangement = Arrangement.spacedBy(12.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            Surface(shape = RoundedCornerShape(16.dp), color = MaterialTheme.colorScheme.primaryContainer) {
+            Surface(shape = CsqttShapes.Pill, color = MaterialTheme.colorScheme.primaryContainer) {
                 Box(modifier = Modifier.size(40.dp), contentAlignment = Alignment.Center) { icon() }
             }
             Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
@@ -216,17 +238,17 @@ internal fun ProjectLinkRow(
     icon: @Composable () -> Unit,
 ) {
     Surface(
-        shape = RoundedCornerShape(24.dp),
+        shape = CsqttShapes.Card,
         color = MaterialTheme.colorScheme.surface.copy(alpha = 0.64f),
         contentColor = MaterialTheme.colorScheme.onSurface,
-        modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(24.dp)).clickable(onClick = onClick),
+        modifier = Modifier.fillMaxWidth().clip(CsqttShapes.Card).clickable(onClick = onClick),
     ) {
         Row(
             modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 14.dp),
             horizontalArrangement = Arrangement.spacedBy(12.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            Surface(shape = RoundedCornerShape(16.dp), color = MaterialTheme.colorScheme.primaryContainer) {
+            Surface(shape = CsqttShapes.Pill, color = MaterialTheme.colorScheme.primaryContainer) {
                 Box(
                     modifier = Modifier.defaultMinSize(minWidth = 40.dp, minHeight = 40.dp),
                     contentAlignment = Alignment.Center,

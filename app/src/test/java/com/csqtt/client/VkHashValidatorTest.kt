@@ -38,6 +38,19 @@ class VkHashValidatorTest {
     }
 
     @Test
+    fun invalidHashIsRetainedForUiButExcludedFromTunnelSource() {
+        val active = "active-hash-123456"
+        val invalid = "invalid-hash-1234"
+        val results = mapOf(invalid to VkHashValidationStatus.Invalid)
+
+        assertEquals(
+            listOf(active),
+            VkHashValidationCodec.active(listOf(active, invalid, active), results),
+        )
+        assertEquals(VkHashValidationStatus.Invalid, results[invalid])
+    }
+
+    @Test
     fun processOutputAcceptsOnlyFinalValidOrInvalidStates() {
         val valid = VkHashValidator.parseOutputLine(
             "HASH_CHECK:{\"hash\":\"hash-123456789012\",\"status\":\"valid\"}",

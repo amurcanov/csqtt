@@ -2,9 +2,10 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 
 use crate::auth::{TurnCredentials, parse_turn_credentials};
+use crate::profiles::Profile;
 use anyhow::{Context, Result, bail};
 use primp::{
-    Client, Impersonate, ImpersonateOS,
+    Client,
     header::{self, HeaderMap, HeaderValue},
 };
 use serde::Deserialize;
@@ -64,13 +65,14 @@ pub async fn start(
     bootstrap: Bootstrap,
     device_id: &str,
     multiple_devices: bool,
+    profile: &Profile,
 ) -> Result<StartedCalls> {
     if bootstrap.token.trim().is_empty() {
         bail!("VK access token отсутствует");
     }
     let client = Client::builder()
-        .impersonate(Impersonate::EdgeV148)
-        .impersonate_os(ImpersonateOS::Windows)
+        .impersonate(profile.impersonate)
+        .impersonate_os(profile.os)
         .timeout(Duration::from_secs(15))
         .connect_timeout(Duration::from_secs(8))
         .redirect(primp::redirect::Policy::limited(5))

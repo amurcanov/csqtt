@@ -453,8 +453,10 @@ impl CaptchaSession<'_> {
         let input = page.pow_input.clone();
         let difficulty = page.pow_difficulty;
         let cancel = self.cancel.clone();
-        let hash =
-            tokio::task::spawn_blocking(move || solve_pow(&input, difficulty, &cancel)).await??;
+        let hash = crate::cpu_task::run("csqtt-captcha-pow", move || {
+            solve_pow(&input, difficulty, &cancel)
+        })
+        .await?;
         crate::log_error!("[КАПЧА] v2 pow solved");
         let base = base_values(&captcha.session_token);
         self.request("captchaNotRobot.settings", &base)
@@ -830,26 +832,27 @@ fn parse_page(html: &str) -> Result<CaptchaPage> {
         .and_then(|regex| regex.captures(html))
         .and_then(|captures| captures[1].parse().ok())
         .unwrap_or_default();
-    if pow_input.is_empty() {
-        if let Some(captures) = POW_OBFUSCATED.as_ref().and_then(|regex| regex.captures(html)) {
-            pow_input = captures[1].to_owned();
-            pow_difficulty = captures[2].parse().unwrap_or(4);
-        }
+    if pow_input.is_empty()
+        && let Some(captures) = POW_OBFUSCATED
+            .as_ref()
+            .and_then(|regex| regex.captures(html))
+    {
+        pow_input = captures[1].to_owned();
+        pow_difficulty = captures[2].parse().unwrap_or(4);
     }
-    if let Some(init) = &init {
-        if pow_input.is_empty()
-            && let Some(setting) = init
-                .data
-                .captcha_settings
-                .iter()
-                .find(|setting| setting.kind == "pow")
-        {
-            pow_input = if setting.settings.is_empty() {
-                setting.settings_key.clone()
-            } else {
-                setting.settings.clone()
-            };
-        }
+    if let Some(init) = &init
+        && pow_input.is_empty()
+        && let Some(setting) = init
+            .data
+            .captcha_settings
+            .iter()
+            .find(|setting| setting.kind == "pow")
+    {
+        pow_input = if setting.settings.is_empty() {
+            setting.settings_key.clone()
+        } else {
+            setting.settings.clone()
+        };
     }
     if !pow_input.is_empty() && pow_difficulty == 0 {
         pow_difficulty = 4;
@@ -910,12 +913,28 @@ fn extract_window_init(html: &str) -> Result<String> {
     bail!("unbalanced braces in captcha init json")
 }
 
+// Difficulty comes from server HTML; a hostile value would otherwise build a
+// multi-megabyte target string before burning the full nonce range.
+const MAX_POW_DIFFICULTY: usize = 8;
+
+fn hash_meets_target(digest: &[u8], difficulty: usize) -> bool {
+    // Hex target is `difficulty` leading '0' chars == that many leading
+    // zero bits (high nibble first), checked without per-nonce allocation.
+    let full_bytes = difficulty / 2;
+    if digest[..full_bytes].iter().any(|byte| *byte != 0) {
+        return false;
+    }
+    difficulty.is_multiple_of(2) || digest[full_bytes] & 0xF0 == 0
+}
+
 fn solve_pow(input: &str, difficulty: usize, cancel: &CancellationToken) -> Result<String> {
     std::thread::sleep(Duration::from_millis(rand::rng().random_range(200..500)));
     if input.is_empty() || difficulty == 0 {
         bail!("captcha pow failed");
     }
-    let target = "0".repeat(difficulty);
+    if difficulty > MAX_POW_DIFFICULTY {
+        bail!("captcha pow difficulty too high: {difficulty}");
+    }
     let mut source = Vec::with_capacity(input.len() + 8);
     for nonce in 0..=10_000_000u32 {
         if nonce % 4096 == 0 && cancel.is_cancelled() {
@@ -925,9 +944,8 @@ fn solve_pow(input: &str, difficulty: usize, cancel: &CancellationToken) -> Resu
         source.extend_from_slice(input.as_bytes());
         source.extend_from_slice(nonce.to_string().as_bytes());
         let digest = Sha256::digest(&source);
-        let hash = hex::encode(digest);
-        if hash.starts_with(&target) {
-            return Ok(hash);
+        if hash_meets_target(&digest, difficulty) {
+            return Ok(hex::encode(digest));
         }
     }
     bail!("captcha pow failed")

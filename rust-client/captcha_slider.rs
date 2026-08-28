@@ -9,7 +9,6 @@ use anyhow::{Result, anyhow, bail};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use image::{DynamicImage, GenericImageView, Pixel, Rgba};
 use rand::RngExt;
-use rayon::prelude::*;
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::cmp::Ordering;
@@ -62,8 +61,10 @@ pub(crate) async fn solve_slider(
     let size = puzzle.size;
     let swaps = puzzle.swaps;
     let attempts = puzzle.attempts;
-    let guesses =
-        tokio::task::spawn_blocking(move || rank_guesses(&puzzle.image, size, &swaps)).await??;
+    let guesses = crate::cpu_task::run("csqtt-captcha-slider", move || {
+        rank_guesses(&puzzle.image, size, &swaps)
+    })
+    .await?;
     let limit = attempts.min(guesses.len());
     if limit == 0 {
         bail!("slider has no attempts available");
@@ -159,12 +160,16 @@ fn parse_number(value: &Value) -> Result<usize> {
     bail!("invalid numeric value: {value}")
 }
 
+// Real slider puzzles are 3..8 tiles per side; anything larger is either a
+// protocol change or hostile input that would allocate a huge swap mapping.
+const MAX_SLIDER_GRID: usize = 16;
+
 fn split_steps(steps: &[usize]) -> Result<(usize, Vec<usize>, usize)> {
     if steps.len() < 3 {
         bail!("slider steps payload too short");
     }
     let size = steps[0];
-    if size == 0 {
+    if size == 0 || size > MAX_SLIDER_GRID {
         bail!("invalid slider size: {size}");
     }
     let mut tail = steps[1..].to_vec();
@@ -217,7 +222,7 @@ fn rank_guesses(
         .take(candidate_count.min(12))
         .collect();
     let computed: Vec<Result<(usize, u64, f64)>> = stage_two
-        .par_iter()
+        .iter()
         .map(|&index| {
             let mapping = apply_swaps(grid_size, &guesses[index].swaps)?;
             let (rgb, text) = seam_score_rgb_text(image, grid_size, &mapping);
@@ -314,8 +319,13 @@ fn tile_rect(image: &DynamicImage, grid_size: usize, index: usize) -> Rect {
 fn sample(image: &DynamicImage, destination: Rect, source: Rect, x: u32, y: u32) -> Rgba<u8> {
     let width = destination.width().max(1);
     let height = destination.height().max(1);
-    let source_x = source.min_x + (x - destination.min_x) * source.width() / width;
-    let source_y = source.min_y + (y - destination.min_y) * source.height() / height;
+    // Rect math can round past the image edge when the grid exceeds the
+    // bitmap; get_pixel would panic there, so clamp to the last pixel.
+    let (image_width, image_height) = image.dimensions();
+    let source_x = (source.min_x + (x - destination.min_x) * source.width() / width)
+        .min(image_width.saturating_sub(1));
+    let source_y = (source.min_y + (y - destination.min_y) * source.height() / height)
+        .min(image_height.saturating_sub(1));
     image.get_pixel(source_x, source_y).to_rgba()
 }
 

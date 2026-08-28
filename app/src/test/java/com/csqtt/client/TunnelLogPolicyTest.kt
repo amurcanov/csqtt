@@ -3,20 +3,12 @@
 
 package com.csqtt.client
 
-import org.junit.Assert.assertFalse
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class TunnelLogPolicyTest {
-    @Test
-    fun hidesHealthyPathChecksAndSurfacesFailures() {
-        assertFalse(TunnelLogPolicy.shouldSurfacePathHealth(0, 0, 0))
-        assertTrue(TunnelLogPolicy.shouldSurfacePathHealth(1, 0, 0))
-        assertTrue(TunnelLogPolicy.shouldSurfacePathHealth(0, 1, 0))
-        assertTrue(TunnelLogPolicy.shouldSurfacePathHealth(0, 0, 1))
-    }
-
     @Test
     fun removesStatusStickersFromVisibleLogs() {
         assertEquals(
@@ -27,6 +19,17 @@ class TunnelLogPolicyTest {
         assertEquals("✗ Ошибка VPN", withoutLogStickers("✗ Ошибка VPN"))
         assertEquals("Сервис запущен", withoutLogStickers("[✅] Сервис запущен"))
         assertEquals("[СЕТЬ] Переподключение", withoutLogStickers("[СЕТЬ] ⚠ Переподключение"))
+    }
+
+    @Test
+    fun inactiveLoggingKeepsOnlyReadyStatsAndErrors() {
+        assertTrue(TunnelLogPolicy.isAllowedWhenInactiveLogging("ready", false, LogLevel.OK))
+        assertTrue(TunnelLogPolicy.isAllowedWhenInactiveLogging("stats", false, LogLevel.NET))
+        assertTrue(TunnelLogPolicy.isAllowedWhenInactiveLogging("turn_error", true, LogLevel.ERR))
+        assertTrue(TunnelLogPolicy.isAllowedWhenInactiveLogging("general_error", true, null))
+        assertFalse(TunnelLogPolicy.isAllowedWhenInactiveLogging("turn_refresh_status", false, LogLevel.LOG))
+        assertFalse(TunnelLogPolicy.isAllowedWhenInactiveLogging("wrap_status", false, LogLevel.OK))
+        assertFalse(TunnelLogPolicy.isAllowedWhenInactiveLogging("vk_js_call_progress", false, LogLevel.OK))
     }
 
     @Test
@@ -42,13 +45,13 @@ class TunnelLogPolicyTest {
     }
 
     @Test
-    fun hidesTurnRetriesThatKeepTheStreamAlive() {
-        assertTrue(
+    fun exposesTurnRetriesThatKeepTheStreamAlive() {
+        assertFalse(
             TunnelLogPolicy.isInternalRecovery(
                 "[TURN][RETRY] Ошибка обновления permission: timeout"
             )
         )
-        assertTrue(
+        assertFalse(
             TunnelLogPolicy.isInternalRecovery(
                 "[TURN][RETRY] Ошибка транзакции ChannelBind: timeout"
             )
@@ -63,7 +66,7 @@ class TunnelLogPolicyTest {
                 "[ВОРКЕР #17] PEER_LIVENESS_TIMEOUT: 8s без валидных пакетов"
             )
         )
-        assertTrue(
+        assertFalse(
             TunnelLogPolicy.isInternalRecovery(
                 "[ВОРКЕР #2] [TURN][RETRY] Попытка 46: TURN liveness probe failed"
             )

@@ -28,6 +28,10 @@ class SecureStringStore(context: Context) {
         KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
     }
 
+    // Keystore crypto costs an IPC round-trip; DataStore re-emits the whole
+    // preferences object on every edit, so unchanged ciphertexts are memoized.
+    private val decryptCache = java.util.concurrent.ConcurrentHashMap<String, String>()
+
     fun encrypt(value: String): String {
         val cipher = Cipher.getInstance(TRANSFORMATION)
         cipher.init(Cipher.ENCRYPT_MODE, getOrCreateKey())
@@ -40,17 +44,23 @@ class SecureStringStore(context: Context) {
 
     fun decrypt(value: String?): String? {
         if (value.isNullOrBlank() || !value.startsWith(VERSION_PREFIX)) return null
+        decryptCache[value]?.let { return it }
         val payload = value.removePrefix(VERSION_PREFIX)
         val parts = payload.split(":", limit = 2)
         if (parts.size != 2) return null
 
-        return runCatching {
+        val result = runCatching {
             val iv = Base64.decode(parts[0], Base64.NO_WRAP)
             val encrypted = Base64.decode(parts[1], Base64.NO_WRAP)
             val cipher = Cipher.getInstance(TRANSFORMATION)
             cipher.init(Cipher.DECRYPT_MODE, getOrCreateKey(), GCMParameterSpec(GCM_TAG_BITS, iv))
             cipher.doFinal(encrypted).toString(Charsets.UTF_8)
         }.getOrNull()
+        if (result != null) {
+            if (decryptCache.size > 64) decryptCache.clear()
+            decryptCache[value] = result
+        }
+        return result
     }
 
     private fun getOrCreateKey(): SecretKey {

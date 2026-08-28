@@ -210,7 +210,7 @@ async fn run_profile(workers: usize, target: u64, rate: Option<u64>) -> ProfileR
     for worker in 0..workers {
         let share = target / workers as u64 + u64::from((worker as u64) < target % workers as u64);
         assert!(share >= ORACLE_HEADER_BYTES as u64);
-        let (sender, receiver) = packet_channel(QUEUE_CAPACITY, Duration::from_secs(3_600), true);
+        let (sender, receiver) = packet_channel(QUEUE_CAPACITY, true);
         let send_pool = pool.clone();
         let send_in_flight = in_flight.clone();
         let receive_in_flight = in_flight.clone();
@@ -311,18 +311,18 @@ fn five_hundred_kib_rate_math_is_exact_for_all_requested_worker_counts() {
     assert!(deadline_bytes * 9 < GIB);
     assert!(deadline_bytes * 27 < GIB);
     assert!(deadline_bytes * 108 > GIB);
-    assert!(deadline_bytes * 162 > GIB);
+    assert!(deadline_bytes * 126 > GIB);
     assert_eq!(GIB.div_ceil(RATE_PER_WORKER * 9), 234);
     assert_eq!(GIB.div_ceil(RATE_PER_WORKER * 27), 78);
     assert_eq!(GIB.div_ceil(RATE_PER_WORKER * 108), 20);
-    assert_eq!(GIB.div_ceil(RATE_PER_WORKER * 162), 13);
+    assert_eq!(GIB.div_ceil(RATE_PER_WORKER * 126), 17);
     assert_eq!(GIB.div_ceil(deadline_bytes), 42);
     assert_eq!(GIB.div_ceil(deadline_bytes).div_ceil(9) * 9, 45);
 }
 
 #[tokio::test]
 async fn bounded_pipeline_delivers_every_byte_and_returns_every_buffer() {
-    for workers in [9, 27, 108, 162] {
+    for workers in [9, 27, 108, 126] {
         let report = tokio::time::timeout(
             Duration::from_secs(30),
             run_profile(workers, 16 * 1024 * 1024, None),
@@ -343,8 +343,7 @@ async fn local_channel_recreation_under_saturated_load_recovers_cleanly() {
         let mut delivered = 0_u64;
         for generation in 0..RECREATIONS {
             let started = Instant::now();
-            let (sender, receiver) =
-                packet_channel(QUEUE_CAPACITY, Duration::from_secs(3_600), true);
+            let (sender, receiver) = packet_channel(QUEUE_CAPACITY, true);
             let stale_sender = sender.clone();
             let (sent, received) = tokio::join!(
                 send_exact(
@@ -397,29 +396,29 @@ async fn local_channel_recreation_under_saturated_load_recovers_cleanly() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "real 51 second 1 GiB throughput profile"]
-async fn one_gibibyte_with_9_27_108_162_workers_and_500_kib_per_worker_limit() {
+async fn one_gibibyte_with_9_27_108_126_workers_and_500_kib_per_worker_limit() {
     let target_9 = RATE_PER_WORKER * 9 * PROFILE_SECONDS;
     let target_27 = RATE_PER_WORKER * 27 * PROFILE_SECONDS;
     let profile_9 = run_profile(9, target_9, Some(RATE_PER_WORKER));
     let profile_27 = run_profile(27, target_27, Some(RATE_PER_WORKER));
     let profile_108 = run_profile(108, GIB, Some(RATE_PER_WORKER));
-    let profile_162 = run_profile(162, GIB, Some(RATE_PER_WORKER));
-    let (report_9, report_27, report_108, report_162) =
+    let profile_126 = run_profile(126, GIB, Some(RATE_PER_WORKER));
+    let (report_9, report_27, report_108, report_126) =
         tokio::time::timeout(Duration::from_secs(DEADLINE_SECONDS), async {
-            tokio::join!(profile_9, profile_27, profile_108, profile_162)
+            tokio::join!(profile_9, profile_27, profile_108, profile_126)
         })
         .await
         .unwrap();
-    for report in [&report_9, &report_27, &report_108, &report_162] {
+    for report in [&report_9, &report_27, &report_108, &report_126] {
         assert_complete(report);
         assert!(report.elapsed <= Duration::from_secs(DEADLINE_SECONDS));
     }
     assert_eq!(report_9.delivered, 225_792_000);
     assert_eq!(report_27.delivered, 677_376_000);
     assert_eq!(report_108.delivered, GIB);
-    assert_eq!(report_162.delivered, GIB);
+    assert_eq!(report_126.delivered, GIB);
     assert_eq!(
-        report_9.delivered + report_27.delivered + report_108.delivered + report_162.delivered,
+        report_9.delivered + report_27.delivered + report_108.delivered + report_126.delivered,
         3_050_651_648
     );
 }

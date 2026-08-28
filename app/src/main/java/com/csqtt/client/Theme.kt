@@ -9,8 +9,6 @@ import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Typography
 import androidx.compose.material3.darkColorScheme
-import androidx.compose.material3.dynamicDarkColorScheme
-import androidx.compose.material3.dynamicLightColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
@@ -19,7 +17,6 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.graphics.toArgb
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.TextStyle
@@ -190,13 +187,56 @@ private val ForestDarkColorScheme = darkColorScheme(
     outlineVariant = Color(0xFF48454E),
 )
 
-private fun getAppColorScheme(palette: String, isDark: Boolean): androidx.compose.material3.ColorScheme {
-    return when (palette) {
-        CsqttConstants.Theme.PALETTE_ESPRESSO -> if (isDark) DarkColorScheme else LightColorScheme
-        CsqttConstants.Theme.PALETTE_FOREST -> if (isDark) ForestDarkColorScheme else ForestLightColorScheme
-        else -> if (isDark) IndigoDarkColorScheme else IndigoLightColorScheme
-    }
-}
+private val BrandLightColorScheme = lightColorScheme(
+    primary = Color(0xFF1A73E8),
+    onPrimary = Color(0xFFFFFFFF),
+    primaryContainer = Color(0xFFE8F0FE),
+    onPrimaryContainer = Color(0xFF111215),
+    secondary = Color(0xFF1A73E8),
+    onSecondary = Color(0xFFFFFFFF),
+    secondaryContainer = Color(0xFFE8F0FE),
+    onSecondaryContainer = Color(0xFF111215),
+    tertiary = Color(0xFFD27D00),
+    onTertiary = Color(0xFFFFFFFF),
+    tertiaryContainer = Color(0xFFFFE4B7),
+    onTertiaryContainer = Color(0xFF241400),
+    background = Color(0xFFFDFDFE),
+    onBackground = Color(0xFF111215),
+    surface = Color(0xFFFFFFFF),
+    onSurface = Color(0xFF111215),
+    surfaceVariant = Color(0xFFF2F2F4),
+    onSurfaceVariant = Color(0xFF5F6067),
+    outline = Color(0xFF898B92),
+    outlineVariant = Color(0xFFD7D8DD),
+    surfaceTint = Color.Transparent,
+)
+
+private val BrandDarkColorScheme = darkColorScheme(
+    primary = Color(0xFF1565D8),
+    onPrimary = Color(0xFFFFFFFF),
+    primaryContainer = Color(0xFF173B72),
+    onPrimaryContainer = Color(0xFFFFFFFF),
+    secondary = Color(0xFF1565D8),
+    onSecondary = Color(0xFFFFFFFF),
+    secondaryContainer = Color(0xFF173B72),
+    onSecondaryContainer = Color(0xFFFFFFFF),
+    tertiary = Color(0xFFFFB74D),
+    onTertiary = Color(0xFF271500),
+    tertiaryContainer = Color(0xFF5A3900),
+    onTertiaryContainer = Color(0xFFFFE5BD),
+    background = Color(0xFF09090A),
+    onBackground = Color(0xFFFAFAFA),
+    surface = Color(0xFF121214),
+    onSurface = Color(0xFFFAFAFA),
+    surfaceVariant = Color(0xFF202024),
+    onSurfaceVariant = Color(0xFFC9C9CF),
+    outline = Color(0xFF8C8C94),
+    outlineVariant = Color(0xFF35353A),
+    surfaceTint = Color.Transparent,
+)
+
+private fun getAppColorScheme(isDark: Boolean): androidx.compose.material3.ColorScheme =
+    if (isDark) BrandDarkColorScheme else BrandLightColorScheme
 
 object CSQTTColors {
     val connected = Color(0xFF4CAF50)
@@ -220,8 +260,6 @@ object CSQTTColors {
 @Composable
 fun CSQTTTheme(
     themeMode: String = "system",
-    dynamicColor: Boolean = false,
-    themePalette: String = "indigo",
     content: @Composable () -> Unit
 ) {
     val darkTheme = when (themeMode) {
@@ -230,14 +268,8 @@ fun CSQTTTheme(
         else -> isSystemInDarkTheme()
     }
 
-    val context = LocalContext.current
-    val colorScheme = remember(dynamicColor, themePalette, darkTheme) {
-        when {
-            dynamicColor && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S -> {
-                if (darkTheme) dynamicDarkColorScheme(context) else dynamicLightColorScheme(context)
-            }
-            else -> getAppColorScheme(themePalette, darkTheme)
-        }
+    val colorScheme = remember(darkTheme) {
+        getAppColorScheme(darkTheme)
     }
 
     val view = LocalView.current

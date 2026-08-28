@@ -32,23 +32,6 @@ class TunnelEventParserTest {
     }
 
     @Test
-    fun parsesPathHealthWithoutAllowingNegativeCounters() {
-        val event = TunnelEventParser.parse(
-            "__CSQTT_EVENT__|PATH_HEALTH|" +
-                "{\"active\":162,\"sent\":162,\"acked\":161,\"missed\":1," +
-                "\"send_errors\":-1,\"unresponsive\":0,\"scheduler_resets\":2}",
-        ) as TunnelEventParser.Event.PathHealth
-
-        assertEquals(162, event.active)
-        assertEquals(162L, event.sent)
-        assertEquals(161L, event.acked)
-        assertEquals(1L, event.missed)
-        assertEquals(0L, event.sendErrors)
-        assertEquals(0L, event.unresponsive)
-        assertEquals(2L, event.schedulerResets)
-    }
-
-    @Test
     fun rustLifecycleObjectPayloadsMatchKotlinContract() {
         assertTrue(
             TunnelEventParser.parse("__CSQTT_EVENT__|READY|{}") is
@@ -61,6 +44,10 @@ class TunnelEventParserTest {
         assertTrue(
             TunnelEventParser.parse("__CSQTT_EVENT__|ACTIVE_ZERO|{}") is
                 TunnelEventParser.Event.ActiveZero
+        )
+        assertTrue(
+            TunnelEventParser.parse("__CSQTT_EVENT__|NETWORK_SUSPECT|{}") is
+                TunnelEventParser.Event.NetworkSuspect
         )
     }
 
@@ -85,6 +72,26 @@ class TunnelEventParserTest {
             "__CSQTT_EVENT__|PROGRESS|{\"kind\":\"credentials\"}",
         ) as TunnelEventParser.Event.Progress
         assertEquals("credentials", progress.kind)
+    }
+
+    @Test
+    fun parsesCallUnavailableWithoutTurningItIntoALogError() {
+        val event = TunnelEventParser.parse(
+            "__CSQTT_EVENT__|CALL_UNAVAILABLE|{\"hash\":\"dead-hash\",\"code\":951}",
+        ) as TunnelEventParser.Event.CallUnavailable
+
+        assertEquals("dead-hash", event.hash)
+        assertEquals(951, event.code)
+        assertNull(TunnelEventParser.parse("__CSQTT_EVENT__|CALL_UNAVAILABLE|{\"code\":951}"))
+    }
+
+    @Test
+    fun detailedPerfEventsAreIgnored() {
+        assertNull(
+            TunnelEventParser.parse(
+                "__CSQTT_EVENT__|PERF_DETAIL|{\"rows\":[{\"name\":\"Crypto/obfs\"}]}",
+            ),
+        )
     }
 
     @Test

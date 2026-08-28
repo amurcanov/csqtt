@@ -7,11 +7,6 @@ use tokio_util::sync::CancellationToken;
 
 #[cfg(unix)]
 pub async fn receive_fd(name: String, cancel: CancellationToken) -> Result<File> {
-    tokio::task::spawn_blocking(move || receive_fd_blocking(&name, &cancel)).await?
-}
-
-#[cfg(unix)]
-fn receive_fd_blocking(name: &str, cancel: &CancellationToken) -> Result<File> {
     use nix::{
         cmsg_space,
         errno::Errno,
@@ -23,9 +18,8 @@ fn receive_fd_blocking(name: &str, cancel: &CancellationToken) -> Result<File> {
     use std::{
         io::IoSliceMut,
         os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
-        thread,
-        time::Duration,
     };
+    use tokio::io::unix::AsyncFd;
 
     fn configure_nonblocking(descriptor: RawFd) -> Result<()> {
         let status = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
@@ -49,50 +43,58 @@ fn receive_fd_blocking(name: &str, cancel: &CancellationToken) -> Result<File> {
         &UnixAddr::new_abstract(name.as_bytes())?,
     )?;
     listen(&listener, Backlog::new(1)?)?;
+    let listener = AsyncFd::new(listener)?;
     let connection = loop {
-        if cancel.is_cancelled() {
-            bail!("TUN FD wait cancelled");
-        }
-        match accept(listener.as_raw_fd()) {
-            Ok(descriptor) => {
-                let descriptor = unsafe { OwnedFd::from_raw_fd(descriptor) };
-                configure_nonblocking(descriptor.as_raw_fd())?;
-                break descriptor;
+        tokio::select! {
+            _ = cancel.cancelled() => bail!("TUN FD wait cancelled"),
+            ready = listener.readable() => {
+                let mut ready = ready?;
+                match accept(listener.get_ref().as_raw_fd()) {
+                    Ok(descriptor) => {
+                        let descriptor = unsafe { OwnedFd::from_raw_fd(descriptor) };
+                        configure_nonblocking(descriptor.as_raw_fd())?;
+                        break descriptor;
+                    }
+                    Err(Errno::EAGAIN) => ready.clear_ready(),
+                    Err(error) => return Err(error.into()),
+                }
             }
-            Err(Errno::EAGAIN) => thread::sleep(Duration::from_millis(25)),
-            Err(error) => return Err(error.into()),
         }
     };
+    let connection = AsyncFd::new(connection)?;
     let mut data = [0u8; 1];
     loop {
-        if cancel.is_cancelled() {
-            bail!("TUN FD receive cancelled");
-        }
-        let mut slices = [IoSliceMut::new(&mut data)];
-        let mut ancillary = cmsg_space!([std::os::fd::RawFd; 1]);
-        match recvmsg::<UnixAddr>(
-            connection.as_raw_fd(),
-            &mut slices,
-            Some(&mut ancillary),
-            MsgFlags::empty(),
-        ) {
-            Ok(message) => {
-                if message.bytes == 0 {
-                    bail!("TUN FD connection closed");
-                }
-                for control in message.cmsgs()? {
-                    if let ControlMessageOwned::ScmRights(descriptors) = control
-                        && let Some(descriptor) = descriptors.into_iter().next()
-                    {
-                        let file = unsafe { File::from_raw_fd(descriptor) };
-                        configure_nonblocking(file.as_raw_fd())?;
-                        return Ok(file);
+        tokio::select! {
+            _ = cancel.cancelled() => bail!("TUN FD receive cancelled"),
+            ready = connection.readable() => {
+                let mut ready = ready?;
+                let mut slices = [IoSliceMut::new(&mut data)];
+                let mut ancillary = cmsg_space!([std::os::fd::RawFd; 1]);
+                match recvmsg::<UnixAddr>(
+                    connection.get_ref().as_raw_fd(),
+                    &mut slices,
+                    Some(&mut ancillary),
+                    MsgFlags::empty(),
+                ) {
+                    Ok(message) => {
+                        if message.bytes == 0 {
+                            bail!("TUN FD connection closed");
+                        }
+                        for control in message.cmsgs()? {
+                            if let ControlMessageOwned::ScmRights(descriptors) = control
+                                && let Some(descriptor) = descriptors.into_iter().next()
+                            {
+                                let file = unsafe { File::from_raw_fd(descriptor) };
+                                configure_nonblocking(file.as_raw_fd())?;
+                                return Ok(file);
+                            }
+                        }
+                        bail!("no fd received");
                     }
+                    Err(Errno::EAGAIN) => ready.clear_ready(),
+                    Err(error) => return Err(error.into()),
                 }
-                bail!("no fd received");
             }
-            Err(Errno::EAGAIN) => thread::sleep(Duration::from_millis(25)),
-            Err(error) => return Err(error.into()),
         }
     }
 }

@@ -134,9 +134,6 @@ class VpnWidgetProvider : AppWidgetProvider() {
         val store = SettingsStore(context.applicationContext)
         val source = resolveConnectionSource(store) ?: return null
 
-        val manualPortsEnabled = store.manualPortsEnabled.first()
-        val localPort = if (manualPortsEnabled) store.listenPort.first() else 0
-
         return Intent(context, TunnelService::class.java).apply {
             action = "START"
             putExtra("peer", source.peer)
@@ -144,7 +141,7 @@ class VpnWidgetProvider : AppWidgetProvider() {
             putExtra("vk_hashes_from_link", source.hashesFromLink)
             putExtra("secondary_vk_hash", store.secondaryVkHash.first())
             putExtra("workers_per_hash", store.workersPerHash.first())
-            putExtra("port", localPort)
+            putExtra("port", 0)
             putExtra("sni", store.sni.first())
             putExtra("connection_password", source.password)
             putExtra("protocol", store.protocol.first())
@@ -154,6 +151,7 @@ class VpnWidgetProvider : AppWidgetProvider() {
             putExtra("fingerprint", store.selectedFingerprint.first())
             putExtra("client_ids", store.activeClientIds.first())
             putExtra("obfs_mode", store.obfsMode.first())
+            putExtra("turn_transport", store.turnTransport.first())
         }
     }
 

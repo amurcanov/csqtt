@@ -12,7 +12,6 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Update
 import androidx.compose.material3.Button
@@ -32,6 +31,7 @@ import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import com.csqtt.client.AppReleaseInfo
 import com.csqtt.client.RemoteVersionSource
+import com.csqtt.client.ui.design.CsqttShapes
 
 @Composable
 fun AppUpdateDialog(
@@ -56,7 +56,7 @@ fun AppUpdateDialog(
         )
     ) {
         Surface(
-            shape = RoundedCornerShape(28.dp),
+            shape = CsqttShapes.Dialog,
             color = MaterialTheme.colorScheme.surface,
             contentColor = MaterialTheme.colorScheme.onSurface,
             tonalElevation = 8.dp,
@@ -110,7 +110,7 @@ fun AppUpdateDialog(
                         modifier = Modifier
                             .weight(1f)
                             .height(50.dp),
-                        shape = RoundedCornerShape(22.dp)
+                        shape = CsqttShapes.Pill
                     ) {
                         Text("Позже", fontWeight = FontWeight.SemiBold)
                     }
@@ -120,7 +120,7 @@ fun AppUpdateDialog(
                         modifier = Modifier
                             .weight(1f)
                             .height(50.dp),
-                        shape = RoundedCornerShape(22.dp)
+                        shape = CsqttShapes.Pill
                     ) {
                         Text("Обновить", fontWeight = FontWeight.Bold)
                     }

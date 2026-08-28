@@ -57,13 +57,48 @@ import com.csqtt.client.ui.design.CsqttTheme
 import kotlinx.coroutines.launch
 
 import androidx.compose.foundation.BorderStroke
-import androidx.compose.foundation.shape.RoundedCornerShape
 
 @Composable
 fun LogsTab(settingsStore: SettingsStore) {
-    val context = LocalContext.current
     val loggingEnabled by settingsStore.loggingEnabled.collectAsStateWithLifecycle(initialValue = true)
     val scope = rememberCoroutineScope()
+
+    CsqttScreen {
+        AppSectionCard(
+            contentPadding = PaddingValues(horizontal = CsqttSpacing.Md, vertical = CsqttSpacing.Xs),
+            verticalArrangement = Arrangement.spacedBy(CsqttSpacing.None),
+        ) {
+            CsqttSettingRow(
+                title = stringResource(R.string.logs_enabled),
+                checked = loggingEnabled,
+                onCheckedChange = { enabled ->
+                    TunnelManager.isLoggingEnabled = enabled
+                    scope.launch {
+                        settingsStore.saveLoggingEnabled(enabled)
+                    }
+                },
+            )
+        }
+
+        // The terminal panel is the only place reading TunnelManager.logs, so a
+        // log flush (~120ms under traffic) recomposes this panel alone instead
+        // of the whole tab.
+        Surface(
+            modifier = Modifier
+                .fillMaxWidth()
+                .weight(1f),
+            shape = CsqttShapes.Card,
+            color = CsqttTheme.extendedColors.terminalBackground,
+            contentColor = CsqttTheme.extendedColors.terminalText,
+        ) {
+            LogsTerminal()
+        }
+    }
+}
+
+@Composable
+private fun LogsTerminal() {
+    val context = LocalContext.current
     val currentLogs = TunnelManager.logs
     val listState = rememberLazyListState()
     val copiedMessage = stringResource(R.string.logs_copied)
@@ -76,99 +111,71 @@ fun LogsTab(settingsStore: SettingsStore) {
         }
     }
 
-    CsqttScreen {
-        AppSectionCard(
-            contentPadding = PaddingValues(horizontal = CsqttSpacing.Md, vertical = CsqttSpacing.Xs),
-            verticalArrangement = Arrangement.spacedBy(CsqttSpacing.None),
-        ) {
-            CsqttSettingRow(
-                title = stringResource(R.string.logs_enabled),
-                checked = loggingEnabled,
-                onCheckedChange = { enabled ->
-                    scope.launch {
-                        settingsStore.saveLoggingEnabled(enabled)
-                        if (!enabled) TunnelManager.clearLogs()
-                    }
-                },
-            )
+    Box(modifier = Modifier.fillMaxSize()) {
+        if (currentLogs.isEmpty()) {
+            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                CsqttEmptyState(
+                    title = stringResource(R.string.logs_empty_title),
+                    icon = Icons.Outlined.Terminal,
+                    modifier = Modifier.padding(CsqttSpacing.Md),
+                    contentColor = CsqttTheme.extendedColors.terminalText,
+                    secondaryContentColor = CsqttTheme.extendedColors.terminalMuted,
+                )
+            }
+        } else {
+            LazyColumn(
+                state = listState,
+                modifier = Modifier.fillMaxSize(),
+                contentPadding = PaddingValues(start = CsqttSpacing.Md, top = CsqttSpacing.Md, end = CsqttSpacing.Md, bottom = 64.dp),
+                verticalArrangement = Arrangement.spacedBy(CsqttSpacing.Xs),
+            ) {
+                items(
+                    items = currentLogs,
+                    key = { it.key },
+                    contentType = { "log_line" },
+                ) { entry ->
+                    LogLine(entry)
+                }
+            }
         }
 
-        Surface(
+        Row(
             modifier = Modifier
-                .fillMaxWidth()
-                .weight(1f),
-            shape = CsqttShapes.Card,
-            color = CsqttTheme.extendedColors.terminalBackground,
-            contentColor = CsqttTheme.extendedColors.terminalText,
+                .align(Alignment.BottomEnd)
+                .padding(16.dp),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            verticalAlignment = Alignment.CenterVertically
         ) {
-            Box(modifier = Modifier.fillMaxSize()) {
-                if (currentLogs.isEmpty()) {
-                    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                        CsqttEmptyState(
-                            title = stringResource(R.string.logs_empty_title),
-                            icon = Icons.Outlined.Terminal,
-                            modifier = Modifier.padding(CsqttSpacing.Md),
-                            contentColor = CsqttTheme.extendedColors.terminalText,
-                            secondaryContentColor = CsqttTheme.extendedColors.terminalMuted,
-                        )
-                    }
-                } else {
-                    LazyColumn(
-                        state = listState,
-                        modifier = Modifier.fillMaxSize(),
-                        contentPadding = PaddingValues(start = CsqttSpacing.Md, top = CsqttSpacing.Md, end = CsqttSpacing.Md, bottom = 64.dp),
-                        verticalArrangement = Arrangement.spacedBy(CsqttSpacing.Xs),
-                    ) {
-                        items(
-                            items = currentLogs,
-                            key = { it.key },
-                            contentType = { "log_line" },
-                        ) { entry ->
-                            LogLine(entry)
-                        }
-                    }
-                }
+            IconButton(
+                onClick = {
+                    val text = currentLogs.joinToString("\n") { "${it.message} (x${it.count})" }
+                    val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                    clipboard.setPrimaryClip(ClipData.newPlainText("CSQTT Logs", text))
+                    context.showRaisedToast(copiedMessage, Toast.LENGTH_SHORT)
+                },
+                enabled = currentLogs.isNotEmpty(),
+                modifier = Modifier.size(40.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Outlined.ContentCopy,
+                    contentDescription = stringResource(R.string.action_copy),
+                    tint = if (currentLogs.isNotEmpty()) Color.White else Color.White.copy(alpha = 0.4f),
+                    modifier = Modifier.size(22.dp)
+                )
+            }
 
-                Row(
-                    modifier = Modifier
-                        .align(Alignment.BottomEnd)
-                        .padding(16.dp),
-                    horizontalArrangement = Arrangement.spacedBy(6.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    IconButton(
-                        onClick = {
-                            val text = currentLogs.joinToString("\n") { "${it.message} (x${it.count})" }
-                            val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                            clipboard.setPrimaryClip(ClipData.newPlainText("CSQTT Logs", text))
-                            context.showRaisedToast(copiedMessage, Toast.LENGTH_SHORT)
-                        },
-                        enabled = currentLogs.isNotEmpty(),
-                        modifier = Modifier.size(40.dp)
-                    ) {
-                        Icon(
-                            imageVector = Icons.Outlined.ContentCopy,
-                            contentDescription = stringResource(R.string.action_copy),
-                            tint = if (currentLogs.isNotEmpty()) Color.White else Color.White.copy(alpha = 0.4f),
-                            modifier = Modifier.size(22.dp)
-                        )
-                    }
-
-                    IconButton(
-                        onClick = TunnelManager::clearLogs,
-                        modifier = Modifier.size(40.dp)
-                    ) {
-                        Icon(
-                            imageVector = Icons.Outlined.Delete,
-                            contentDescription = stringResource(R.string.action_clear),
-                            tint = Color.White,
-                            modifier = Modifier.size(22.dp)
-                        )
-                    }
-                }
+            IconButton(
+                onClick = TunnelManager::clearLogs,
+                modifier = Modifier.size(40.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Outlined.Delete,
+                    contentDescription = stringResource(R.string.action_clear),
+                    tint = Color.White,
+                    modifier = Modifier.size(22.dp)
+                )
             }
         }
     }
 }
-
 

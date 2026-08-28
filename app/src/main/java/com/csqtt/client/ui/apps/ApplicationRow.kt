@@ -32,7 +32,6 @@ import androidx.compose.ui.unit.dp
 import com.csqtt.client.ui.design.CsqttShapes
 import com.csqtt.client.ui.design.CsqttSpacing
 import androidx.compose.foundation.BorderStroke
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.ui.graphics.luminance
 
 @Immutable
@@ -74,7 +73,7 @@ internal fun AppRow(
                 role = Role.Checkbox,
                 onValueChange = { onClick() },
             ),
-        shape = RoundedCornerShape(20.dp),
+        shape = CsqttShapes.Card,
         color = surfaceColor,
         contentColor = if (isSelected) colors.onPrimaryContainer else colors.onSurface,
         border = BorderStroke(1.dp, borderColor),
@@ -88,10 +87,10 @@ internal fun AppRow(
                 Image(
                     bitmap = app.icon,
                     contentDescription = null,
-                    modifier = Modifier.size(42.dp).clip(RoundedCornerShape(12.dp)),
+                    modifier = Modifier.size(42.dp).clip(CsqttShapes.Small),
                 )
             } else {
-                Box(modifier = Modifier.size(42.dp).background(colors.surfaceVariant, RoundedCornerShape(12.dp)))
+                Box(modifier = Modifier.size(42.dp).background(colors.surfaceVariant, CsqttShapes.Small))
             }
 
             Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {

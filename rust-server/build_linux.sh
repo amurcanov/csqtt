@@ -6,22 +6,31 @@ set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
 RUN_CHECKS=""
-case "${1:-}" in
-  "")
-    if [[ -t 0 ]]; then
-      read -rp "Запустить тесты и проверки перед сборкой? [Y/n]: " REPLY
-      case "$REPLY" in
-        [nN]|[nN][oO]|[нН]|[нН][eE][тТ]) RUN_CHECKS=0 ;;
-        *) RUN_CHECKS=1 ;;
-      esac
-    else
-      RUN_CHECKS=1
-    fi
-    ;;
-  --tests) RUN_CHECKS=1 ;;
-  --no-tests) RUN_CHECKS=0 ;;
-  *) echo "Usage: $0 [--tests|--no-tests]" >&2; exit 2 ;;
-esac
+DIAGNOSTICS=0
+while (($#)); do
+  case "$1" in
+    --tests) RUN_CHECKS=1 ;;
+    --no-tests) RUN_CHECKS=0 ;;
+    --diagnostics) DIAGNOSTICS=1 ;;
+    *) echo "Usage: $0 [--tests|--no-tests] [--diagnostics]" >&2; exit 2 ;;
+  esac
+  shift
+done
+if [[ -z "$RUN_CHECKS" ]]; then
+  if [[ -t 0 ]]; then
+    read -rp "Запустить проверки и тесты (или их кросс-компиляцию) перед сборкой? [Y/n]: " REPLY
+    case "$REPLY" in
+      [nN]|[nN][oO]|[нН]|[нН][eE][тТ]) RUN_CHECKS=0 ;;
+      *) RUN_CHECKS=1 ;;
+    esac
+  else
+    RUN_CHECKS=1
+  fi
+fi
+FEATURE_ARGS=()
+if [[ "$DIAGNOSTICS" == 1 ]]; then
+  FEATURE_ARGS=(--features diagnostics)
+fi
 command -v cargo >/dev/null
 command -v rustup >/dev/null
 command -v zig >/dev/null
@@ -91,10 +100,17 @@ export AR_x86_64_unknown_linux_musl="$AR_WRAPPER"
 export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER="$CC_WRAPPER"
 if [[ "$RUN_CHECKS" == 1 ]]; then
   cargo +1.97.1 fmt --all -- --check
-  cargo +1.97.1 zigbuild --all-targets --target x86_64-unknown-linux-musl
-  CARGO_TARGET_DIR="$ROOT/build/linux-musl-check" cargo +1.97.1 clippy --release --target x86_64-unknown-linux-musl --all-targets -- -D warnings
+  cargo +1.97.1 zigbuild --all-targets --target x86_64-unknown-linux-musl "${FEATURE_ARGS[@]}"
+  CARGO_TARGET_DIR="$ROOT/build/linux-musl-check" cargo +1.97.1 clippy --release --target x86_64-unknown-linux-musl "${FEATURE_ARGS[@]}" --all-targets -- -D warnings
+  if [[ "$HOST" == *linux* ]]; then
+    echo "Running Linux musl tests..."
+    CARGO_TARGET_DIR="$ROOT/build/linux-musl-tests" cargo +1.97.1 test --target x86_64-unknown-linux-musl "${FEATURE_ARGS[@]}" --all-targets
+  else
+    echo "Compiling Linux musl test binaries (they cannot run on this non-Linux host)..."
+    CARGO_TARGET_DIR="$ROOT/build/linux-musl-tests" cargo +1.97.1 zigbuild --target x86_64-unknown-linux-musl "${FEATURE_ARGS[@]}" --tests
+  fi
 fi
-CARGO_TARGET_DIR="$ROOT/build/linux-musl" cargo +1.97.1 zigbuild --release --target x86_64-unknown-linux-musl
+CARGO_TARGET_DIR="$ROOT/build/linux-musl" cargo +1.97.1 zigbuild --release --target x86_64-unknown-linux-musl "${FEATURE_ARGS[@]}"
 mkdir -p "$ROOT/dist"
 cp "$ROOT/build/linux-musl/x86_64-unknown-linux-musl/release/csqtt" "$ROOT/dist/csqtt"
 ls -lh "$ROOT/dist/csqtt"

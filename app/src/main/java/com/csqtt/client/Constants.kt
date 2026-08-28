@@ -10,12 +10,22 @@ object CsqttConstants {
         const val PACKAGE_VK_CALLS = "com.vk.calls"
         const val CSQTT_EVENT_PREFIX = "__CSQTT_EVENT__|"
         const val ACTION_RESTART_WHEN_VK_REACHABLE = "com.csqtt.client.RESTART_WHEN_VK_REACHABLE"
+        const val ACTION_VERIFY_VK_REACHABILITY = "com.csqtt.client.VERIFY_VK_REACHABILITY"
+        const val ACTION_RECOVER_VK_CALL = "com.csqtt.client.RECOVER_VK_CALL"
+        const val EXTRA_UNAVAILABLE_VK_HASH = "unavailable_vk_hash"
+    }
+
+    object Profiles {
+        const val MIN_INDEX = 0
+        const val MAX_INDEX = 3
     }
 
     object Network {
         const val LOCAL_LISTEN_HOST = "127.0.0.1"
         const val DEFAULT_LOCAL_PORT = 0
         const val DEFAULT_SERVER_PEER_PORT = 46000
+        const val DEFAULT_SSH_PORT = 22
+        const val DEFAULT_SERVER_WEB_PORT = 46002
     }
 
     object Tunnel {
@@ -25,11 +35,14 @@ object CsqttConstants {
         const val DEFAULT_FINGERPRINT = "firefox"
         const val DEFAULT_CLIENT_IDS = "8202606,6287487"
         const val DEFAULT_OBFS_MODE = "video"
+        const val DEFAULT_TURN_TRANSPORT = "udp"
+        const val TURN_TRANSPORT_TCP_TLS = "tcp_tls"
 
         const val WORKERS_PER_GROUP = 9
         const val GROUPS_PER_VK_HASH = 3
         const val MAX_VK_HASHES = 6
-        const val MAX_WORKERS = 162
+        const val DEFAULT_MAX_WORKERS = 72
+        const val MAX_WORKERS = 126
     }
 
     object VkAuth {
@@ -46,7 +59,7 @@ object CsqttConstants {
         const val WATCHDOG_INTERVAL_MS = 5_000L
         const val LOG_READER_RESET_INTERVAL_MS = 60_000L
 
-        const val VPN_PERMISSION_COOLDOWN_MS = 1_500L
+        const val VPN_PERMISSION_COOLDOWN_MS = 300L
 
         const val DEPLOY_CMD_TIMEOUT_MS = 900_000L
         const val DEPLOY_STALL_TIMEOUT_MS = 30 * 60 * 1000L
@@ -159,6 +172,7 @@ object CsqttConstants {
         const val ISSUES = "https://github.com/amurcanov/csqtt/issues/new"
         const val DEVELOPER_PROFILE = "https://github.com/amurcanov"
         const val REPOSITORY = "https://github.com/amurcanov/csqtt"
+        const val DONATE = "-"
     }
 
     object Patterns {

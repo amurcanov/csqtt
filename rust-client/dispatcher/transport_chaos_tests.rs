@@ -3,7 +3,7 @@
 
 #![cfg(any())]
 use super::{
-    PacketClass, PacketReceiver, WorkerChannels, packet_channel, try_normal_workers, try_workers,
+    PacketClass, PacketReceiver, WorkerChannels, force_worker, packet_channel, try_workers,
 };
 use crate::{
     packet::{PacketBuf, PacketPool},
@@ -11,11 +11,8 @@ use crate::{
 };
 use std::{cmp::Reverse, env, sync::Arc, time::Duration};
 
-const TOTALS: [usize; 18] = [
-    9, 18, 27, 36, 45, 54, 63, 72, 81, 90, 99, 108, 117, 126, 135, 144, 153, 162,
-];
-const NORMAL_CAPACITY: usize = 2;
-const SMALL_CAPACITY: usize = 3;
+const TOTALS: [usize; 14] = [9, 18, 27, 36, 45, 54, 63, 72, 81, 90, 99, 108, 117, 126];
+const LATENCY_CAPACITY: usize = 3;
 const BULK_CAPACITY: usize = 4;
 const FLOW_COUNT: usize = 12;
 const MAGIC: [u8; 4] = *b"TCHS";
@@ -34,7 +31,7 @@ enum Mutation {
     AcceptReplay,
     DropControl,
     PinFirstWorker,
-    DisableNormalFallback,
+    DisableForceFallback,
     SkipGroupedInterruption,
     NeverReturnPrimary,
 }
@@ -66,7 +63,7 @@ enum Feature {
     StaleQueuePurge,
     StaleWireFilter,
     ReplayReject,
-    NormalFallback,
+    ForcedFallback,
     SlowSaturation,
     HealthyProgress,
     ControlUnderBulk,
@@ -138,10 +135,9 @@ struct PacketMeta {
 }
 
 struct HarnessReceiver {
-    normal: PacketReceiver,
-    small: PacketReceiver,
+    latency: PacketReceiver,
+    priority: PacketReceiver,
     bulk: PacketReceiver,
-    doomsday: PacketReceiver,
 }
 
 struct WireEvent {
@@ -210,25 +206,21 @@ impl Scenario {
         let mut channels = Vec::with_capacity(count);
         let mut receivers = Vec::with_capacity(count);
         for id in 0..count {
-            let (normal, normal_rx) =
-                packet_channel(NORMAL_CAPACITY, Duration::from_secs(3600), true);
-            let (small, small_rx) = packet_channel(SMALL_CAPACITY, Duration::from_secs(3600), true);
-            let (bulk, bulk_rx) = packet_channel(BULK_CAPACITY, Duration::from_secs(3600), true);
-            let (doomsday, doomsday_rx) =
-                packet_channel(SMALL_CAPACITY, Duration::from_secs(3600), true);
+            let (latency, latency_rx) = packet_channel(LATENCY_CAPACITY, true);
+            let (priority, priority_rx) = packet_channel(LATENCY_CAPACITY, true);
+            let (bulk, bulk_rx) = packet_channel(BULK_CAPACITY, true);
             channels.push(WorkerChannels {
                 id,
                 incarnation_id: id as u64 + 1,
-                normal,
-                small,
+                turn_path: Arc::from("test"),
+                latency,
+                priority,
                 bulk,
-                doomsday,
             });
             receivers.push(HarnessReceiver {
-                normal: normal_rx,
-                small: small_rx,
+                latency: latency_rx,
+                priority: priority_rx,
                 bulk: bulk_rx,
-                doomsday: doomsday_rx,
             });
         }
         Self {
@@ -325,24 +317,24 @@ impl Scenario {
         let workers = &self.channels[..self.active_count];
         if self.mutation == Some(Mutation::PinFirstWorker) {
             let channel = match ticket.class {
-                PacketClass::Doomsday => &workers[0].doomsday,
-                PacketClass::Small => &workers[0].small,
+                PacketClass::Latency => &workers[0].latency,
+                PacketClass::Priority => &workers[0].priority,
                 PacketClass::Bulk => &workers[0].bulk,
             };
             if let Err(packet) = channel.try_send(packet) {
-                let _ = workers[0].normal.force_send(packet);
+                let _ = channel.force_send(packet);
             }
             self.observe_bounds(None);
             return;
         }
         match try_workers(workers, ticket, packet) {
             Ok(()) => {}
-            Err(packet) if self.mutation == Some(Mutation::DisableNormalFallback) => {
+            Err(packet) if self.mutation == Some(Mutation::DisableForceFallback) => {
                 drop(packet);
             }
             Err(packet) => {
-                self.coverage.hit(Feature::NormalFallback);
-                let _ = try_normal_workers(workers, ticket, packet);
+                self.coverage.hit(Feature::ForcedFallback);
+                let _ = force_worker(workers, ticket, packet);
             }
         }
         self.observe_bounds(None);
@@ -358,27 +350,21 @@ impl Scenario {
 
     fn observe_bounds(&mut self, phase: Option<Phase>) {
         for (index, receiver) in self.receivers.iter().enumerate() {
-            let normal = receiver.normal.len();
-            let small = receiver.small.len();
+            let latency = receiver.latency.len();
+            let priority = receiver.priority.len();
             let bulk = receiver.bulk.len();
-            let doomsday = receiver.doomsday.len();
-            if normal > NORMAL_CAPACITY
-                || small > SMALL_CAPACITY
-                || bulk > BULK_CAPACITY
-                || doomsday > SMALL_CAPACITY
-            {
+            if latency > LATENCY_CAPACITY || priority > LATENCY_CAPACITY || bulk > BULK_CAPACITY {
                 self.violations = self.violations.saturating_add(1);
             }
-            if normal == NORMAL_CAPACITY
-                || small == SMALL_CAPACITY
-                || bulk == BULK_CAPACITY
-                || doomsday == SMALL_CAPACITY
+            if latency == LATENCY_CAPACITY || priority == LATENCY_CAPACITY || bulk == BULK_CAPACITY
             {
                 self.coverage.hit(Feature::QueueBound);
             }
             if phase == Some(Phase::SlowNeighbor)
                 && index / 9 == self.slow_group
-                && (small == SMALL_CAPACITY || bulk == BULK_CAPACITY)
+                && (latency == LATENCY_CAPACITY
+                    || priority == LATENCY_CAPACITY
+                    || bulk == BULK_CAPACITY)
             {
                 self.slow_saturated = true;
                 self.coverage.hit(Feature::SlowSaturation);
@@ -387,29 +373,10 @@ impl Scenario {
         self.observe_pool();
     }
 
-    fn drain_worker(
-        &mut self,
-        worker: usize,
-        small: usize,
-        normal: usize,
-        bulk: usize,
-        phase: Phase,
-    ) {
-        let mut packets = Vec::with_capacity(small + normal + bulk + small);
-        for _ in 0..small {
-            let Some(packet) = self.receivers[worker].doomsday.try_recv() else {
-                break;
-            };
-            packets.push(packet);
-        }
-        for _ in 0..small {
-            let Some(packet) = self.receivers[worker].small.try_recv() else {
-                break;
-            };
-            packets.push(packet);
-        }
-        for _ in 0..normal {
-            let Some(packet) = self.receivers[worker].normal.try_recv() else {
+    fn drain_worker(&mut self, worker: usize, latency: usize, bulk: usize, phase: Phase) {
+        let mut packets = Vec::with_capacity(latency + bulk);
+        for _ in 0..latency {
+            let Some(packet) = self.receivers[worker].latency.try_recv() else {
                 break;
             };
             packets.push(packet);
@@ -429,29 +396,29 @@ impl Scenario {
         for worker in 0..self.active_count {
             let group = worker / 9;
             let budgets = match phase {
-                Phase::Dominant if group == 0 => (4, 4, 8),
-                Phase::Dominant if self.tick.is_multiple_of(9) => (1, 1, 1),
-                Phase::Dominant => (0, 0, 0),
-                Phase::OneNinth if group == 0 => (4, 4, 8),
-                Phase::OneNinth if group == 1 && self.tick.is_multiple_of(9) => (1, 1, 1),
-                Phase::OneNinth => (1, 1, 2),
-                Phase::ReturnBurst => (8, 8, 16),
-                Phase::Reconnect => (4, 4, 8),
+                Phase::Dominant if group == 0 => (4, 8),
+                Phase::Dominant if self.tick.is_multiple_of(9) => (1, 1),
+                Phase::Dominant => (0, 0),
+                Phase::OneNinth if group == 0 => (4, 8),
+                Phase::OneNinth if group == 1 && self.tick.is_multiple_of(9) => (1, 1),
+                Phase::OneNinth => (1, 2),
+                Phase::ReturnBurst => (8, 16),
+                Phase::Reconnect => (4, 8),
                 Phase::SlowNeighbor if group == self.slow_group && self.tick.is_multiple_of(23) => {
-                    (1, 1, 1)
+                    (1, 1)
                 }
-                Phase::SlowNeighbor if group == self.slow_group => (0, 0, 0),
-                Phase::SlowNeighbor if group == self.healthy_group => (8, 8, 16),
-                Phase::SlowNeighbor => (2, 2, 4),
+                Phase::SlowNeighbor if group == self.slow_group => (0, 0),
+                Phase::SlowNeighbor if group == self.healthy_group => (8, 16),
+                Phase::SlowNeighbor => (2, 4),
             };
-            self.drain_worker(worker, budgets.0, budgets.1, budgets.2, phase);
+            self.drain_worker(worker, budgets.0, budgets.1, phase);
         }
         self.observe_bounds(Some(phase));
     }
 
     fn drain_all(&mut self, phase: Phase) {
         for worker in 0..self.count {
-            self.drain_worker(worker, 32, 32, 32, phase);
+            self.drain_worker(worker, 32, 32, phase);
         }
         self.observe_bounds(Some(phase));
     }
@@ -626,35 +593,23 @@ impl Scenario {
         let queued_before: usize = self
             .receivers
             .iter()
-            .map(|receiver| {
-                receiver.normal.len()
-                    + receiver.small.len()
-                    + receiver.bulk.len()
-                    + receiver.doomsday.len()
-            })
+            .map(|receiver| receiver.latency.len() + receiver.priority.len() + receiver.bulk.len())
             .sum();
         for receiver in &self.receivers {
-            receiver.normal.suspend();
-            receiver.small.suspend();
+            receiver.latency.suspend();
+            receiver.priority.suspend();
             receiver.bulk.suspend();
-            receiver.doomsday.suspend();
         }
         self.epoch = self.epoch.saturating_add(1);
         for receiver in &self.receivers {
-            receiver.normal.resume();
-            receiver.small.resume();
+            receiver.latency.resume();
+            receiver.priority.resume();
             receiver.bulk.resume();
-            receiver.doomsday.resume();
         }
         let queued_after: usize = self
             .receivers
             .iter()
-            .map(|receiver| {
-                receiver.normal.len()
-                    + receiver.small.len()
-                    + receiver.bulk.len()
-                    + receiver.doomsday.len()
-            })
+            .map(|receiver| receiver.latency.len() + receiver.priority.len() + receiver.bulk.len())
             .sum();
         if queued_before > 0 {
             self.coverage
@@ -694,7 +649,7 @@ impl Scenario {
     fn deterministic_fault_probe(&mut self) {
         self.issue(2, FLAG_FORCE_DELAY);
         self.drain_all(Phase::Reconnect);
-        for _ in 0..self.count * SMALL_CAPACITY {
+        for _ in 0..self.count * LATENCY_CAPACITY {
             self.issue(3, FLAG_CONTROL | FLAG_NO_FAULT);
         }
         self.issue(3, FLAG_CONTROL | FLAG_NO_FAULT);
@@ -725,7 +680,7 @@ impl Scenario {
             self.issue(4 + step % 2, 0);
             for worker in 0..self.count {
                 if worker / 9 != self.slow_group {
-                    self.drain_worker(worker, 2, 2, 4, Phase::SlowNeighbor);
+                    self.drain_worker(worker, 2, 4, Phase::SlowNeighbor);
                 }
             }
             self.observe_bounds(Some(Phase::SlowNeighbor));
@@ -868,7 +823,7 @@ impl Scenario {
         if self.pool.available() != self.pool.capacity() {
             self.violations = self.violations.saturating_add(1);
         }
-        if self.coverage.hits[Feature::NormalFallback as usize] == 0 {
+        if self.coverage.hits[Feature::ForcedFallback as usize] == 0 {
             self.violations = self.violations.saturating_add(1);
         }
         if self.coverage.hits[Feature::StaleQueuePurge as usize] == 0
@@ -1062,7 +1017,7 @@ fn assert_report(report: &Report) {
 }
 
 #[test]
-fn deterministic_transport_chaos_covers_9_through_162_and_replays_exactly() {
+fn deterministic_transport_chaos_covers_9_through_126_and_replays_exactly() {
     let first = run_suite(0x4d59_5df4_d0f3_3173, TOTALS.len() * 180);
     assert_report(&first);
     let replay = run_suite(0x4d59_5df4_d0f3_3173, TOTALS.len() * 180);
@@ -1092,7 +1047,7 @@ fn transport_chaos_mutation_oracle_detects_each_broken_invariant() {
         Mutation::AcceptReplay,
         Mutation::DropControl,
         Mutation::PinFirstWorker,
-        Mutation::DisableNormalFallback,
+        Mutation::DisableForceFallback,
         Mutation::SkipGroupedInterruption,
         Mutation::NeverReturnPrimary,
     ] {
@@ -1115,7 +1070,7 @@ fn deterministic_transport_chaos_soak() {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(240_000)
-        .max(TOTALS.len() * 162);
+        .max(TOTALS.len() * 126);
     let report = run_suite(seed, steps);
     assert_report(&report);
     eprintln!(

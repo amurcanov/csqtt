@@ -54,8 +54,7 @@ impl Counters {
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 pub struct Snapshot {
-    pub io_wait: Counters,
-    pub cqe_processing: Counters,
+    pub dispatch: Counters,
     pub udp_rx: Counters,
     pub tun_rx: Counters,
     pub route_replay: Counters,
@@ -63,16 +62,12 @@ pub struct Snapshot {
     pub udp_queue: Counters,
     pub flush: Counters,
     pub bookkeeping: Counters,
-    pub io_enter: Counters,
-    pub sq_submit: Counters,
-    pub cq_drain: Counters,
 }
 
 impl Snapshot {
     pub fn delta(self, previous: Self) -> Self {
         Self {
-            io_wait: self.io_wait.delta(previous.io_wait),
-            cqe_processing: self.cqe_processing.delta(previous.cqe_processing),
+            dispatch: self.dispatch.delta(previous.dispatch),
             udp_rx: self.udp_rx.delta(previous.udp_rx),
             tun_rx: self.tun_rx.delta(previous.tun_rx),
             route_replay: self.route_replay.delta(previous.route_replay),
@@ -80,16 +75,12 @@ impl Snapshot {
             udp_queue: self.udp_queue.delta(previous.udp_queue),
             flush: self.flush.delta(previous.flush),
             bookkeeping: self.bookkeeping.delta(previous.bookkeeping),
-            io_enter: self.io_enter.delta(previous.io_enter),
-            sq_submit: self.sq_submit.delta(previous.sq_submit),
-            cq_drain: self.cq_drain.delta(previous.cq_drain),
         }
     }
 
     pub fn merge(self, other: Self) -> Self {
         Self {
-            io_wait: self.io_wait.add(other.io_wait),
-            cqe_processing: self.cqe_processing.add(other.cqe_processing),
+            dispatch: self.dispatch.add(other.dispatch),
             udp_rx: self.udp_rx.add(other.udp_rx),
             tun_rx: self.tun_rx.add(other.tun_rx),
             route_replay: self.route_replay.add(other.route_replay),
@@ -97,17 +88,13 @@ impl Snapshot {
             udp_queue: self.udp_queue.add(other.udp_queue),
             flush: self.flush.add(other.flush),
             bookkeeping: self.bookkeeping.add(other.bookkeeping),
-            io_enter: self.io_enter.add(other.io_enter),
-            sq_submit: self.sq_submit.add(other.sq_submit),
-            cq_drain: self.cq_drain.add(other.cq_drain),
         }
     }
 }
 
 #[derive(Clone, Copy)]
 pub enum Stage {
-    IoWait,
-    CqeProcessing,
+    Dispatch,
     UdpRx,
     TunRx,
     RouteReplay,
@@ -115,82 +102,101 @@ pub enum Stage {
     UdpQueue,
     Flush,
     Bookkeeping,
-    IoEnter,
-    SqSubmit,
-    CqDrain,
 }
 
 impl Stage {
+    #[cfg(feature = "diagnostics")]
     fn index(self) -> usize {
         match self {
-            Self::IoWait => 0,
-            Self::CqeProcessing => 1,
-            Self::UdpRx => 2,
-            Self::TunRx => 3,
-            Self::RouteReplay => 4,
-            Self::TunWrite => 5,
-            Self::UdpQueue => 6,
-            Self::Flush => 7,
-            Self::Bookkeeping => 8,
-            Self::IoEnter => 9,
-            Self::SqSubmit => 10,
-            Self::CqDrain => 11,
+            Self::Dispatch => 0,
+            Self::UdpRx => 1,
+            Self::TunRx => 2,
+            Self::RouteReplay => 3,
+            Self::TunWrite => 4,
+            Self::UdpQueue => 5,
+            Self::Flush => 6,
+            Self::Bookkeeping => 7,
         }
     }
 }
 
+#[derive(Default)]
 pub struct Profiler {
+    #[cfg(feature = "diagnostics")]
     enabled: bool,
-    cursors: [u64; 12],
-    counters: [Counters; 12],
-}
-
-impl Default for Profiler {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            cursors: [0, 5, 11, 17, 23, 29, 35, 41, 47, 53, 57, 61],
-            counters: [Counters::default(); 12],
-        }
-    }
+    #[cfg(feature = "diagnostics")]
+    cursors: [u64; 8],
+    #[cfg(feature = "diagnostics")]
+    counters: [Counters; 8],
 }
 
 impl Profiler {
     pub fn refresh_enabled(&mut self) {
-        self.enabled = ALL_CLIENTS.load(Ordering::Acquire) != 0;
+        #[cfg(feature = "diagnostics")]
+        {
+            self.enabled = ALL_CLIENTS.load(Ordering::Acquire) != 0;
+        }
+        #[cfg(not(feature = "diagnostics"))]
+        {
+            let _ = self;
+        }
     }
 
     pub fn enabled(&self) -> bool {
-        self.enabled
+        #[cfg(feature = "diagnostics")]
+        {
+            self.enabled
+        }
+        #[cfg(not(feature = "diagnostics"))]
+        {
+            let _ = self;
+            false
+        }
     }
 
     #[inline(always)]
     pub fn begin(&mut self, stage: Stage, bytes: usize) -> Option<u64> {
-        if !self.enabled {
-            return None;
+        #[cfg(feature = "diagnostics")]
+        {
+            if !self.enabled {
+                return None;
+            }
+            let index = stage.index();
+            let counter = &mut self.counters[index];
+            counter.operations = counter.operations.saturating_add(1);
+            counter.bytes = counter.bytes.saturating_add(bytes as u64);
+            let cursor = self.cursors[index];
+            self.cursors[index] = cursor.wrapping_add(1);
+            if cursor.is_multiple_of(SAMPLE_INTERVAL) {
+                counter.samples = counter.samples.saturating_add(1);
+                Some(thread_cpu_time_ns())
+            } else {
+                None
+            }
         }
-        let index = stage.index();
-        let counter = &mut self.counters[index];
-        counter.operations = counter.operations.saturating_add(1);
-        counter.bytes = counter.bytes.saturating_add(bytes as u64);
-        let cursor = self.cursors[index];
-        self.cursors[index] = cursor.wrapping_add(1);
-        if cursor.is_multiple_of(SAMPLE_INTERVAL) {
-            counter.samples = counter.samples.saturating_add(1);
-            Some(thread_cpu_time_ns())
-        } else {
+        #[cfg(not(feature = "diagnostics"))]
+        {
+            let _ = (stage, bytes);
             None
         }
     }
 
     #[inline(always)]
     pub fn finish(&mut self, stage: Stage, started: Option<u64>) {
-        let Some(started) = started else {
-            return;
-        };
-        self.finish_elapsed(stage, thread_cpu_time_ns().saturating_sub(started));
+        #[cfg(feature = "diagnostics")]
+        {
+            let Some(started) = started else {
+                return;
+            };
+            self.finish_elapsed(stage, thread_cpu_time_ns().saturating_sub(started));
+        }
+        #[cfg(not(feature = "diagnostics"))]
+        {
+            let _ = (stage, started);
+        }
     }
 
+    #[cfg(feature = "diagnostics")]
     #[inline(always)]
     pub fn finish_elapsed(&mut self, stage: Stage, elapsed_ns: u64) {
         let counter = &mut self.counters[stage.index()];
@@ -199,42 +205,29 @@ impl Profiler {
 
     #[inline(always)]
     pub fn expand_batch(&mut self, stage: Stage, operations: u64, bytes: u64, sampled: bool) {
-        if !self.enabled {
-            return;
+        #[cfg(feature = "diagnostics")]
+        {
+            if !self.enabled {
+                return;
+            }
+            let counter = &mut self.counters[stage.index()];
+            let additional = operations.saturating_sub(1);
+            counter.operations = counter.operations.saturating_add(additional);
+            counter.bytes = counter.bytes.saturating_add(bytes);
+            if sampled {
+                counter.samples = counter.samples.saturating_add(additional);
+            }
         }
-        let counter = &mut self.counters[stage.index()];
-        let additional = operations.saturating_sub(1);
-        counter.operations = counter.operations.saturating_add(additional);
-        counter.bytes = counter.bytes.saturating_add(bytes);
-        if sampled {
-            counter.samples = counter.samples.saturating_add(additional);
-        }
-    }
-
-    pub fn record_timing(
-        &mut self,
-        stage: Stage,
-        operations: u64,
-        sampled: bool,
-        cpu_ns: u64,
-        wall_ns: u64,
-    ) {
-        if !self.enabled || operations == 0 {
-            return;
-        }
-        let counter = &mut self.counters[stage.index()];
-        counter.operations = counter.operations.saturating_add(operations);
-        if sampled {
-            counter.samples = counter.samples.saturating_add(operations);
-            counter.sampled_ns = counter.sampled_ns.saturating_add(cpu_ns);
-            counter.sampled_wall_ns = counter.sampled_wall_ns.saturating_add(wall_ns);
+        #[cfg(not(feature = "diagnostics"))]
+        {
+            let _ = (stage, operations, bytes, sampled);
         }
     }
 
+    #[cfg(feature = "diagnostics")]
     pub fn snapshot(&self) -> Snapshot {
         Snapshot {
-            io_wait: self.counters[Stage::IoWait.index()],
-            cqe_processing: self.counters[Stage::CqeProcessing.index()],
+            dispatch: self.counters[Stage::Dispatch.index()],
             udp_rx: self.counters[Stage::UdpRx.index()],
             tun_rx: self.counters[Stage::TunRx.index()],
             route_replay: self.counters[Stage::RouteReplay.index()],
@@ -242,20 +235,25 @@ impl Profiler {
             udp_queue: self.counters[Stage::UdpQueue.index()],
             flush: self.counters[Stage::Flush.index()],
             bookkeeping: self.counters[Stage::Bookkeeping.index()],
-            io_enter: self.counters[Stage::IoEnter.index()],
-            sq_submit: self.counters[Stage::SqSubmit.index()],
-            cq_drain: self.counters[Stage::CqDrain.index()],
         }
     }
 
     pub fn publish_dataplane(&self) {
-        if self.enabled
-            && let Ok(mut global) = GLOBAL_DATAPLANE.write()
+        #[cfg(feature = "diagnostics")]
         {
-            *global = self.snapshot();
+            if self.enabled
+                && let Ok(mut global) = GLOBAL_DATAPLANE.write()
+            {
+                *global = self.snapshot();
+            }
+        }
+        #[cfg(not(feature = "diagnostics"))]
+        {
+            let _ = self;
         }
     }
 
+    #[cfg(feature = "diagnostics")]
     pub fn publish_protocol(&self) {
         if self.enabled
             && let Ok(mut global) = GLOBAL_PROTOCOL.write()

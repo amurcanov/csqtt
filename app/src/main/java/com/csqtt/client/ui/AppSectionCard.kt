@@ -26,7 +26,7 @@ private fun appSectionCardColor(): Color {
     val colors = MaterialTheme.colorScheme
     val isDark = colors.background.luminance() < 0.22f
     return if (isDark) {
-        lerp(colors.surface, colors.surfaceVariant, 0.10f)
+        lerp(colors.background, colors.surface, 0.82f)
     } else {
         lerp(colors.surface, colors.surfaceVariant, 0.28f)
     }
@@ -37,7 +37,7 @@ private fun appSectionCardBorderColor(): Color {
     val colors = MaterialTheme.colorScheme
     val isDark = colors.background.luminance() < 0.22f
     return if (isDark) {
-        colors.outlineVariant.copy(alpha = 0.26f)
+        colors.outlineVariant.copy(alpha = 0.32f)
     } else {
         colors.outlineVariant.copy(alpha = 0.24f)
     }
@@ -55,8 +55,8 @@ fun AppSectionCard(
         color = appSectionCardColor(),
         contentColor = MaterialTheme.colorScheme.onSurface,
         border = BorderStroke(1.dp, appSectionCardBorderColor()),
-        shadowElevation = 0.dp,
-        tonalElevation = 0.dp,
+        shadowElevation = if (MaterialTheme.colorScheme.background.luminance() < 0.22f) 4.dp else 10.dp,
+        tonalElevation = if (MaterialTheme.colorScheme.background.luminance() < 0.22f) 0.dp else 2.dp,
         modifier = modifier.fillMaxWidth()
     ) {
         Column(

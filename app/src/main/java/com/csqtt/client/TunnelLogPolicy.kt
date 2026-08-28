@@ -4,16 +4,13 @@
 package com.csqtt.client
 
 object TunnelLogPolicy {
-    fun shouldSurfacePathHealth(
-        missed: Long,
-        sendErrors: Long,
-        unresponsive: Long,
-    ): Boolean = missed > 0L || sendErrors > 0L || unresponsive > 0L
+    fun isAllowedWhenInactiveLogging(key: String, isError: Boolean, level: LogLevel?): Boolean {
+        return isError || level == LogLevel.ERR || key == "ready" || key == "stats"
+    }
 
     fun isInternalRecovery(line: String): Boolean {
         if (line.contains("FATAL_AUTH", ignoreCase = true)) return false
         return line.contains("GETCONF", ignoreCase = true) ||
-            line.contains("[TURN][RETRY]", ignoreCase = true) ||
             line.contains("[СЕТЬ][RETRY]", ignoreCase = true) ||
             line.contains("PEER_LIVENESS_TIMEOUT", ignoreCase = true)
     }

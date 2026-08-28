@@ -8,6 +8,7 @@ import android.content.Context
 import android.net.Uri
 import android.os.Handler
 import android.os.Looper
+import android.view.KeyEvent
 import android.view.ViewGroup
 import android.webkit.CookieManager
 import android.webkit.WebResourceError
@@ -29,41 +30,11 @@ internal data class VkAuthPayload(
 internal enum class VkAuthPhase { LOGIN, TOKEN }
 
 internal object VkAuthWebViewManager {
-    @Volatile
-    private var prewarmed: WebView? = null
-
     private val mainHandler = Handler(Looper.getMainLooper())
 
-    fun prewarm(context: Context) {
-        if (prewarmed != null) return
-        val appContext = context.applicationContext
-        mainHandler.post {
-            if (prewarmed != null) return@post
-            runCatching {
-                val view = createWebView(appContext)
-                view.loadUrl(CsqttConstants.VkAutoHash.VK_LOGIN_URL)
-                prewarmed = view
-            }
-        }
-    }
-
-    fun acquire(context: Context): WebView {
-        val existing = prewarmed
-        if (existing != null) {
-            prewarmed = null
-            return existing
-        }
-        return createWebView(context.applicationContext)
-    }
-
-    fun discardPrewarmed() {
-        val existing = prewarmed ?: return
-        prewarmed = null
-        release(existing)
-    }
+    fun acquire(context: Context): WebView = createWebView(context)
 
     fun clearVkSessionCookies() {
-        discardPrewarmed()
         mainHandler.post {
             runCatching {
                 val manager = CookieManager.getInstance()
@@ -85,7 +56,6 @@ internal object VkAuthWebViewManager {
                 view.destroy()
             }
         }
-        if (prewarmed === view) prewarmed = null
     }
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -100,12 +70,89 @@ internal object VkAuthWebViewManager {
             setSupportZoom(false)
             builtInZoomControls = false
         }
+        if (TvDevicePolicy.isTelevision(context)) {
+            configureTelevisionInput(view)
+        }
         runCatching {
             CookieManager.getInstance().setAcceptCookie(true)
             CookieManager.getInstance().setAcceptThirdPartyCookies(view, true)
         }
         return view
     }
+
+    private fun configureTelevisionInput(view: WebView) {
+        view.isFocusable = true
+        view.isFocusableInTouchMode = false
+        view.setOnFocusChangeListener { _, hasFocus ->
+            if (hasFocus) {
+                view.post { view.evaluateJavascript(TV_FOCUS_FIRST_ELEMENT_JS, null) }
+            }
+        }
+        view.setOnKeyListener { _, keyCode, event ->
+            if (event.action != KeyEvent.ACTION_DOWN) return@setOnKeyListener false
+            val command = when (keyCode) {
+                KeyEvent.KEYCODE_DPAD_UP, KeyEvent.KEYCODE_DPAD_LEFT -> "previous"
+                KeyEvent.KEYCODE_DPAD_DOWN, KeyEvent.KEYCODE_DPAD_RIGHT -> "next"
+                KeyEvent.KEYCODE_DPAD_CENTER,
+                KeyEvent.KEYCODE_ENTER,
+                KeyEvent.KEYCODE_NUMPAD_ENTER -> "activate"
+                else -> null
+            } ?: return@setOnKeyListener false
+
+            view.evaluateJavascript("window.__csqttTvInput && window.__csqttTvInput('$command');", null)
+            true
+        }
+        view.post { view.requestFocus() }
+    }
+
+    private const val TV_FOCUS_FIRST_ELEMENT_JS = """
+        (function() {
+          if (window.__csqttTvInput) {
+            window.__csqttTvInput('ensure-focus');
+            return;
+          }
+          var selector = 'a[href],button,input:not([type=hidden]),select,textarea,[role=button],[tabindex]:not([tabindex="-1"])';
+          function elements() {
+            return Array.prototype.filter.call(document.querySelectorAll(selector), function(node) {
+              var style = window.getComputedStyle(node);
+              return !node.disabled && style.display !== 'none' && style.visibility !== 'hidden' && node.getClientRects().length > 0;
+            });
+          }
+          function focus(node) {
+            if (!node) return false;
+            node.focus({preventScroll: true});
+            node.scrollIntoView({block: 'center', inline: 'nearest'});
+            return true;
+          }
+          window.__csqttTvInput = function(command) {
+            var items = elements();
+            var active = document.activeElement;
+            var index = items.indexOf(active);
+            if (command === 'ensure-focus') {
+              return index >= 0 || focus(items[0]);
+            }
+            if (command === 'next' || command === 'previous') {
+              if (!items.length) return false;
+              var direction = command === 'next' ? 1 : -1;
+              var next = index < 0 ? (direction > 0 ? 0 : items.length - 1) : (index + direction + items.length) % items.length;
+              return focus(items[next]);
+            }
+            if (command === 'activate') {
+              if (index < 0 && !focus(items[0])) return false;
+              active = document.activeElement;
+              if (!active) return false;
+              if (active.matches('button,a[href],input[type=button],input[type=submit],input[type=checkbox],input[type=radio],[role=button]')) {
+                active.click();
+                return true;
+              }
+              active.click();
+              return true;
+            }
+            return false;
+          };
+          window.__csqttTvInput('ensure-focus');
+        })();
+    """
 }
 
 @SuppressLint("SetJavaScriptEnabled")
@@ -123,14 +170,26 @@ internal class VkAuthSession(
     private var nonPermanentRetried = false
     private var lastUrl: String? = null
     private var startedAt = 0L
+    private var pausedAt = 0L
     private var uiReadyReported = false
     private var phase = VkAuthPhase.LOGIN
+    private var paused = false
+    private var pendingAuthorizationRetry = false
 
     fun attach(view: WebView) {
         webView = view
         startedAt = System.currentTimeMillis()
         view.webViewClient = object : WebViewClient() {
             override fun onPageFinished(v: WebView, url: String) {
+                installTelevisionNavigation(v)
+                if (!uiReadyReported) {
+                    uiReadyReported = true
+                    onUiReady()
+                }
+            }
+
+            override fun onPageCommitVisible(v: WebView, url: String) {
+                installTelevisionNavigation(v)
                 if (!uiReadyReported) {
                     uiReadyReported = true
                     onUiReady()
@@ -181,13 +240,51 @@ internal class VkAuthSession(
                 view.loadUrl(CsqttConstants.VkAutoHash.VK_LOGIN_URL)
             }
         }
-        mainHandler.postDelayed(monitorTick, CsqttConstants.VkAutoHash.AUTH_MONITOR_INTERVAL_MS)
+        scheduleMonitor()
     }
 
     fun stop() {
         finished = true
         mainHandler.removeCallbacksAndMessages(null)
         webView = null
+    }
+
+    fun pause() {
+        if (finished || paused) return
+        paused = true
+        pausedAt = System.currentTimeMillis()
+        mainHandler.removeCallbacks(monitorTick)
+        webView?.onPause()
+    }
+
+    fun resume() {
+        if (finished || !paused) return
+        val resumedAt = System.currentTimeMillis()
+        if (pausedAt != 0L) {
+            startedAt += (resumedAt - pausedAt).coerceAtLeast(0L)
+            pausedAt = 0L
+        }
+        paused = false
+        webView?.onResume()
+        if (pendingAuthorizationRetry) {
+            pendingAuthorizationRetry = false
+            repeatAuthorization()
+        }
+        scheduleMonitor()
+    }
+
+    private fun scheduleMonitor() {
+        mainHandler.removeCallbacks(monitorTick)
+        if (!finished && !paused) {
+            mainHandler.postDelayed(monitorTick, CsqttConstants.VkAutoHash.AUTH_MONITOR_INTERVAL_MS)
+        }
+    }
+
+    private fun installTelevisionNavigation(view: WebView) {
+        if (TvDevicePolicy.isTelevision(view.context)) {
+            view.evaluateJavascript(TV_FOCUS_FIRST_ELEMENT_JS, null)
+            view.post { view.requestFocus() }
+        }
     }
 
     private fun switchToTokenPhase(view: WebView) {
@@ -231,7 +328,7 @@ internal class VkAuthSession(
                         onToken(payload)
                     },
                     onFailure = {
-                        view.loadUrl(CsqttConstants.VkAutoHash.VK_OAUTH_AUTH_URL)
+                        repeatAuthorization()
                     }
                 )
             }
@@ -251,7 +348,7 @@ internal class VkAuthSession(
 
     private val monitorTick = object : Runnable {
         override fun run() {
-            if (finished) return
+            if (finished || paused) return
             val view = webView
             if (view == null) {
                 stop()
@@ -291,7 +388,7 @@ internal class VkAuthSession(
                 }
             }
 
-            mainHandler.postDelayed(this, CsqttConstants.VkAutoHash.AUTH_MONITOR_INTERVAL_MS)
+            scheduleMonitor()
         }
     }
 
@@ -352,6 +449,10 @@ internal class VkAuthSession(
     }
 
     private fun repeatAuthorization() {
+        if (paused) {
+            pendingAuthorizationRetry = true
+            return
+        }
         val view = webView ?: return
         lastUrl = null
         view.loadUrl(CsqttConstants.VkAutoHash.VK_OAUTH_AUTH_URL)
@@ -377,6 +478,51 @@ internal class VkAuthSession(
     }
 
     companion object {
+        private const val TV_FOCUS_FIRST_ELEMENT_JS = """
+            (function() {
+              if (window.__csqttTvInput) {
+                window.__csqttTvInput('ensure-focus');
+                return;
+              }
+              var selector = 'a[href],button,input:not([type=hidden]),select,textarea,[role=button],[tabindex]:not([tabindex="-1"])';
+              function elements() {
+                return Array.prototype.filter.call(document.querySelectorAll(selector), function(node) {
+                  var style = window.getComputedStyle(node);
+                  return !node.disabled && style.display !== 'none' && style.visibility !== 'hidden' && node.getClientRects().length > 0;
+                });
+              }
+              function focus(node) {
+                if (!node) return false;
+                node.focus({preventScroll: true});
+                node.scrollIntoView({block: 'center', inline: 'nearest'});
+                return true;
+              }
+              window.__csqttTvInput = function(command) {
+                var items = elements();
+                var active = document.activeElement;
+                var index = items.indexOf(active);
+                if (command === 'ensure-focus') {
+                  return index >= 0 || focus(items[0]);
+                }
+                if (command === 'next' || command === 'previous') {
+                  if (!items.length) return false;
+                  var direction = command === 'next' ? 1 : -1;
+                  var next = index < 0 ? (direction > 0 ? 0 : items.length - 1) : (index + direction + items.length) % items.length;
+                  return focus(items[next]);
+                }
+                if (command === 'activate') {
+                  if (index < 0 && !focus(items[0])) return false;
+                  active = document.activeElement;
+                  if (!active) return false;
+                  active.click();
+                  return true;
+                }
+                return false;
+              };
+              window.__csqttTvInput('ensure-focus');
+            })();
+        """
+
         private val TOKEN_WAITING_HTML = """
             <!DOCTYPE html>
             <html>

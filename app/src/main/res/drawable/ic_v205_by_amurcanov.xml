@@ -1,0 +1,160 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-FileCopyrightText: 2026 amurcanov -->
+<!-- SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0 -->
+
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="180dp"
+    android:height="23dp"
+    android:viewportWidth="516"
+    android:viewportHeight="64"
+    android:autoMirrored="false">
+
+    <path
+        android:fillColor="@android:color/transparent"
+        android:strokeWidth="6"
+        android:strokeAlpha="1"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="
+            M8,24
+            L18,48
+            L28,24
+
+            M34,20
+            Q38,14 46,14
+            H50
+            Q58,14 58,22
+            Q58,28 52,33
+            L36,48
+            H58
+
+            M67,47
+            L67.8,47
+
+            M86,14
+            V48
+
+            M107,47
+            L107.8,47
+
+            M142,14
+            H121
+            V30
+            Q126,24 133,24
+            Q142,24 142,36
+            Q142,48 132,48
+            Q125,48 121,42
+
+            M158,12
+            V48
+
+            M158,31
+            Q163,24 170,24
+            Q180,24 180,36
+            Q180,48 170,48
+            Q163,48 158,41
+
+            M190,24
+            L200,47
+
+            M210,24
+            L200,47
+            L196,57
+            Q194,60 189,58
+
+            M250,30
+            Q246,24 239,24
+            Q228,24 228,36
+            Q228,48 239,48
+            Q246,48 250,42
+
+            M250,24
+            V48
+
+            M260,48
+            V24
+
+            M260,31
+            Q264,24 270,24
+            Q277,24 277,32
+            V48
+
+            M277,31
+            Q281,24 287,24
+            Q294,24 294,32
+            V48
+
+            M304,24
+            V39
+            Q304,48 314,48
+            Q324,48 324,39
+            V24
+
+            M334,48
+            V24
+
+            M334,32
+            Q338,24 348,24
+
+            M382,29
+            Q378,24 370,24
+            Q360,24 360,36
+            Q360,48 370,48
+            Q378,48 382,43
+
+            M414,30
+            Q410,24 403,24
+            Q392,24 392,36
+            Q392,48 403,48
+            Q410,48 414,42
+
+            M414,24
+            V48
+
+            M424,48
+            V24
+
+            M424,32
+            Q429,24 436,24
+            Q446,24 446,35
+            V48
+
+            M467,24
+            Q456,24 456,36
+            Q456,48 467,48
+            Q478,48 478,36
+            Q478,24 467,24
+            Z
+
+            M488,24
+            L498,48
+            L508,24">
+
+        <aapt:attr name="android:strokeColor">
+            <gradient
+                android:type="linear"
+                android:startX="0"
+                android:startY="0"
+                android:endX="504"
+                android:endY="64"
+                android:tileMode="clamp">
+
+                <item
+                    android:offset="0.0"
+                    android:color="#45B7FF" />
+
+                <item
+                    android:offset="0.45"
+                    android:color="#2087FF" />
+
+                <item
+                    android:offset="1.0"
+                    android:color="#075BFF" />
+
+            </gradient>
+        </aapt:attr>
+
+    </path>
+
+</vector>

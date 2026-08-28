@@ -3,7 +3,7 @@
 
 [package]
 name = "csqtt"
-version = "2.0.0"
+version = "2.1.5"
 edition = "2024"
 rust-version = "1.97.1"
 license = "PolyForm-Noncommercial-1.0.0"
@@ -12,28 +12,34 @@ license = "PolyForm-Noncommercial-1.0.0"
 name = "csqtt"
 path = "main.rs"
 
+[features]
+default = []
+diagnostics = []
+
 [dependencies]
-aes = "0.8"
+aes = "0.9.2"
 anyhow = "1.0"
 
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
 axum-server = { version = "0.8.0", default-features = false, features = ["tls-rustls-no-provider"] }
 base64 = "0.22"
+bytes = "1.12.1"
 chrono = "0.4"
 clap = { version = "4.5", features = ["derive", "env"] }
-ctr = "0.9"
+crossbeam-queue = "0.3.13"
+ctr = "0.10.1"
 dashmap = "6.1"
-etherparse = "0.16"
 hex = "0.4"
-hkdf = "0.12"
+hkdf = "0.13.0"
 libc = "0.2"
 rand = "0.8"
 rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "pem"] }
-aws-lc-rs = "1.17.3"
+rusqlite = { version = "0.37", features = ["bundled"] }
+aws-lc-rs = "1.18.0"
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-sha2 = "0.10"
+sha2 = "0.11.0"
 slab = "0.4"
 socket2 = "0.6"
 subtle = "2.6"
@@ -44,7 +50,7 @@ tun = "=0.8.14"
 x25519-dalek = { version = "2.0", features = ["static_secrets"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-io-uring = "=0.7.13"
+snmalloc-rs = { version = "0.7.5", default-features = false, features = ["build_cc", "usewait-on-address"] }
 
 [dev-dependencies]
 tokio = { version = "1.53.1", features = ["test-util"] }

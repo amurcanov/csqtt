@@ -143,10 +143,21 @@ class TunVpnService : VpnService() {
                     }
                     .toSet()
                 if (installedIncluded.isEmpty()) {
-                    try { builder.addAllowedApplication("com.csqtt.whitelist.empty") } catch (_: Exception) {}
+                    failVpn("Whitelist пуст: выберите хотя бы одно установленное приложение")
+                    return
                 } else {
+                    var includedCount = 0
                     installedIncluded.forEach { pkg ->
-                        try { builder.addAllowedApplication(pkg) } catch (_: Exception) {}
+                        try {
+                            builder.addAllowedApplication(pkg)
+                            includedCount++
+                        } catch (error: Exception) {
+                            Log.w(TAG, "Unable to include $pkg in VPN", error)
+                        }
+                    }
+                    if (includedCount == 0) {
+                        failVpn("Android не разрешил добавить выбранные приложения в whitelist")
+                        return
                     }
                 }
             } else {
@@ -306,7 +317,6 @@ class TunVpnService : VpnService() {
         stopRequested = true
         serviceDestroyed = true
         serviceJob.cancel()
-        runCatching { VkAutoCallsManager.finishActiveCalls() }
         stopVpn()
         instance = null
         TunnelManager.onVpnTerminalFailure("разрешение Android VPN было отозвано")

@@ -7,8 +7,11 @@ use hmac::{Hmac, Mac};
 use md5::{Digest, Md5};
 use sha1::Sha1;
 use std::net::{IpAddr, SocketAddr};
-use tokio::net::UdpSocket;
 use tokio::sync::oneshot;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream, UdpSocket},
+};
 
 const STUN_COOKIE: u32 = 0x2112_a442;
 const ALLOCATE_REQUEST: u16 = 0x0003;
@@ -254,6 +257,38 @@ async fn recv_datagram(socket: &UdpSocket) -> (Vec<u8>, SocketAddr) {
     (buffer[..length].to_vec(), source)
 }
 
+async fn recv_stream_message(stream: &mut TcpStream) -> Vec<u8> {
+    let mut header = [0u8; 20];
+    tokio::time::timeout(Duration::from_secs(3), stream.read_exact(&mut header))
+        .await
+        .unwrap()
+        .unwrap();
+    let attributes = u16::from_be_bytes([header[2], header[3]]) as usize;
+    let mut wire = vec![0u8; 20 + attributes];
+    wire[..20].copy_from_slice(&header);
+    if attributes > 0 {
+        stream.read_exact(&mut wire[20..]).await.unwrap();
+    }
+    wire
+}
+
+async fn recv_stream_channel_data(stream: &mut TcpStream) -> Vec<u8> {
+    let mut header = [0u8; 4];
+    tokio::time::timeout(Duration::from_secs(3), stream.read_exact(&mut header))
+        .await
+        .unwrap()
+        .unwrap();
+    let payload = u16::from_be_bytes([header[2], header[3]]) as usize;
+    let length = 4 + payload;
+    let padded = (length + 3) & !3;
+    let mut wire = vec![0u8; padded];
+    wire[..4].copy_from_slice(&header);
+    if padded > 4 {
+        stream.read_exact(&mut wire[4..]).await.unwrap();
+    }
+    wire
+}
+
 async fn receive_challenged_allocate(server: &UdpSocket, relay: SocketAddr) -> SocketAddr {
     let (first_wire, client) = recv_datagram(server).await;
     let first = StunMessage::decode(&first_wire).unwrap();
@@ -280,6 +315,24 @@ async fn receive_challenged_allocate(server: &UdpSocket, relay: SocketAddr) -> S
     client
 }
 
+async fn receive_create_permission(server: &UdpSocket, client: SocketAddr, peer: SocketAddr) {
+    let (permission_wire, permission_client) = recv_datagram(server).await;
+    assert_eq!(permission_client, client);
+    let permission = assert_authenticated_request(&permission_wire, CREATE_PERMISSION_REQUEST);
+    let encoded_peer = permission.attribute(ATTR_XOR_PEER_ADDRESS).unwrap();
+    assert_eq!(
+        decode_xor_address(encoded_peer.value, &permission.transaction()),
+        peer
+    );
+    server
+        .send_to(
+            &empty_authenticated_success(CREATE_PERMISSION_SUCCESS, permission.transaction()),
+            client,
+        )
+        .await
+        .unwrap();
+}
+
 async fn connect(
     server: SocketAddr,
     peer: SocketAddr,
@@ -288,7 +341,12 @@ async fn connect(
     tokio::time::timeout(
         Duration::from_secs(5),
         TurnAllocation::connect(
-            &server.to_string(),
+            TurnConnectTarget {
+                address: &server.to_string(),
+                override_host: None,
+                override_port: None,
+                transport_mode: TurnTransportMode::Udp,
+            },
             Arc::from(USERNAME),
             Arc::from(PASSWORD),
             peer,
@@ -301,6 +359,91 @@ async fn connect(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tcp_turn_transport_allocates_without_udp_fallback() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_address = listener.local_addr().unwrap();
+    let relay: SocketAddr = "127.0.0.1:49009".parse().unwrap();
+    let (data_tx, data_rx) = oneshot::channel();
+    let server_task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let first = recv_stream_message(&mut stream).await;
+        let initial = StunMessage::decode(&first).unwrap();
+        assert_eq!(initial.class(), StunClass::Request);
+        assert_eq!(initial.method(), ALLOCATE_REQUEST);
+        stream
+            .write_all(&challenge_response(initial.transaction()))
+            .await
+            .unwrap();
+        let authenticated_wire = recv_stream_message(&mut stream).await;
+        let authenticated = assert_authenticated_request(&authenticated_wire, ALLOCATE_REQUEST);
+        stream
+            .write_all(&allocate_success(authenticated.transaction(), relay))
+            .await
+            .unwrap();
+        let permission_wire = recv_stream_message(&mut stream).await;
+        let permission = assert_authenticated_request(&permission_wire, CREATE_PERMISSION_REQUEST);
+        stream
+            .write_all(&empty_authenticated_success(
+                CREATE_PERMISSION_SUCCESS,
+                permission.transaction(),
+            ))
+            .await
+            .unwrap();
+        let channel_wire = recv_stream_message(&mut stream).await;
+        let channel_request = assert_authenticated_request(&channel_wire, CHANNEL_BIND_REQUEST);
+        let channel = channel_number(&channel_request);
+        stream
+            .write_all(&empty_authenticated_success(
+                CHANNEL_BIND_SUCCESS,
+                channel_request.transaction(),
+            ))
+            .await
+            .unwrap();
+        let data = recv_stream_channel_data(&mut stream).await;
+        assert_eq!(data, channel_data(channel, b"tcp-data"));
+        data_tx.send(()).unwrap();
+        let refresh_wire = recv_stream_message(&mut stream).await;
+        let refresh = assert_authenticated_request(&refresh_wire, REFRESH_REQUEST);
+        assert_eq!(attribute_u32(&refresh, ATTR_LIFETIME), 0);
+        stream
+            .write_all(&refresh_zero_success(refresh.transaction()))
+            .await
+            .unwrap();
+    });
+    let endpoint = format!("turn:127.0.0.1:{}?transport=tcp", server_address.port());
+    let allocation = TurnAllocation::connect(
+        TurnConnectTarget {
+            address: &endpoint,
+            override_host: None,
+            override_port: None,
+            transport_mode: TurnTransportMode::TcpTls,
+        },
+        Arc::from(USERNAME),
+        Arc::from(PASSWORD),
+        "127.0.0.1:39009".parse().unwrap(),
+        PacketPool::new(4),
+    )
+    .await
+    .unwrap();
+    assert_eq!(allocation.local_addr(), relay);
+    allocation.prepare_channel().await.unwrap();
+    let pool = PacketPool::new(1);
+    let mut packet = pool.acquire();
+    packet.read_area()[..8].copy_from_slice(b"tcp-data");
+    packet.set_read_len(8).unwrap();
+    allocation.send_with_duplicate(packet, false).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), data_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    allocation.deallocate().await;
+    tokio::time::timeout(Duration::from_secs(3), server_task)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn authenticated_flow_survives_pool_deficit_and_keeps_channel_data_zero_copy() {
     let server = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
     let server_address = server.local_addr().unwrap();
@@ -310,26 +453,7 @@ async fn authenticated_flow_survives_pool_deficit_and_keeps_channel_data_zero_co
         let server = server.clone();
         async move {
             let client = receive_challenged_allocate(&server, relay).await;
-
-            let (permission_wire, permission_client) = recv_datagram(&server).await;
-            assert_eq!(permission_client, client);
-            let permission =
-                assert_authenticated_request(&permission_wire, CREATE_PERMISSION_REQUEST);
-            let encoded_peer = permission.attribute(ATTR_XOR_PEER_ADDRESS).unwrap();
-            assert_eq!(
-                decode_xor_address(encoded_peer.value, &permission.transaction()),
-                peer
-            );
-            server
-                .send_to(
-                    &empty_authenticated_success(
-                        CREATE_PERMISSION_SUCCESS,
-                        permission.transaction(),
-                    ),
-                    client,
-                )
-                .await
-                .unwrap();
+            receive_create_permission(&server, client, peer).await;
 
             let (channel_wire, channel_client) = recv_datagram(&server).await;
             assert_eq!(channel_client, client);
@@ -404,11 +528,7 @@ async fn authenticated_flow_survives_pool_deficit_and_keeps_channel_data_zero_co
 
     held.read_area()[..8].copy_from_slice(b"outbound");
     held.set_read_len(8).unwrap();
-    allocation
-        .send_with_duplicate(&mut held, false)
-        .await
-        .unwrap();
-    drop(held);
+    allocation.send_with_duplicate(held, false).await.unwrap();
 
     let mut inbound = tokio::time::timeout(Duration::from_secs(3), receiver.recv())
         .await
@@ -435,6 +555,118 @@ async fn authenticated_flow_survives_pool_deficit_and_keeps_channel_data_zero_co
         .unwrap();
     assert!((0x4000..=0x7fff).contains(&channel));
     assert_eq!(pool.available(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn data_batches_preserve_channel_order_and_release_idle_pool_leases() {
+    const OUTBOUND: [&[u8]; 8] = [
+        b"batch-0", b"batch-1", b"batch-2", b"batch-3", b"batch-4", b"batch-5", b"batch-6",
+        b"batch-7",
+    ];
+    const INBOUND_COUNT: usize = 16;
+
+    let server = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let server_address = server.local_addr().unwrap();
+    let peer: SocketAddr = "127.0.0.1:39007".parse().unwrap();
+    let relay: SocketAddr = "127.0.0.1:49007".parse().unwrap();
+    let (send_inbound, wait_inbound) = oneshot::channel();
+    let server_task = tokio::spawn({
+        let server = server.clone();
+        async move {
+            let client = receive_challenged_allocate(&server, relay).await;
+            receive_create_permission(&server, client, peer).await;
+
+            let (channel_wire, channel_client) = recv_datagram(&server).await;
+            assert_eq!(channel_client, client);
+            let channel_request = assert_authenticated_request(&channel_wire, CHANNEL_BIND_REQUEST);
+            let channel = channel_number(&channel_request);
+            server
+                .send_to(
+                    &empty_authenticated_success(
+                        CHANNEL_BIND_SUCCESS,
+                        channel_request.transaction(),
+                    ),
+                    client,
+                )
+                .await
+                .unwrap();
+
+            wait_inbound.await.unwrap();
+            for index in 0..INBOUND_COUNT {
+                let payload = format!("inbound-{index}");
+                server
+                    .send_to(&channel_data(channel, payload.as_bytes()), client)
+                    .await
+                    .unwrap();
+            }
+
+            for payload in OUTBOUND {
+                let (wire, outbound_client) = recv_datagram(&server).await;
+                assert_eq!(outbound_client, client);
+                assert_eq!(wire, channel_data(channel, payload));
+            }
+
+            let (refresh_wire, refresh_client) = recv_datagram(&server).await;
+            assert_eq!(refresh_client, client);
+            let refresh = assert_authenticated_request(&refresh_wire, REFRESH_REQUEST);
+            assert_eq!(attribute_u32(&refresh, ATTR_LIFETIME), 0);
+            server
+                .send_to(&refresh_zero_success(refresh.transaction()), client)
+                .await
+                .unwrap();
+        }
+    });
+
+    let pool = PacketPool::new(64);
+    let allocation = connect(server_address, peer, pool.clone()).await;
+    tokio::time::timeout(Duration::from_secs(5), allocation.prepare_channel())
+        .await
+        .unwrap()
+        .unwrap();
+
+    // The driver must not reserve its mmsg receive slots while it is waiting
+    // for the next UDP readiness event.
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if pool.available() == pool.capacity() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    send_inbound.send(()).unwrap();
+    let mut receiver = allocation.take_receiver().unwrap();
+    for index in 0..INBOUND_COUNT {
+        let packet = tokio::time::timeout(Duration::from_secs(3), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(packet.as_slice(), format!("inbound-{index}").as_bytes());
+        drop(packet);
+    }
+
+    let mut packets = Vec::with_capacity(OUTBOUND.len());
+    for payload in OUTBOUND {
+        let mut packet = pool.acquire();
+        packet.read_area()[..payload.len()].copy_from_slice(payload);
+        packet.set_read_len(payload.len()).unwrap();
+        packets.push(packet);
+    }
+    allocation.send_data_batch(&mut packets).await.unwrap();
+    drop(packets);
+
+    tokio::time::timeout(Duration::from_secs(2), allocation.deallocate())
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), server_task)
+        .await
+        .unwrap()
+        .unwrap();
+    drop(receiver);
+    assert_eq!(pool.available(), pool.capacity());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -470,7 +702,12 @@ async fn final_allocate_errors_preserve_stun_codes() {
         let result = tokio::time::timeout(
             Duration::from_secs(5),
             TurnAllocation::connect(
-                &server_address.to_string(),
+                TurnConnectTarget {
+                    address: &server_address.to_string(),
+                    override_host: None,
+                    override_port: None,
+                    transport_mode: TurnTransportMode::Udp,
+                },
                 Arc::from(USERNAME),
                 Arc::from(PASSWORD),
                 "127.0.0.1:39002".parse().unwrap(),
@@ -504,20 +741,7 @@ async fn channel_bind_error_closes_data_gate_but_preserves_refresh_zero_control_
         let server = server.clone();
         async move {
             let client = receive_challenged_allocate(&server, relay).await;
-
-            let (permission_wire, _) = recv_datagram(&server).await;
-            let permission =
-                assert_authenticated_request(&permission_wire, CREATE_PERMISSION_REQUEST);
-            server
-                .send_to(
-                    &empty_authenticated_success(
-                        CREATE_PERMISSION_SUCCESS,
-                        permission.transaction(),
-                    ),
-                    client,
-                )
-                .await
-                .unwrap();
+            receive_create_permission(&server, client, peer).await;
 
             let (channel_wire, _) = recv_datagram(&server).await;
             let channel_request = assert_authenticated_request(&channel_wire, CHANNEL_BIND_REQUEST);
@@ -554,14 +778,11 @@ async fn channel_bind_error_closes_data_gate_but_preserves_refresh_zero_control_
     let mut packet = pool.acquire();
     packet.read_area()[..7].copy_from_slice(b"blocked");
     packet.set_read_len(7).unwrap();
-    let before = packet.as_slice().to_vec();
     let send_error = allocation
-        .send_with_duplicate(&mut packet, false)
+        .send_with_duplicate(packet, false)
         .await
         .unwrap_err();
     assert!(format!("{send_error:#}").contains("ChannelBind"));
-    assert_eq!(packet.as_slice(), before);
-    drop(packet);
 
     tokio::time::timeout(Duration::from_secs(2), allocation.deallocate())
         .await
@@ -659,7 +880,12 @@ async fn cancelled_connect_deallocates_server_allocation_after_late_success() {
 
     let connect_task = tokio::spawn(async move {
         TurnAllocation::connect(
-            &server_address.to_string(),
+            TurnConnectTarget {
+                address: &server_address.to_string(),
+                override_host: None,
+                override_port: None,
+                transport_mode: TurnTransportMode::Udp,
+            },
             Arc::from(USERNAME),
             Arc::from(PASSWORD),
             peer,
@@ -707,7 +933,8 @@ async fn cancelled_before_first_control_send_never_creates_allocation() {
     core.start_allocation().unwrap();
     shared.request_cleanup();
     let driver = tokio::spawn(driver_loop(DriverRuntime {
-        socket,
+        outbound: TurnOutbound::Udp(socket.clone()),
+        inbound: TurnInbound::Udp(socket),
         core,
         pool: PacketPool::new(1),
         incoming,
