@@ -2,6 +2,18 @@
 
 Формат журнала основан на принципах Keep a Changelog. Записи сгруппированы по характеру изменения: «Добавлено», «Изменено», «Исправлено», «Удалено» и «Безопасность».
 
+## [Unreleased]
+
+### Исправлено
+
+- Исправлена сборка Rust-сервера на GNU и musl: тип флагов `recvmmsg`/`sendmmsg` выводится из platform-specific libc signature.
+- Scheduler маршрутов сбрасывает stripe при изменении числа активных путей.
+- SSH deploy больше не повреждает `command -v sudo` глобальной подстановкой `sudo -S` (#4).
+- Compose `Flow` страницы настроек создаются через `remember`, поэтому Android lint не сбрасывает collectors при recomposition.
+- Устранены cross-libc false positives Clippy вокруг `cmsghdr` и предупреждения ShellCheck deploy-скрипта.
+- SQLite/WAL/SHM и другие новые server-side secrets создаются с umask `0077`; существующая БД при открытии приводится к `0600`.
+- Версия Rust-клиента синхронизирована с релизом `2.1.5`.
+
 ## [2.1.5] — 2026-08-28
 
 ### Добавлено

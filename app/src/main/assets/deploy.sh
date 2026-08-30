@@ -100,7 +100,7 @@ run_timed() {
 
 check_root() {
     if [ "$(id -u)" -ne 0 ]; then
-        die "Скрипт должен быть запущен от root. Если sudo отсутствует, зайдите под root и запустите: bash $0 $*"
+        die "Скрипт должен быть запущен от root. Если sudo отсутствует, зайдите под root и запустите: bash $0 install"
     fi
 }
 
@@ -111,6 +111,8 @@ detect_os() {
     if [ ! -f /etc/os-release ]; then
         die "Файл /etc/os-release не найден."
     fi
+    # Runtime distribution metadata exists on every supported server.
+    # shellcheck disable=SC1091
     . /etc/os-release
     OS_ID="${ID:-unknown}"
     case "$OS_ID" in
@@ -340,10 +342,10 @@ fw_add_mss_clamping() {
 }
 
 delete_marked_rules() {
-    local table="$1" chain="$2" marker="$3" i numbers number
+    local table="$1" chain="$2" marker="$3" _ numbers number
     local -a targs=()
     [ "$table" = "filter" ] || targs=(-t "$table")
-    for i in 1 2 3 4 5 6 7 8; do
+    for _ in 1 2 3 4 5 6 7 8; do
         numbers="$(iptables -w "$XT_WAIT" "${targs[@]}" -S "$chain" 2>/dev/null | awk -v chain="$chain" -v marker="$marker" '
 $1 == "-A" && $2 == chain {
     n++
@@ -363,11 +365,11 @@ EOF
 }
 
 ipt_del_repeat() {
-    local table="$1" chain="$2" i
+    local table="$1" chain="$2" _
     shift 2
     local -a targs=()
     [ "$table" = "filter" ] || targs=(-t "$table")
-    for i in 1 2 3 4 5 6 7 8; do
+    for _ in 1 2 3 4 5 6 7 8; do
         iptables -w "$XT_WAIT" "${targs[@]}" -D "$chain" "$@" >/dev/null 2>&1 || break
     done
 }
@@ -405,10 +407,10 @@ cleanup_csqtt_netfilter_rules() {
 }
 
 cleanup_csqtt_proxy_policy() {
-    local i
-    for i in 1 2 3 4; do ip -4 rule del fwmark 0x7531/0x7531 priority 30001 table 30001 >/dev/null 2>&1 || break; done
-    for i in 1 2 3 4; do ip -4 rule del fwmark 0x422 priority 1066 table 1066 >/dev/null 2>&1 || break; done
-    for i in 1 2 3 4; do ip -4 rule del from 10.66.67.0/24 priority 1066 table 1066 >/dev/null 2>&1 || break; done
+    local _
+    for _ in 1 2 3 4; do ip -4 rule del fwmark 0x7531/0x7531 priority 30001 table 30001 >/dev/null 2>&1 || break; done
+    for _ in 1 2 3 4; do ip -4 rule del fwmark 0x422 priority 1066 table 1066 >/dev/null 2>&1 || break; done
+    for _ in 1 2 3 4; do ip -4 rule del from 10.66.67.0/24 priority 1066 table 1066 >/dev/null 2>&1 || break; done
     ip -4 route flush table 30001 >/dev/null 2>&1 || true
     ip -4 route flush table 1066 >/dev/null 2>&1 || true
     ip -4 route flush cache >/dev/null 2>&1 || true
@@ -1221,10 +1223,10 @@ setup_letsencrypt_ip_tls() {
 }
 
 verify_web_panel() {
-    local attempt scheme code
+    local _ scheme code
     local probe_file="/tmp/csqtt-web-probe.$$"
 
-    for attempt in $(seq 1 24); do
+    for _ in $(seq 1 24); do
         for scheme in https http; do
             code="$(curl -k -sS -o "$probe_file" -w "%{http_code}" \
                 --connect-timeout 1 --max-time 2 \

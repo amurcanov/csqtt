@@ -1821,6 +1821,12 @@ fn print_cli_help() {
 }
 
 fn main() -> Result<()> {
+    #[cfg(unix)]
+    unsafe {
+        // The server creates credentials, SQLite/WAL files and TLS keys.
+        // Restrict every new file before any worker thread can create one.
+        libc::umask(0o077);
+    }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .max_blocking_threads(1)

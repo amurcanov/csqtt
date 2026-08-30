@@ -591,6 +591,20 @@ const LEGACY_DATABASE_FILE: &str = "passwords.json";
 const LEGACY_DATABASE_IMPORTED_FILE: &str = "passwords.json.imported";
 const LEGACY_DATABASE_FILES: [&str; 2] = [LEGACY_DATABASE_FILE, LEGACY_DATABASE_IMPORTED_FILE];
 
+#[cfg(unix)]
+fn secure_database_file_permissions(config_dir: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    for name in [DATABASE_FILE, "csqtt.db-wal", "csqtt.db-shm"] {
+        let path = config_dir.join(name);
+        if path.exists() {
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("secure {}", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
 const DATABASE_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
@@ -649,6 +663,8 @@ fn open_database_connection(config_dir: &Path) -> Result<Connection> {
         fs::set_permissions(config_dir, fs::Permissions::from_mode(0o700))?;
     }
     let path = config_dir.join(DATABASE_FILE);
+    #[cfg(unix)]
+    secure_database_file_permissions(config_dir)?;
     let connection = Connection::open(&path).with_context(|| format!("open {}", path.display()))?;
     connection
         .pragma_update(None, "journal_mode", "WAL")
@@ -659,6 +675,8 @@ fn open_database_connection(config_dir: &Path) -> Result<Connection> {
     connection
         .execute_batch(DATABASE_SCHEMA)
         .with_context(|| format!("schema {}", path.display()))?;
+    #[cfg(unix)]
+    secure_database_file_permissions(config_dir)?;
     Ok(connection)
 }
 
@@ -1327,6 +1345,28 @@ mod tests {
         ClientDevice, Database, DatabasePersistence, PasswordEntry, PersistenceQueue,
         PersistenceUpdate, TrafficCounters, TrafficSnapshot, load_database, save_database,
     };
+
+    #[cfg(unix)]
+    #[test]
+    fn database_files_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("csqtt-db-mode-test-{unique}"));
+
+        save_database(&directory, &Database::default()).expect("save database");
+        let mode = std::fs::metadata(directory.join(super::DATABASE_FILE))
+            .expect("database metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+
+        assert_eq!(mode, 0o600);
+        let _ = std::fs::remove_dir_all(directory);
+    }
 
     #[test]
     fn dns_survives_database_restart() {
