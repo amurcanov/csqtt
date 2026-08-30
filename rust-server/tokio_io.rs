@@ -489,7 +489,7 @@ impl TokioIo {
                         udp_fd,
                         self.rx_msgs.as_mut_ptr(),
                         receive_limit as libc::c_uint,
-                        (libc::MSG_DONTWAIT | libc::MSG_WAITFORONE) as libc::c_uint,
+                        (libc::MSG_DONTWAIT | libc::MSG_WAITFORONE) as _,
                         std::ptr::null_mut(),
                     )
                 };
@@ -544,6 +544,7 @@ impl TokioIo {
             else {
                 continue;
             };
+            #[allow(clippy::unnecessary_cast)] // cmsghdr field differs across libc targets.
             let control_len =
                 (msg.msg_hdr.msg_controllen as usize).min(self.rx_controls[index].len());
             let local_ip = parse_ipv4_pktinfo_destination(unsafe {
@@ -743,7 +744,7 @@ impl TokioIo {
                             udp_fd,
                             self.tx_msgs.as_mut_ptr(),
                             batch_len as libc::c_uint,
-                            libc::MSG_DONTWAIT as libc::c_uint,
+                            libc::MSG_DONTWAIT as _,
                         )
                     };
                     if result < 0 {
@@ -1037,6 +1038,7 @@ fn cmsg_align(length: usize) -> usize {
 fn parse_ipv4_pktinfo_destination(mut control: &[u8]) -> Option<Ipv4Addr> {
     while control.len() >= std::mem::size_of::<libc::cmsghdr>() {
         let header = unsafe { &*(control.as_ptr().cast::<libc::cmsghdr>()) };
+        #[allow(clippy::unnecessary_cast)] // cmsghdr field differs across libc targets.
         let length = header.cmsg_len as usize;
         if length < std::mem::size_of::<libc::cmsghdr>() || length > control.len() {
             break;

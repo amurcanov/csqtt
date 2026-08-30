@@ -142,4 +142,14 @@ class DeployResultPolicyTest {
         )
         assertEquals("pa ssword", sanitizeSshPassword("pa\n ss\rword"))
     }
+
+    @Test
+    fun rootCommandAddsSudoStdinFlagOnlyToInvocation() {
+        val command = rootCommand("id")
+
+        assertTrue(command.contains("command -v sudo >/dev/null"))
+        assertTrue(command.contains("sudo -S bash -c"))
+        assertFalse(command.contains("command -v sudo -S"))
+        assertFalse(command.contains("sudo -S not found"))
+    }
 }

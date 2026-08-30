@@ -221,15 +221,11 @@ private class DeploySSHClient(
 
         val result = StringBuilder()
         val progressRegex = Regex("^CSQTT_PROGRESS\\|(\\d+\\.?\\d*)\\|(.+)$")
-        val cmdAdjusted = if (command.contains("sudo") && !command.contains("sudo -S")) {
-            command.replace("sudo ", "sudo -S ")
-        } else command
-
         val sshSession = ssh.startSession()
         return try {
-            val remoteCmd = sshSession.exec(cmdAdjusted)
+            val remoteCmd = sshSession.exec(command)
 
-            if (cmdAdjusted.contains("sudo -S")) {
+            if (command.contains("sudo -S")) {
                 runCatching {
                     remoteCmd.outputStream.write("$sudoPass\n".toByteArray())
                     remoteCmd.outputStream.flush()
@@ -514,10 +510,10 @@ internal fun deployEnvironmentValue(value: String, installInDocker: Boolean): St
 internal fun deployMode(installInDocker: Boolean): String =
     if (installInDocker) "docker" else "systemd"
 
-private fun rootCommand(command: String): String {
+internal fun rootCommand(command: String): String {
     val quoted = shellQuote(command)
     return "if [ \"\$(id -u)\" = \"0\" ]; then bash -c $quoted; " +
-        "elif command -v sudo >/dev/null 2>&1; then sudo bash -c $quoted; " +
+        "elif command -v sudo >/dev/null 2>&1; then sudo -S bash -c $quoted; " +
         "else echo 'error: root privileges required and sudo not found'; exit 1; fi"
 }
 

@@ -94,8 +94,10 @@ internal fun SettingsTabContent(
     validationRequest: Int,
     onVkAuthRequested: () -> Unit,
 ) {
-    val savedWorkersPerHash by settingsStore.workersPerHash
-        .map<Int, Int?> { it }
+    val workersPerHashFlow = remember(settingsStore) {
+        settingsStore.workersPerHash.map<Int, Int?> { it }
+    }
+    val savedWorkersPerHash by workersPerHashFlow
         .collectAsStateWithLifecycle(initialValue = SettingsStore.cachedWorkersPerHash)
 
     val activeProfile = tunnelAuthSettings.profile
@@ -187,8 +189,10 @@ internal fun SettingsTabContent(
     val combinedHashes = remember(vkHash1, vkHash2, vkHash3, vkHash4, vkHash5, vkHash6) {
         allHashes.filter { it.isNotBlank() && it.length >= 16 }.distinct().joinToString(",")
     }
-    val extraWorkersEnabled by settingsStore.extraWorkers
-        .map<Boolean, Boolean?> { it }
+    val extraWorkersFlow = remember(settingsStore) {
+        settingsStore.extraWorkers.map<Boolean, Boolean?> { it }
+    }
+    val extraWorkersEnabled by extraWorkersFlow
         .collectAsStateWithLifecycle(initialValue = SettingsStore.cachedExtraWorkers)
     val effectiveExtraWorkersEnabled = extraWorkersEnabled == true && !accountAutoJsMode
 

@@ -5168,9 +5168,9 @@ mod tests {
         let alive = round.alive_payload(30_100).unwrap();
         assert!(alive.starts_with(STREAM_ALIVE_PREFIX));
         assert_ne!(repair, alive);
-        assert!(round.alive_payload(5_500).is_none());
-        assert!(round.alive_payload(10_100).is_some());
-        assert!(round.alive_payload(15_100).is_none());
+        assert!(round.alive_payload(35_500).is_none());
+        assert!(round.alive_payload(40_100).is_some());
+        assert!(round.alive_payload(45_100).is_none());
     }
 
     #[test]

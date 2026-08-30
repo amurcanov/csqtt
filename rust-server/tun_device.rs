@@ -43,6 +43,7 @@ impl RouteSelection {
 struct LocalStripeCursor {
     next: usize,
     remaining: usize,
+    path_count: usize,
 }
 
 #[derive(Default)]
@@ -63,7 +64,8 @@ impl LocalStripedScheduler {
             PacketClass::Priority => (&mut self.priority, PRIORITY_STRIPE_PACKET_CHUNK),
             PacketClass::Bulk => (&mut self.bulk, BULK_STRIPE_PACKET_CHUNK),
         };
-        if cursor.next >= count {
+        if cursor.path_count != count {
+            cursor.path_count = count;
             cursor.next = 0;
             cursor.remaining = 0;
         }
