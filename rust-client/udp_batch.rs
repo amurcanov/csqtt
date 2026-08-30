@@ -291,7 +291,7 @@ mod platform {
                         socket.as_raw_fd(),
                         messages.as_mut_ptr(),
                         packets.len() as libc::c_uint,
-                        libc::MSG_DONTWAIT | libc::MSG_WAITFORONE,
+                        (libc::MSG_DONTWAIT | libc::MSG_WAITFORONE) as _,
                         ptr::null_mut(),
                     )
                 };
@@ -393,7 +393,7 @@ mod platform {
                         socket.as_raw_fd(),
                         messages.as_mut_ptr(),
                         packets.len() as libc::c_uint,
-                        libc::MSG_DONTWAIT | libc::MSG_WAITFORONE,
+                        (libc::MSG_DONTWAIT | libc::MSG_WAITFORONE) as _,
                         ptr::null_mut(),
                     )
                 };
@@ -492,7 +492,7 @@ mod platform {
                         socket.as_raw_fd(),
                         messages.as_mut_ptr(),
                         datagrams.len() as libc::c_uint,
-                        libc::MSG_DONTWAIT,
+                        libc::MSG_DONTWAIT as _,
                     )
                 };
                 if result >= 0 {
@@ -568,7 +568,7 @@ mod platform {
                         socket.as_raw_fd(),
                         messages.as_mut_ptr(),
                         datagrams.len() as libc::c_uint,
-                        libc::MSG_DONTWAIT,
+                        libc::MSG_DONTWAIT as _,
                     )
                 };
                 if result >= 0 {
@@ -654,18 +654,10 @@ mod platform {
     }
 
     fn empty_messages() -> [libc::mmsghdr; MAX_DATAGRAMS] {
-        std::array::from_fn(|_| libc::mmsghdr {
-            msg_hdr: libc::msghdr {
-                msg_name: ptr::null_mut(),
-                msg_namelen: 0,
-                msg_iov: ptr::null_mut(),
-                msg_iovlen: 0,
-                msg_control: ptr::null_mut(),
-                msg_controllen: 0,
-                msg_flags: 0,
-            },
-            msg_len: 0,
-        })
+        // Zero is the documented empty state for every pointer, length and flag
+        // field. Constructing through zeroed also covers libc's private musl
+        // padding fields, which cannot be named in a struct literal.
+        std::array::from_fn(|_| unsafe { std::mem::zeroed() })
     }
 }
 

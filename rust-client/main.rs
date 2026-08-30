@@ -114,6 +114,8 @@ struct Arguments {
     tun_uds: String,
     #[arg(long, default_value_t = false)]
     validate_vk_hashes: bool,
+    #[arg(long, default_value_t = false)]
+    credentials_stdin: bool,
 }
 
 fn main() {
@@ -124,7 +126,13 @@ fn main() {
             let _ = libc::write(libc::STDERR_FILENO, MESSAGE.as_ptr().cast(), MESSAGE.len());
         }
     }));
-    let arguments = Arguments::parse_from(normalized_arguments());
+    let mut arguments = Arguments::parse_from(normalized_arguments());
+    if arguments.credentials_stdin
+        && let Err(error) = read_stdin_credentials(&mut arguments)
+    {
+        eprintln!("[ФАТАЛ] {error:#}");
+        std::process::exit(1);
+    }
     let runtime = match build_runtime(runtime_worker_threads(arguments.workers)) {
         Ok(runtime) => runtime,
         Err(error) => {
@@ -473,6 +481,7 @@ fn normalize_cli_argument(argument: String) -> String {
         "tun-uds",
         "allow-hash-redistribution",
         "validate-vk-hashes",
+        "credentials-stdin",
     ];
     if let Some(value) = argument.strip_prefix('-') {
         let name = value.split('=').next().unwrap_or(value);
@@ -481,6 +490,39 @@ fn normalize_cli_argument(argument: String) -> String {
         }
     }
     argument
+}
+
+#[derive(serde::Deserialize)]
+struct StdinCredentials {
+    password: String,
+    vk: String,
+}
+
+fn apply_stdin_credentials(arguments: &mut Arguments, line: &str) -> Result<()> {
+    const PREFIX: &str = "CSQTT_CREDENTIALS|";
+    if line.len() > 128 * 1024 {
+        bail!("слишком большой пакет credentials stdin");
+    }
+    let payload = line
+        .trim_end_matches(['\r', '\n'])
+        .strip_prefix(PREFIX)
+        .context("неверный префикс credentials stdin")?;
+    let credentials: StdinCredentials =
+        serde_json::from_str(payload).context("неверный JSON credentials stdin")?;
+    if credentials.password.is_empty() || credentials.vk.is_empty() {
+        bail!("credentials stdin не содержит password или vk");
+    }
+    arguments.password = credentials.password;
+    arguments.vk = credentials.vk;
+    Ok(())
+}
+
+fn read_stdin_credentials(arguments: &mut Arguments) -> Result<()> {
+    let mut line = String::new();
+    std::io::stdin()
+        .read_line(&mut line)
+        .context("чтение credentials stdin")?;
+    apply_stdin_credentials(arguments, &line)
 }
 
 async fn read_vk_js_bootstrap() -> Result<vk_js_calls::Bootstrap> {
@@ -795,6 +837,36 @@ mod worker_count_tests {
         .unwrap();
         assert_eq!(arguments.vk, "-Wabc,-Wdef");
         assert!(arguments.allow_hash_redistribution);
+    }
+
+    #[test]
+    fn credentials_stdin_populates_secrets_without_argv() {
+        let mut arguments = Arguments::try_parse_from([
+            "csqtt-client",
+            "--peer",
+            "127.0.0.1:9000",
+            "--credentials-stdin",
+        ])
+        .unwrap();
+        apply_stdin_credentials(
+            &mut arguments,
+            r#"CSQTT_CREDENTIALS|{"password":"secret","vk":"hash-a,hash-b"}"#,
+        )
+        .unwrap();
+        assert_eq!(arguments.password, "secret");
+        assert_eq!(arguments.vk, "hash-a,hash-b");
+    }
+
+    #[test]
+    fn credentials_stdin_rejects_missing_secret() {
+        let mut arguments = Arguments::try_parse_from(["csqtt-client"]).unwrap();
+        assert!(
+            apply_stdin_credentials(
+                &mut arguments,
+                r#"CSQTT_CREDENTIALS|{"password":"","vk":"hash-a"}"#,
+            )
+            .is_err()
+        );
     }
 
     #[tokio::test]
