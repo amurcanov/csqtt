@@ -11,8 +11,6 @@
   <img src="https://img.shields.io/github/stars/amurcanov/csqtt?style=for-the-badge&logo=github&color=ffca28&labelColor=24292e" alt="Stars" />
 </a>
 
-<br><br>
-
 [CSQTT Telegram Community](https://t.me/wdttcommunity)
 
 </div>
