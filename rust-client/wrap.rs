@@ -127,4 +127,38 @@ mod tests {
             handle.join().unwrap();
         }
     }
+
+    macro_rules! wrap_equivalence_case {
+        ($name:ident, $password:expr) => {
+            #[test]
+            fn $name() {
+                let password: &str = $password;
+                assert_eq!(
+                    derive_wrap_key(password).unwrap(),
+                    derive_rustcrypto(password)
+                );
+            }
+        };
+    }
+
+    wrap_equivalence_case!(wrap_key_ascii_single_byte, "a");
+    wrap_equivalence_case!(wrap_key_ascii_with_space, "correct horse battery staple");
+    wrap_equivalence_case!(wrap_key_leading_and_trailing_space, "  tunnel-secret  ");
+    wrap_equivalence_case!(wrap_key_contains_newline, "line-one\nline-two");
+    wrap_equivalence_case!(wrap_key_contains_tab, "before\tafter");
+    wrap_equivalence_case!(wrap_key_contains_nul, "before\0after");
+    wrap_equivalence_case!(wrap_key_cyrillic, "пароль-подключения");
+    wrap_equivalence_case!(wrap_key_arabic, "كلمة-مرور-النفق");
+    wrap_equivalence_case!(wrap_key_hebrew, "סיסמת-מנהרה");
+    wrap_equivalence_case!(wrap_key_japanese, "トンネルのパスワード");
+    wrap_equivalence_case!(wrap_key_chinese, "隧道密码");
+    wrap_equivalence_case!(wrap_key_emoji, "🔐🚀🌍");
+    wrap_equivalence_case!(wrap_key_composed_unicode, "école");
+    wrap_equivalence_case!(wrap_key_decomposed_unicode, "e\u{301}cole");
+    wrap_equivalence_case!(wrap_key_mixed_scripts, "Rust-Ржавчина-锈-🦀");
+    wrap_equivalence_case!(wrap_key_control_byte, "prefix\u{0001}suffix");
+    wrap_equivalence_case!(
+        wrap_key_long_fixed_secret,
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    );
 }

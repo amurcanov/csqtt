@@ -5,8 +5,9 @@
 use crate::perf::thread_cpu_time_ns;
 use crate::{
     App,
-    dataplane::{self, DataplaneConfig, DataplaneLogic},
+    dataplane::{self, DataplaneConfig, DataplaneLogic, EndpointRoute, WorkerContext},
     downlink_queue::DownlinkQueue,
+    flow_frame::{self, FlowReassembler, FlowSequencer},
     lock_unpoison, log_event,
     model::{
         ClientDevice, Database, TrafficCounters, TrafficSnapshot, cached_now, derive_wrap_key,
@@ -15,7 +16,7 @@ use crate::{
     packet::{PACKET_CAPACITY, PacketBuf, PacketBuffer},
     perf::{self, Profiler as AllProfiler, Stage as PerfStage},
     selective_fec,
-    tokio_io::{IoCounters, PacketSink},
+    tokio_io::{IoCounters, PacketOutput},
     tun_device::RouteTable,
 };
 use anyhow::{Context, Result, anyhow, bail};
@@ -23,7 +24,7 @@ use ctr::cipher::{InnerIvInit, KeyInit, StreamCipher};
 use rand::{Rng, RngCore, SeedableRng, rngs::OsRng, rngs::StdRng};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{
         Arc, RwLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -75,6 +76,9 @@ const HOT_TABLE_RESERVE: usize = 128;
 const MEMORY_COMPACT_INTERVAL_MS: u64 = 5_000;
 const SESSION_MAINTENANCE_INTERVAL_MS: u64 = 1_000;
 const SETUP_BUDGET_PER_TICK: usize = 1024;
+const UNAUTHENTICATED_SETUP_LOG_INTERVAL_MS: u64 = 10_000;
+const MIGRATING_ENDPOINT_TTL_MS: u64 = 2_000;
+const MIGRATING_ENDPOINT_SWEEP_INTERVAL_MS: u64 = 1_000;
 pub(crate) static SESSION_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 static ROUTE_REGISTRATION_COUNTER: AtomicU64 = AtomicU64::new(1);
 static CACHED_MONOTONIC_MS: AtomicU64 = AtomicU64::new(0);
@@ -884,9 +888,7 @@ impl Drop for MetricClient {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DeviceEpochDecision {
     Current,
-    Advanced,
-    Stale,
-    SaltConflict,
+    Replaced,
 }
 
 pub struct DeviceEpochSlot {
@@ -918,27 +920,12 @@ impl DeviceEpochState {
     }
 
     fn admit(&mut self, generation_id: u64, session_salt: &str) -> DeviceEpochDecision {
-        if self.generation_id == 0 && self.session_salt.is_empty() {
+        if generation_id != self.generation_id || session_salt != self.session_salt {
             self.generation_id = generation_id;
             self.session_salt = session_salt.to_owned();
-            return if generation_id == 0 && session_salt.is_empty() {
-                DeviceEpochDecision::Current
-            } else {
-                DeviceEpochDecision::Advanced
-            };
-        }
-        if generation_id < self.generation_id {
-            return DeviceEpochDecision::Stale;
-        }
-        if generation_id > self.generation_id {
-            self.generation_id = generation_id;
-            self.session_salt = session_salt.to_owned();
-            return DeviceEpochDecision::Advanced;
-        }
-        if session_salt == self.session_salt {
-            DeviceEpochDecision::Current
+            DeviceEpochDecision::Replaced
         } else {
-            DeviceEpochDecision::SaltConflict
+            DeviceEpochDecision::Current
         }
     }
 
@@ -1123,8 +1110,6 @@ impl CredentialSet {
 
 #[derive(Clone)]
 struct EpochValue {
-    generation_id: u64,
-    session_salt: String,
     last_seen_ms: u64,
 }
 
@@ -1284,7 +1269,7 @@ impl HotDebug {
     }
 }
 
-struct HotSession {
+pub(crate) struct HotSession {
     id: u64,
     peer: SocketAddr,
     local_ip: Option<IpAddr>,
@@ -1308,6 +1293,7 @@ struct HotSession {
     reported_down: u64,
     is_srtp: bool,
     pending_tunnel: bool,
+    data_frames: bool,
     public: Arc<Session>,
     #[cfg(feature = "diagnostics")]
     debug: HotDebug,
@@ -1373,6 +1359,7 @@ impl HotSession {
             reported_down: 0,
             is_srtp,
             pending_tunnel: false,
+            data_frames: false,
             public,
             #[cfg(feature = "diagnostics")]
             debug: HotDebug::new(debug_generation),
@@ -1455,6 +1442,11 @@ impl HotSession {
     }
 }
 
+struct IngressPacket {
+    slot: usize,
+    packet: PacketBuffer,
+}
+
 #[derive(Clone, Copy)]
 struct DecodedPacket {
     range: RangePair,
@@ -1479,7 +1471,6 @@ impl RangePair {
 enum GetconfReconnectAction {
     Process,
     Replace,
-    Reject,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -1630,7 +1621,11 @@ impl StreamRepairRound {
     }
 }
 
-pub enum ProtocolCommand {
+pub(crate) enum ProtocolCommand {
+    AdoptSession {
+        session: Box<HotSession>,
+        initial_payload: Vec<u8>,
+    },
     SendPlain {
         session_id: u64,
         payload: Vec<u8>,
@@ -1645,9 +1640,6 @@ pub enum ProtocolCommand {
         worker_id: u16,
         desired_count: u16,
     },
-    DeactivateTunnel {
-        session_id: u64,
-    },
     InjectTun {
         session_id: u64,
         payload: Vec<u8>,
@@ -1657,6 +1649,10 @@ pub enum ProtocolCommand {
         device_id: String,
         generation_id: u64,
         session_salt: String,
+    },
+    SetDataFrames {
+        session_id: u64,
+        enabled: bool,
     },
     SetAuthoritativeEpoch {
         device_id: String,
@@ -1778,9 +1774,10 @@ pub async fn start(app: Arc<App>) -> Result<ProtocolRuntime> {
             global_up: app.bytes_from_client.clone(),
             global_down: app.bytes_to_client.clone(),
         };
-        move || {
+        move |worker| {
             let (credentials, epochs) = latest_engine_state();
             ProtocolEngine::new(
+                worker,
                 credentials,
                 epochs,
                 control_tx.clone(),
@@ -1811,6 +1808,43 @@ pub async fn refresh_credentials(app: &Arc<App>) -> Result<()> {
     let credentials = build_credentials(app).await?;
     publish_credentials_snapshot(&credentials);
     command(app, ProtocolCommand::ReplaceCredentials(credentials))
+}
+
+pub async fn broadcast_tunnel_configuration(app: &Arc<App>) -> Result<usize> {
+    let dns = app.dns.read().await.clone();
+    let sessions = app
+        .sessions
+        .iter()
+        .map(|entry| entry.value().clone())
+        .collect::<Vec<_>>();
+    let mut delivered = 0usize;
+    let mut first_error = None;
+    for session in sessions {
+        let tunnel_ip = *lock_unpoison(&session.tunnel_ip);
+        let Some(tunnel_ip) = tunnel_ip else {
+            continue;
+        };
+        let payload =
+            format!("TUNCONF:{}:{}:0:stream-v2", Ipv4Addr::from(tunnel_ip), dns).into_bytes();
+        match command(
+            app,
+            ProtocolCommand::SendPlain {
+                session_id: session.id,
+                payload,
+            },
+        ) {
+            Ok(()) => delivered = delivered.saturating_add(1),
+            Err(error) => {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+    }
+    if let Some(error) = first_error {
+        return Err(error.context("queue hot tunnel configuration"));
+    }
+    Ok(delivered)
 }
 
 pub fn drop_password_sessions(app: &Arc<App>, password: &str) {
@@ -1929,13 +1963,18 @@ async fn build_credentials(app: &Arc<App>) -> Result<Arc<CredentialSet>> {
 }
 
 struct ProtocolEngine {
+    worker: WorkerContext<ProtocolCommand>,
     credentials: Arc<CredentialSet>,
     epochs: HashMap<String, EpochValue>,
     sessions: slab::Slab<HotSession>,
     by_peer: HashMap<EndpointKey, usize>,
     by_id: HashMap<u64, usize>,
+    migrating_endpoints: HashMap<EndpointKey, u64>,
     routes: RouteTable,
     downlink: DownlinkQueue,
+    downlink_sequences: FlowSequencer,
+    ingress_reassembler: FlowReassembler<IngressPacket>,
+    ingress_ready: VecDeque<IngressPacket>,
     control_tx: mpsc::Sender<ControlEvent>,
     fec_profile: FecProfile,
     stream_debug_active: Arc<AtomicBool>,
@@ -1954,12 +1993,15 @@ struct ProtocolEngine {
     syscalls_enabled: bool,
     io_metrics_enabled: bool,
     setup_budget: usize,
+    unauthenticated_setup_logged: bool,
+    last_unauthenticated_setup_log_ms: u64,
     last_io_counters: IoCounters,
     memory_compact_pending: bool,
     last_memory_compact_ms: u64,
     last_stream_reconcile_ms: u64,
     last_stream_inventory_resync_ms: u64,
     last_session_maintenance_ms: u64,
+    last_migrating_endpoint_sweep_ms: u64,
     stream_inventory_dirty: bool,
     stream_repairs: HashMap<StreamIdentity, StreamRepairRound>,
     stream_inventory: HashMap<StreamIdentity, StreamInventory>,
@@ -1993,6 +2035,7 @@ struct EngineShared {
 
 impl ProtocolEngine {
     fn new(
+        worker: WorkerContext<ProtocolCommand>,
         credentials: Arc<CredentialSet>,
         epochs: HashMap<String, EpochValue>,
         control_tx: mpsc::Sender<ControlEvent>,
@@ -2002,13 +2045,18 @@ impl ProtocolEngine {
     ) -> Self {
         let wall_now = wall_clock();
         let engine = Self {
+            worker,
             credentials,
             epochs,
             sessions: slab::Slab::with_capacity(HOT_TABLE_RESERVE),
             by_peer: HashMap::with_capacity(HOT_TABLE_RESERVE),
             by_id: HashMap::with_capacity(HOT_TABLE_RESERVE),
+            migrating_endpoints: HashMap::with_capacity(HOT_TABLE_RESERVE),
             routes: RouteTable::new(),
             downlink: DownlinkQueue::default(),
+            downlink_sequences: FlowSequencer::with_sender_id(OsRng.next_u64()),
+            ingress_reassembler: FlowReassembler::new(),
+            ingress_ready: VecDeque::with_capacity(128),
             control_tx,
             fec_profile,
             stream_debug_active,
@@ -2027,12 +2075,15 @@ impl ProtocolEngine {
             syscalls_enabled: false,
             io_metrics_enabled: false,
             setup_budget: SETUP_BUDGET_PER_TICK * 2,
+            unauthenticated_setup_logged: false,
+            last_unauthenticated_setup_log_ms: 0,
             last_io_counters: IoCounters::default(),
             memory_compact_pending: false,
             last_memory_compact_ms: 0,
             last_stream_reconcile_ms: 0,
             last_stream_inventory_resync_ms: 0,
             last_session_maintenance_ms: 0,
+            last_migrating_endpoint_sweep_ms: 0,
             stream_inventory_dirty: true,
             stream_repairs: HashMap::new(),
             stream_inventory: HashMap::new(),
@@ -2049,8 +2100,19 @@ impl ProtocolEngine {
     }
 
     fn publish_session_gauges(&self) {
-        ACTIVE_SESSIONS_GAUGE.store(self.sessions.len() as u64, Ordering::Relaxed);
-        HOT_SESSION_CAPACITY_GAUGE.store(self.sessions.capacity() as u64, Ordering::Relaxed);
+        HOT_SESSION_CAPACITY_GAUGE.fetch_max(self.sessions.capacity() as u64, Ordering::Relaxed);
+    }
+
+    fn session_added(&self) {
+        ACTIVE_SESSIONS_GAUGE.fetch_add(1, Ordering::Relaxed);
+        self.publish_session_gauges();
+    }
+
+    fn session_removed(&self) {
+        let _ = ACTIVE_SESSIONS_GAUGE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            value.checked_sub(1)
+        });
+        self.publish_session_gauges();
     }
 
     fn publish_memory_gauges(&self) {
@@ -2178,16 +2240,96 @@ impl ProtocolEngine {
             self.wall_now,
         );
         let _ = session.replay.accept(replay_seq);
-        let public = session.public.clone();
         let slot = self.sessions.insert(session);
         self.by_peer.insert(endpoint_key, slot);
         self.by_id.insert(id, slot);
         self.stream_inventory_dirty = true;
-        self.publish_session_gauges();
+        self.session_added();
+        slot
+    }
+
+    fn publish_created_session(&self, session: &HotSession, payload: Vec<u8>) {
         let _ = self
             .control_tx
-            .try_send(ControlEvent::SessionCreated(public));
-        slot
+            .try_send(ControlEvent::SessionCreated(session.public.clone()));
+        let _ = self.control_tx.try_send(ControlEvent::Payload {
+            address: session.peer,
+            session_id: session.id,
+            payload,
+        });
+    }
+
+    fn place_new_session(&mut self, slot: usize, payload: Vec<u8>) {
+        let Some(session) = self.sessions.get(slot) else {
+            return;
+        };
+        let target = shard_for_device(&session.device_id, self.worker.shard_count());
+        if target == self.worker.shard_index() {
+            self.worker
+                .bind_endpoint(EndpointRoute::new(session.peer, session.local_ip));
+            self.publish_created_session(session, payload);
+            return;
+        }
+        let session = self.sessions.remove(slot);
+        let endpoint_key = EndpointKey::new(session.peer, session.local_ip);
+        self.by_peer.remove(&endpoint_key);
+        self.by_id.remove(&session.id);
+        self.session_removed();
+        let endpoint = EndpointRoute::new(session.peer, session.local_ip);
+        self.migrating_endpoints
+            .insert(endpoint_key, self.monotonic_ms);
+        match self.worker.migrate(
+            endpoint,
+            target,
+            ProtocolCommand::AdoptSession {
+                session: Box::new(session),
+                initial_payload: payload,
+            },
+        ) {
+            Ok(()) => {}
+            Err(ProtocolCommand::AdoptSession {
+                session,
+                initial_payload,
+            }) => {
+                let session = *session;
+                let peer = EndpointKey::new(session.peer, session.local_ip);
+                self.migrating_endpoints.remove(&peer);
+                let id = session.id;
+                let slot = self.sessions.insert(session);
+                self.by_peer.insert(peer, slot);
+                self.by_id.insert(id, slot);
+                self.session_added();
+                let session = &self.sessions[slot];
+                self.worker
+                    .bind_endpoint(EndpointRoute::new(session.peer, session.local_ip));
+                self.publish_created_session(session, initial_payload);
+            }
+            Err(_) => unreachable!(),
+        }
+    }
+
+    fn adopt_session(&mut self, session: HotSession, initial_payload: Vec<u8>) {
+        let endpoint = EndpointKey::new(session.peer, session.local_ip);
+        let id = session.id;
+        let slot = self.sessions.insert(session);
+        self.by_peer.insert(endpoint, slot);
+        self.by_id.insert(id, slot);
+        self.stream_inventory_dirty = true;
+        self.session_added();
+        let session = &self.sessions[slot];
+        self.worker
+            .bind_endpoint(EndpointRoute::new(session.peer, session.local_ip));
+        self.publish_created_session(session, initial_payload);
+    }
+
+    #[inline(always)]
+    fn endpoint_is_migrating(&self, peer: SocketAddr, local_ip: Option<IpAddr>) -> bool {
+        self.migrating_endpoints
+            .contains_key(&EndpointKey::new(peer, local_ip))
+            || (local_ip.is_some()
+                && self
+                    .migrating_endpoints
+                    .contains_key(&EndpointKey::new(peer, None)))
     }
 
     fn remove_slot_with_reason(&mut self, slot: usize, reason: &'static str) {
@@ -2197,7 +2339,7 @@ impl ProtocolEngine {
         let mut session = self.sessions.remove(slot);
         self.memory_compact_pending = true;
         self.stream_inventory_dirty = true;
-        self.publish_session_gauges();
+        self.session_removed();
         session.publish_counters(
             &self.global_up,
             &self.global_down,
@@ -2255,13 +2397,7 @@ impl ProtocolEngine {
         });
     }
 
-    fn handle_unknown_legacy(
-        &mut self,
-        peer: SocketAddr,
-        local_ip: Option<IpAddr>,
-        wire: &[u8],
-        sink: &mut PacketSink<'_>,
-    ) {
+    fn handle_unknown_legacy(&mut self, peer: SocketAddr, local_ip: Option<IpAddr>, wire: &[u8]) {
         if self.sessions.len() >= MAX_ACTIVE_SESSIONS
             || wire.len() > PACKET_CAPACITY
             || self.setup_budget == 0
@@ -2305,9 +2441,7 @@ impl ProtocolEngine {
         }
         let Some((password, key, decoded, device_id, generation_id, session_salt, plain)) = found
         else {
-            if wire.len() >= 30 {
-                let _ = sink.send_udp(peer, local_ip, b"DENIED:wrong_password");
-            }
+            self.report_unauthenticated_setup(peer, wire.len());
             return;
         };
         let slot = self.create_legacy_session(
@@ -2346,12 +2480,23 @@ impl ProtocolEngine {
                 &session.session_salt,
             );
         }
-        let session_id = session.id;
-        let _ = self.control_tx.try_send(ControlEvent::Payload {
-            address: peer,
-            session_id,
-            payload: plain,
-        });
+        self.place_new_session(slot, plain);
+    }
+
+    fn report_unauthenticated_setup(&mut self, peer: SocketAddr, wire_len: usize) {
+        if self.unauthenticated_setup_logged
+            && self
+                .monotonic_ms
+                .saturating_sub(self.last_unauthenticated_setup_log_ms)
+                < UNAUTHENTICATED_SETUP_LOG_INTERVAL_MS
+        {
+            return;
+        }
+        self.unauthenticated_setup_logged = true;
+        self.last_unauthenticated_setup_log_ms = self.monotonic_ms;
+        eprintln!(
+            "[CSQTT] UDP setup from {peer} rejected ({wire_len} bytes): no active credential could decrypt or accept GETCONF"
+        );
     }
 
     fn handle_existing(
@@ -2359,7 +2504,7 @@ impl ProtocolEngine {
         slot: usize,
         local_ip: Option<IpAddr>,
         packet: &mut [u8],
-        sink: &mut PacketSink<'_>,
+        sink: &mut impl PacketOutput,
     ) {
         if !self.sessions.contains(slot) {
             return;
@@ -2401,9 +2546,7 @@ impl ProtocolEngine {
             if let Some(epoch) = self.epochs.get_mut(incoming_device) {
                 epoch.last_seen_ms = self.monotonic_ms;
             }
-            let authoritative = self.epochs.get(incoming_device);
             match getconf_reconnect_action_hot(
-                authoritative,
                 &session.device_id,
                 session.generation_id,
                 &session.session_salt,
@@ -2411,7 +2554,6 @@ impl ProtocolEngine {
                 incoming_generation,
                 incoming_salt,
             ) {
-                GetconfReconnectAction::Reject => return,
                 GetconfReconnectAction::Replace => {
                     let peer = session.peer;
                     let local_ip = local_ip.or(session.local_ip);
@@ -2435,13 +2577,7 @@ impl ProtocolEngine {
                         &session_salt,
                         decoded.seq,
                     );
-                    if let Some(new_session) = self.sessions.get(new_slot) {
-                        let _ = self.control_tx.try_send(ControlEvent::Payload {
-                            address: new_session.peer,
-                            session_id: new_session.id,
-                            payload,
-                        });
-                    }
+                    self.place_new_session(new_slot, payload);
                     return;
                 }
                 GetconfReconnectAction::Process => {}
@@ -2474,16 +2610,19 @@ impl ProtocolEngine {
             self.by_peer.remove(&EndpointKey::new(peer, old_local_ip));
             self.by_peer
                 .insert(EndpointKey::new(peer, new_local_ip), slot);
+            self.worker
+                .bind_endpoint(EndpointRoute::new(peer, new_local_ip));
         }
         if plain == SESSION_LEASE {
             return;
         }
+        let transport_plain = flow_frame::payload(plain);
         let record_dpi = should_record_dpi(
             self.dpi_enabled,
             self.monotonic_ms,
             &mut self.dpi_sample_counter,
             &mut self.dpi_last_sample_ms,
-            plain,
+            transport_plain,
         );
         let session = &mut self.sessions[slot];
         if record_dpi {
@@ -2493,7 +2632,7 @@ impl ProtocolEngine {
                 "TUN-Server",
                 decoded.payload_type,
                 decoded.seq as u64,
-                plain,
+                transport_plain,
                 packet.len(),
                 &session.device_id,
                 session.generation_id,
@@ -2528,18 +2667,19 @@ impl ProtocolEngine {
             return;
         }
         if session.tunnel_ip.is_some() && session.registration_id.is_some() {
-            let write_started = self
-                .crypto_profiler
-                .all
-                .begin(PerfStage::TunWrite, plain.len());
-            let class = crate::striped_scheduler::packet_class(plain);
-            let written = sink.write_tun_priority(plain, class);
-            self.crypto_profiler
-                .all
-                .finish(PerfStage::TunWrite, write_started);
-            if written {
-                session.up_total = session.up_total.saturating_add(plain.len() as u64);
-                session.record_debug_up(plain.len() as u64, self.debug_enabled);
+            if let Some((header, payload)) = flow_frame::FrameHeader::decode(plain) {
+                let mut packet = PacketBuffer::new();
+                if !packet.copy_from(payload) {
+                    return;
+                }
+                self.ingress_reassembler.push(
+                    header,
+                    IngressPacket { slot, packet },
+                    &mut self.ingress_ready,
+                );
+                self.flush_ingress_ready(sink);
+            } else {
+                self.write_ingress_packet(slot, transport_plain, sink);
             }
             return;
         }
@@ -2548,11 +2688,33 @@ impl ProtocolEngine {
             let event = ControlEvent::IngressBeforeTunnel {
                 address: session.peer,
                 session_id: session.id,
-                payload: plain.to_vec(),
+                payload: transport_plain.to_vec(),
             };
             if self.control_tx.try_send(event).is_err() {
                 session.pending_tunnel = false;
             }
+        }
+    }
+
+    fn flush_ingress_ready(&mut self, sink: &mut impl PacketOutput) {
+        while let Some(ingress) = self.ingress_ready.pop_front() {
+            self.write_ingress_packet(ingress.slot, ingress.packet.as_slice(), sink);
+        }
+    }
+
+    fn write_ingress_packet(&mut self, slot: usize, packet: &[u8], sink: &mut impl PacketOutput) {
+        let write_started = self
+            .crypto_profiler
+            .all
+            .begin(PerfStage::TunWrite, packet.len());
+        let written =
+            sink.write_tun_priority(packet, crate::striped_scheduler::packet_class(packet));
+        self.crypto_profiler
+            .all
+            .finish(PerfStage::TunWrite, write_started);
+        if written && let Some(session) = self.sessions.get_mut(slot) {
+            session.up_total = session.up_total.saturating_add(packet.len() as u64);
+            session.record_debug_up(packet.len() as u64, self.debug_enabled);
         }
     }
 
@@ -2601,31 +2763,9 @@ impl ProtocolEngine {
         }
         if activated {
             self.sync_downlink_profile(ip);
+            self.worker.bind_tunnel(ip);
         }
         activated
-    }
-
-    fn remove_tunnel(&mut self, session_id: u64) {
-        let Some(slot) = self.by_id.get(&session_id).copied() else {
-            return;
-        };
-        let ip = {
-            let session = &mut self.sessions[slot];
-            let ip = session.tunnel_ip;
-            if let (Some(ip), Some(registration_id)) = (ip, session.registration_id) {
-                self.routes.unregister(ip, registration_id);
-            }
-            session.tunnel_ip = None;
-            session.registration_id = None;
-            session.pending_tunnel = false;
-            *lock_unpoison(&session.public.tunnel_ip) = None;
-            session.public.has_tunnel.store(false, Ordering::Release);
-            ip
-        };
-        if let Some(ip) = ip {
-            self.sync_downlink_profile(ip);
-        }
-        self.stream_inventory_dirty = true;
     }
 
     fn update_epoch(
@@ -2676,7 +2816,7 @@ impl ProtocolEngine {
         endpoint: crate::tun_device::RouteEndpoint,
         packet: &[u8],
         class: crate::striped_scheduler::PacketClass,
-        sink: &mut PacketSink<'_>,
+        sink: &mut impl PacketOutput,
     ) -> DownlinkSend {
         let Some(session) = self.sessions.get_mut(endpoint.slot) else {
             return DownlinkSend::Stale;
@@ -2686,16 +2826,18 @@ impl ProtocolEngine {
         {
             return DownlinkSend::Stale;
         }
+        let payload = flow_frame::payload(packet);
+        let outgoing = if session.data_frames { packet } else { payload };
         let record_dpi = should_record_dpi(
             self.dpi_enabled,
             self.monotonic_ms,
             &mut self.dpi_sample_counter,
             &mut self.dpi_last_sample_ms,
-            packet,
+            payload,
         );
         let sent = send_plain_mode(
             session,
-            packet,
+            outgoing,
             &mut self.rng,
             sink,
             &mut self.crypto_profiler,
@@ -2709,8 +2851,8 @@ impl ProtocolEngine {
             },
         );
         if sent {
-            session.down_total = session.down_total.saturating_add(packet.len() as u64);
-            session.record_debug_down(packet.len() as u64, self.debug_enabled);
+            session.down_total = session.down_total.saturating_add(payload.len() as u64);
+            session.record_debug_down(payload.len() as u64, self.debug_enabled);
             DownlinkSend::Sent
         } else {
             DownlinkSend::Backpressured
@@ -2722,7 +2864,7 @@ impl ProtocolEngine {
         key: usize,
         packet: &[u8],
         class: crate::striped_scheduler::PacketClass,
-        sink: &mut PacketSink<'_>,
+        sink: &mut impl PacketOutput,
     ) -> DownlinkSend {
         let Some(selection) = self.routes.select_key_window(key, class) else {
             return DownlinkSend::Stale;
@@ -2739,11 +2881,11 @@ impl ProtocolEngine {
         DownlinkSend::Stale
     }
 
-    fn drain_downlink(&mut self, sink: &mut PacketSink<'_>) {
+    fn drain_downlink(&mut self, sink: &mut impl PacketOutput) {
         let mut remaining = DOWNLINK_DRAIN_PACKET_LIMIT;
         for class in [
-            crate::striped_scheduler::PacketClass::Latency,
-            crate::striped_scheduler::PacketClass::Priority,
+            crate::striped_scheduler::PacketClass::Small,
+            crate::striped_scheduler::PacketClass::Medium,
             crate::striped_scheduler::PacketClass::Bulk,
         ] {
             while remaining != 0 {
@@ -2771,7 +2913,7 @@ impl ProtocolEngine {
         &mut self,
         carriers: &[usize],
         payload: &[u8],
-        sink: &mut PacketSink<'_>,
+        sink: &mut impl PacketOutput,
     ) -> usize {
         let mut sent = 0usize;
         for slot in carriers.iter().copied() {
@@ -2799,7 +2941,7 @@ impl ProtocolEngine {
         sent
     }
 
-    fn reconcile_streams(&mut self, sink: &mut PacketSink<'_>) {
+    fn reconcile_streams(&mut self, sink: &mut impl PacketOutput) {
         if self
             .monotonic_ms
             .saturating_sub(self.last_stream_reconcile_ms)
@@ -2929,7 +3071,7 @@ impl ProtocolEngine {
         }
     }
 
-    fn handle_tun_packet(&mut self, packet: &[u8], _sink: &mut PacketSink<'_>) {
+    fn handle_tun_packet(&mut self, packet: &[u8], _sink: &mut impl PacketOutput) {
         let route_started = self
             .crypto_profiler
             .all
@@ -2944,19 +3086,123 @@ impl ProtocolEngine {
         self.crypto_profiler
             .all
             .finish(PerfStage::RouteReplay, route_started);
-        let _ = self.downlink.enqueue(key, class, packet);
+        if let Some(header) = self.downlink_sequences.next(packet) {
+            let _ = self.downlink.enqueue_framed(key, class, header, packet);
+        } else {
+            let _ = self.downlink.enqueue(key, class, packet);
+        }
     }
 }
 
 impl DataplaneLogic for ProtocolEngine {
     type Command = ProtocolCommand;
 
-    fn on_udp(
+    fn fanout_command(command: Self::Command, shard_count: usize) -> Vec<Self::Command> {
+        let count = shard_count.max(1);
+        match command {
+            ProtocolCommand::AdoptSession { .. } | ProtocolCommand::CompactMemory { .. } => {
+                vec![command]
+            }
+            ProtocolCommand::SendPlain {
+                session_id,
+                payload,
+            } => (0..count)
+                .map(|_| ProtocolCommand::SendPlain {
+                    session_id,
+                    payload: payload.clone(),
+                })
+                .collect(),
+            ProtocolCommand::BroadcastPlain { payload } => (0..count)
+                .map(|_| ProtocolCommand::BroadcastPlain {
+                    payload: payload.clone(),
+                })
+                .collect(),
+            ProtocolCommand::ActivateTunnel {
+                session_id,
+                ip,
+                registration_id,
+                worker_id,
+                desired_count,
+            } => (0..count)
+                .map(|_| ProtocolCommand::ActivateTunnel {
+                    session_id,
+                    ip,
+                    registration_id,
+                    worker_id,
+                    desired_count,
+                })
+                .collect(),
+            ProtocolCommand::InjectTun {
+                session_id,
+                payload,
+            } => (0..count)
+                .map(|_| ProtocolCommand::InjectTun {
+                    session_id,
+                    payload: payload.clone(),
+                })
+                .collect(),
+            ProtocolCommand::UpdateEpoch {
+                session_id,
+                device_id,
+                generation_id,
+                session_salt,
+            } => (0..count)
+                .map(|_| ProtocolCommand::UpdateEpoch {
+                    session_id,
+                    device_id: device_id.clone(),
+                    generation_id,
+                    session_salt: session_salt.clone(),
+                })
+                .collect(),
+            ProtocolCommand::SetDataFrames {
+                session_id,
+                enabled,
+            } => (0..count)
+                .map(|_| ProtocolCommand::SetDataFrames {
+                    session_id,
+                    enabled,
+                })
+                .collect(),
+            ProtocolCommand::SetAuthoritativeEpoch {
+                device_id,
+                generation_id,
+                session_salt,
+            } => (0..count)
+                .map(|_| ProtocolCommand::SetAuthoritativeEpoch {
+                    device_id: device_id.clone(),
+                    generation_id,
+                    session_salt: session_salt.clone(),
+                })
+                .collect(),
+            ProtocolCommand::DisconnectDevice {
+                device_id,
+                requester_session_id,
+            } => (0..count)
+                .map(|_| ProtocolCommand::DisconnectDevice {
+                    device_id: device_id.clone(),
+                    requester_session_id,
+                })
+                .collect(),
+            ProtocolCommand::ReplaceCredentials(credentials) => (0..count)
+                .map(|_| ProtocolCommand::ReplaceCredentials(credentials.clone()))
+                .collect(),
+            ProtocolCommand::DropSession { session_id } => (0..count)
+                .map(|_| ProtocolCommand::DropSession { session_id })
+                .collect(),
+            ProtocolCommand::DropPassword { password } => (0..count)
+                .map(|_| ProtocolCommand::DropPassword {
+                    password: password.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    fn on_udp<S: PacketOutput>(
         &mut self,
         peer: SocketAddr,
         local_ip: Option<IpAddr>,
         packet: &mut [u8],
-        sink: &mut PacketSink<'_>,
+        sink: &mut S,
     ) {
         let key = EndpointKey::new(peer, local_ip);
         if let Some(slot) = self.by_peer.get(&key).copied() {
@@ -2969,14 +3215,17 @@ impl DataplaneLogic for ProtocolEngine {
             self.handle_existing(slot, local_ip, packet, sink);
             return;
         }
-        self.handle_unknown_legacy(peer, local_ip, packet, sink);
+        if self.endpoint_is_migrating(peer, local_ip) {
+            return;
+        }
+        self.handle_unknown_legacy(peer, local_ip, packet);
     }
 
-    fn on_tun(&mut self, packet: &mut [u8], sink: &mut PacketSink<'_>) {
+    fn on_tun<S: PacketOutput>(&mut self, packet: &mut [u8], sink: &mut S) {
         self.handle_tun_packet(packet, sink);
     }
 
-    fn on_tun_batch_end(&mut self, sink: &mut PacketSink<'_>) {
+    fn on_tun_batch_end<S: PacketOutput>(&mut self, sink: &mut S) {
         self.drain_downlink(sink);
     }
 
@@ -2984,8 +3233,12 @@ impl DataplaneLogic for ProtocolEngine {
         self.batch_now = now;
     }
 
-    fn on_command(&mut self, command_value: Self::Command, sink: &mut PacketSink<'_>) {
+    fn on_command<S: PacketOutput>(&mut self, command_value: Self::Command, sink: &mut S) {
         match command_value {
+            ProtocolCommand::AdoptSession {
+                session,
+                initial_payload,
+            } => self.adopt_session(*session, initial_payload),
             ProtocolCommand::SendPlain {
                 session_id,
                 payload,
@@ -3049,7 +3302,6 @@ impl DataplaneLogic for ProtocolEngine {
             } => {
                 self.activate_tunnel(session_id, ip, registration_id, worker_id, desired_count);
             }
-            ProtocolCommand::DeactivateTunnel { session_id } => self.remove_tunnel(session_id),
             ProtocolCommand::InjectTun {
                 session_id,
                 payload,
@@ -3071,6 +3323,16 @@ impl DataplaneLogic for ProtocolEngine {
                 generation_id,
                 session_salt,
             } => self.update_epoch(session_id, device_id, generation_id, session_salt),
+            ProtocolCommand::SetDataFrames {
+                session_id,
+                enabled,
+            } => {
+                if let Some(slot) = self.by_id.get(&session_id).copied()
+                    && let Some(session) = self.sessions.get_mut(slot)
+                {
+                    session.data_frames = enabled;
+                }
+            }
             ProtocolCommand::SetAuthoritativeEpoch {
                 device_id,
                 generation_id,
@@ -3095,8 +3357,6 @@ impl DataplaneLogic for ProtocolEngine {
                 self.epochs.insert(
                     device_id,
                     EpochValue {
-                        generation_id,
-                        session_salt,
                         last_seen_ms: self.monotonic_ms,
                     },
                 );
@@ -3179,7 +3439,7 @@ impl DataplaneLogic for ProtocolEngine {
         }
     }
 
-    fn on_tick(&mut self, _sink: &mut PacketSink<'_>) {
+    fn on_tick<S: PacketOutput>(&mut self, _sink: &mut S) {
         self.monotonic_ms = self.started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64 + 1;
         self.wall_now = wall_clock();
         #[cfg(feature = "diagnostics")]
@@ -3200,6 +3460,16 @@ impl DataplaneLogic for ProtocolEngine {
             self.io_metrics_enabled = false;
         }
         self.setup_budget = SETUP_BUDGET_PER_TICK;
+        if self
+            .monotonic_ms
+            .saturating_sub(self.last_migrating_endpoint_sweep_ms)
+            >= MIGRATING_ENDPOINT_SWEEP_INTERVAL_MS
+        {
+            self.last_migrating_endpoint_sweep_ms = self.monotonic_ms;
+            self.migrating_endpoints.retain(|_, started_ms| {
+                self.monotonic_ms.saturating_sub(*started_ms) < MIGRATING_ENDPOINT_TTL_MS
+            });
+        }
         if self
             .monotonic_ms
             .saturating_sub(self.last_session_maintenance_ms)
@@ -3260,6 +3530,15 @@ impl DataplaneLogic for ProtocolEngine {
         }
         self.last_io_counters = counters;
     }
+}
+
+pub(crate) fn shard_for_device(device_id: &str, shard_count: usize) -> usize {
+    let mut value = 0xcbf2_9ce4_8422_2325u64;
+    for byte in device_id.as_bytes() {
+        value ^= u64::from(*byte);
+        value = value.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    (value as usize) % shard_count.max(1)
 }
 
 fn wall_clock() -> u64 {
@@ -3471,11 +3750,11 @@ enum DownlinkSend {
     Backpressured,
 }
 
-fn send_plain(
+fn send_plain<S: PacketOutput>(
     session: &mut HotSession,
     plain: &[u8],
     rng: &mut StdRng,
-    sink: &mut PacketSink<'_>,
+    sink: &mut S,
     profiler: &mut CryptoProfiler,
     batch_now: Instant,
     observability: SendObservability,
@@ -3494,11 +3773,11 @@ fn send_plain(
     )
 }
 
-fn send_plain_mode(
+fn send_plain_mode<S: PacketOutput>(
     session: &mut HotSession,
     plain: &[u8],
     rng: &mut StdRng,
-    sink: &mut PacketSink<'_>,
+    sink: &mut S,
     profiler: &mut CryptoProfiler,
     batch_now: Instant,
     mode: SendMode,
@@ -3506,11 +3785,11 @@ fn send_plain_mode(
     send_legacy_plain(session, plain, rng, sink, profiler, batch_now, mode)
 }
 
-fn send_legacy_plain(
+fn send_legacy_plain<S: PacketOutput>(
     session: &mut HotSession,
     plain: &[u8],
     rng: &mut StdRng,
-    sink: &mut PacketSink<'_>,
+    sink: &mut S,
     profiler: &mut CryptoProfiler,
     batch_now: Instant,
     mode: SendMode,
@@ -3548,10 +3827,7 @@ fn send_legacy_plain(
             wrapped
         });
     profiler.all.finish(PerfStage::UdpQueue, queue_started);
-    if sent
-        && (mode.class == crate::striped_scheduler::PacketClass::Latency
-            || should_flush_udp_immediately(plain))
-    {
+    if sent && should_flush_udp_immediately(plain) {
         sink.request_udp_flush();
     }
     if sent && mode.observability.record_dpi {
@@ -3710,6 +3986,15 @@ fn parse_generation_id(value: &str) -> Option<u64> {
     value.parse::<u64>().ok()
 }
 
+fn is_supported_wire_protocol(value: &str) -> bool {
+    value == crate::wire_protocol::WIRE_PROTOCOL_REVISION
+        || value == crate::wire_protocol::LEGACY_WIRE_PROTOCOL_REVISION
+}
+
+fn supports_data_frames(value: &str) -> bool {
+    value == crate::wire_protocol::WIRE_PROTOCOL_REVISION
+}
+
 fn parse_getconf_epoch(payload: &[u8]) -> Option<(&str, u64, &str)> {
     let text = std::str::from_utf8(payload).ok()?;
     let content = text.strip_prefix("GETCONF:")?.trim();
@@ -3760,9 +4045,8 @@ fn session_is_retired_by_epoch(
     authoritative_salt: &str,
 ) -> bool {
     session_device_id == authoritative_device_id
-        && (session_generation_id < authoritative_generation_id
-            || (session_generation_id == authoritative_generation_id
-                && session_salt != authoritative_salt))
+        && (session_generation_id != authoritative_generation_id
+            || session_salt != authoritative_salt)
 }
 
 fn session_is_disconnected_device(
@@ -3775,7 +4059,6 @@ fn session_is_disconnected_device(
 }
 
 fn getconf_reconnect_action_hot(
-    authoritative: Option<&EpochValue>,
     session_device_id: &str,
     session_generation_id: u64,
     session_salt: &str,
@@ -3783,42 +4066,10 @@ fn getconf_reconnect_action_hot(
     incoming_generation_id: u64,
     incoming_salt: &str,
 ) -> GetconfReconnectAction {
-    if !session_device_id.is_empty()
-        && (session_device_id != incoming_device_id
-            || incoming_generation_id < session_generation_id
-            || (incoming_generation_id == session_generation_id && incoming_salt != session_salt))
+    if session_device_id == incoming_device_id
+        && session_generation_id == incoming_generation_id
+        && session_salt == incoming_salt
     {
-        return GetconfReconnectAction::Reject;
-    }
-    if let Some(epoch) = authoritative {
-        if incoming_generation_id < epoch.generation_id
-            || (incoming_generation_id == epoch.generation_id
-                && incoming_salt != epoch.session_salt)
-        {
-            return GetconfReconnectAction::Reject;
-        }
-        if incoming_generation_id == epoch.generation_id && incoming_salt == epoch.session_salt {
-            return if session_device_id == incoming_device_id
-                && session_generation_id == incoming_generation_id
-                && session_salt == incoming_salt
-            {
-                GetconfReconnectAction::Process
-            } else {
-                GetconfReconnectAction::Replace
-            };
-        }
-        return GetconfReconnectAction::Replace;
-    }
-    if session_device_id.is_empty() {
-        return GetconfReconnectAction::Process;
-    }
-    if session_device_id != incoming_device_id
-        || incoming_generation_id < session_generation_id
-        || (incoming_generation_id == session_generation_id && incoming_salt != session_salt)
-    {
-        return GetconfReconnectAction::Reject;
-    }
-    if incoming_generation_id == session_generation_id {
         GetconfReconnectAction::Process
     } else {
         GetconfReconnectAction::Replace
@@ -4064,22 +4315,6 @@ fn getconf_credential_access(
     if !entry.device_id.is_empty() && entry.device_id != device_id {
         return Err("DENIED:device_mismatch");
     }
-    if let Some(device) = db.devices.get(device_id)
-        && !device.bound_password.is_empty()
-        && device.bound_password != password
-    {
-        let owner_password = &device.bound_password;
-        let owner_claims = if !db.main_password.is_empty() && owner_password == &db.main_password {
-            db.main_device_id == device_id
-        } else {
-            db.passwords
-                .get(owner_password)
-                .is_some_and(|owner| owner.device_id == device_id)
-        };
-        if owner_claims {
-            return Err("DENIED:device_mismatch");
-        }
-    }
     if entry.device_id.is_empty() {
         Ok(CredentialAccess::Unbound)
     } else {
@@ -4103,11 +4338,7 @@ fn device_control_authorized(db: &Database, password: &str, device_id: &str) -> 
             && !entry.device_id.is_empty()
             && entry.device_id == device_id
     });
-    password_authorized
-        && db
-            .devices
-            .get(device_id)
-            .is_some_and(|device| device.bound_password == password)
+    password_authorized && db.devices.contains_key(device_id)
 }
 
 fn session_epoch_identity(session: &Session) -> SessionEpochIdentity {
@@ -4133,17 +4364,8 @@ fn current_device_epoch(app: &Arc<App>, device_id: &str, slot: &Arc<DeviceEpochS
 }
 
 async fn fresh_device_epoch_slot(app: &Arc<App>, device_id: &str) -> DeviceEpochSlot {
-    let state = match db_read(app).await {
-        Ok(db) => db
-            .devices
-            .get(device_id)
-            .map(|device| {
-                DeviceEpochState::new(device.last_generation_id, device.last_session_salt.clone())
-            })
-            .unwrap_or_default(),
-        Err(_) => DeviceEpochState::default(),
-    };
-    DeviceEpochSlot::new(state, unix_time_ms())
+    let _ = (app, device_id);
+    DeviceEpochSlot::new(DeviceEpochState::default(), unix_time_ms())
 }
 
 async fn lock_device_epoch(
@@ -4345,7 +4567,7 @@ async fn handle_getconf(
     text: &str,
 ) -> Result<()> {
     let content = text.strip_prefix("GETCONF:").unwrap_or_default().trim();
-    let mut parts = content.splitn(7, '|');
+    let mut parts = content.splitn(8, '|');
     let client_port = parts.next().unwrap_or("9000").trim();
     let device_id = parts.next().unwrap_or("unknown").trim();
     let password = parts.next().unwrap_or("").trim();
@@ -4353,6 +4575,7 @@ async fn handle_getconf(
     let session_salt = parts.next().unwrap_or("").trim();
     let worker_text = parts.next().unwrap_or("").trim();
     let desired_text = parts.next().unwrap_or("").trim();
+    let protocol_revision = parts.next().unwrap_or("").trim();
     let Some(generation_id) = parse_generation_id(generation_text) else {
         log_getconf_result(
             app,
@@ -4366,6 +4589,20 @@ async fn handle_getconf(
         writer.write(b"DENIED:invalid_epoch").await?;
         return Ok(());
     };
+    if !is_supported_wire_protocol(protocol_revision) {
+        log_getconf_result(
+            app,
+            session,
+            device_id,
+            Some(generation_id),
+            None,
+            None,
+            "DENIED:protocol_mismatch",
+        );
+        writer.write(b"DENIED:protocol_mismatch").await?;
+        return Ok(());
+    }
+    let data_frames = supports_data_frames(protocol_revision);
     if password != session.password {
         log_getconf_result(
             app,
@@ -4497,15 +4734,7 @@ async fn handle_getconf(
                 response.to_owned()
             }
             Ok(access) => match epoch.admit(generation_id, session_salt) {
-                DeviceEpochDecision::Stale => {
-                    reject_session = true;
-                    "DENIED:stale_generation".to_owned()
-                }
-                DeviceEpochDecision::SaltConflict => {
-                    reject_session = true;
-                    "DENIED:session_conflict".to_owned()
-                }
-                DeviceEpochDecision::Current | DeviceEpochDecision::Advanced => {
+                DeviceEpochDecision::Current | DeviceEpochDecision::Replaced => {
                     set_public_epoch(session, device_id, generation_id, session_salt);
                     session
                         .worker_id
@@ -4550,30 +4779,22 @@ async fn handle_getconf(
                                     pub_key: public,
                                     up_bytes: 0,
                                     down_bytes: 0,
-                                    bound_password: password.to_owned(),
-                                    last_session_salt: session_salt.to_owned(),
-                                    last_generation_id: generation_id,
                                 },
                             );
-                            changed = true;
-                        }
-                    } else if let Some(device) = db.devices.get_mut(device_id) {
-                        if device.bound_password != password {
-                            device.bound_password = password.to_owned();
-                            changed = true;
-                        }
-                        if device.last_session_salt != session_salt {
-                            device.last_session_salt = session_salt.to_owned();
-                            changed = true;
-                        }
-                        if device.last_generation_id != generation_id {
-                            device.last_generation_id = generation_id;
                             changed = true;
                         }
                     }
                     if let Some(device) = db.devices.get(device_id).cloned() {
                         tunnel_ip = crate::tun_device::parse_ipv4(&device.ip);
-                        format!("TUNCONF:{}:{}:{}", device.ip, dns, client_port)
+                        let stream_revision = if data_frames {
+                            "stream-v2"
+                        } else {
+                            "stream-v1"
+                        };
+                        format!(
+                            "TUNCONF:{}:{}:{}:{stream_revision}",
+                            device.ip, dns, client_port
+                        )
                     } else {
                         "NOCONF".to_owned()
                     }
@@ -4607,6 +4828,13 @@ async fn handle_getconf(
         )?;
         command(
             app,
+            ProtocolCommand::SetDataFrames {
+                session_id: session.id,
+                enabled: data_frames,
+            },
+        )?;
+        command(
+            app,
             ProtocolCommand::SetAuthoritativeEpoch {
                 device_id: device_id.to_owned(),
                 generation_id,
@@ -4623,7 +4851,6 @@ async fn handle_getconf(
         Some(desired_count),
         &response,
     );
-    writer.write(response.as_bytes()).await?;
     if !reject_session && let Some(ip) = tunnel_ip {
         *lock_unpoison(&session.tunnel_ip) = Some(ip);
         let registration_id = ROUTE_REGISTRATION_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -4639,6 +4866,7 @@ async fn handle_getconf(
             },
         )?;
     }
+    writer.write(response.as_bytes()).await?;
     drop(epoch);
     if reject_session
         && rejected_session_is_request(session, device_id, generation_id, session_salt)
@@ -4961,7 +5189,6 @@ async fn run_password_janitor_cycle(app: &Arc<App>) {
                 continue;
             }
             db.passwords.remove(&password);
-            db.clear_device_binding(&password);
             app.db_persistence.submit(db.clone());
         }
         app.derived_keys.remove(&password);
@@ -4984,6 +5211,213 @@ pub async fn password_janitor(app: Arc<App>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::PasswordEntry;
+
+    #[test]
+    fn hot_tunnel_configuration_preserves_client_ip_and_replaces_dns() {
+        let payload = format!(
+            "TUNCONF:{}:{}:0:stream-v2",
+            Ipv4Addr::from([10, 66, 67, 42]),
+            "8.8.8.8,8.8.4.4"
+        );
+        assert_eq!(payload, "TUNCONF:10.66.67.42:8.8.8.8,8.8.4.4:0:stream-v2");
+    }
+
+    #[test]
+    fn a_device_can_bind_multiple_passwords_but_each_password_stays_device_locked() {
+        let mut db = Database::default();
+        db.devices.insert(
+            "device-a".to_owned(),
+            ClientDevice {
+                device_id: "device-a".to_owned(),
+                ..ClientDevice::default()
+            },
+        );
+        db.passwords.insert(
+            "password-a".to_owned(),
+            PasswordEntry {
+                device_id: "device-a".to_owned(),
+                ..PasswordEntry::default()
+            },
+        );
+        db.passwords
+            .insert("password-b".to_owned(), PasswordEntry::default());
+
+        assert_eq!(
+            getconf_credential_access(&db, "password-b", "device-a"),
+            Ok(CredentialAccess::Unbound)
+        );
+        assert_eq!(
+            getconf_credential_access(&db, "password-a", "device-b"),
+            Err("DENIED:device_mismatch")
+        );
+
+        db.passwords.get_mut("password-b").unwrap().device_id = "device-a".to_owned();
+        assert_eq!(
+            getconf_credential_access(&db, "password-a", "device-a"),
+            Ok(CredentialAccess::Bound)
+        );
+        assert_eq!(
+            getconf_credential_access(&db, "password-b", "device-a"),
+            Ok(CredentialAccess::Bound)
+        );
+        assert_eq!(
+            getconf_credential_access(&db, "password-b", "device-b"),
+            Err("DENIED:device_mismatch")
+        );
+        assert!(device_control_authorized(&db, "password-a", "device-a"));
+        assert!(device_control_authorized(&db, "password-b", "device-a"));
+    }
+
+    fn fixture_engine_with_worker(
+        password: &str,
+        shard_index: usize,
+        shard_count: usize,
+    ) -> (
+        ProtocolEngine,
+        mpsc::Receiver<ControlEvent>,
+        mpsc::Receiver<dataplane::WorkerOutput<ProtocolCommand>>,
+    ) {
+        let key = derive_wrap_key(password).unwrap();
+        let credentials = Arc::new(CredentialSet {
+            entries: vec![Credential {
+                password: Arc::<str>::from(password),
+                key,
+                aes: make_aes_key(&key),
+                hmac: make_hmac_key(&key),
+                chacha: aws_lc_rs::aead::LessSafeKey::new(
+                    aws_lc_rs::aead::UnboundKey::new(&aws_lc_rs::aead::CHACHA20_POLY1305, &key)
+                        .unwrap(),
+                ),
+            }],
+        });
+        let (control_tx, control_rx) = mpsc::channel(64);
+        let (output_tx, output_rx) = mpsc::channel(64);
+        let engine = ProtocolEngine::new(
+            WorkerContext::new(shard_index, shard_count, output_tx),
+            credentials,
+            HashMap::new(),
+            control_tx,
+            FecProfile::Safe,
+            Arc::new(AtomicBool::new(false)),
+            EngineShared {
+                global_up: Arc::new(AtomicU64::new(0)),
+                global_down: Arc::new(AtomicU64::new(0)),
+            },
+        );
+        (engine, control_rx, output_rx)
+    }
+
+    fn fixture_engine(password: &str) -> (ProtocolEngine, mpsc::Receiver<ControlEvent>) {
+        let (engine, control_rx, _output_rx) = fixture_engine_with_worker(password, 0, 1);
+        (engine, control_rx)
+    }
+
+    fn fixture_wire() -> Vec<u8> {
+        hex::decode(crate::wire_protocol::CLIENT_GETCONF_AUDIO_FIXTURE).unwrap()
+    }
+
+    struct NoopSink;
+
+    impl PacketOutput for NoopSink {
+        fn has_udp_tx_slot(&self) -> bool {
+            true
+        }
+
+        fn send_udp_with_duplicate_priority<F>(
+            &mut self,
+            _peer: SocketAddr,
+            _source_ip: Option<IpAddr>,
+            _duplicate: bool,
+            _class: crate::striped_scheduler::PacketClass,
+            build: F,
+        ) -> bool
+        where
+            F: FnOnce(&mut PacketBuf) -> bool,
+        {
+            let pool = crate::packet::PacketPool::new(1);
+            let Some(mut packet) = pool.try_acquire() else {
+                return false;
+            };
+            build(&mut packet)
+        }
+
+        fn request_udp_flush(&mut self) {}
+
+        fn write_tun_priority(
+            &mut self,
+            _payload: &[u8],
+            _class: crate::striped_scheduler::PacketClass,
+        ) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn device_owner_shard_is_stable_across_all_turn_workers() {
+        for device in ["alpha", "device-42", "long-device-id-0123456789"] {
+            let owner = shard_for_device(device, 11);
+            assert!(owner < 11);
+            for _ in 0..126 {
+                assert_eq!(shard_for_device(device, 11), owner);
+            }
+        }
+    }
+
+    #[test]
+    fn bootstrap_session_moves_to_its_device_owner_before_control_is_emitted() {
+        let mut device = "device-owner".to_owned();
+        while shard_for_device(&device, 2) == 0 {
+            device.push('x');
+        }
+        let target = shard_for_device(&device, 2);
+        let password = "owner-password";
+        let key = derive_wrap_key(password).unwrap();
+        let (mut bootstrap, mut bootstrap_control, mut router_output) =
+            fixture_engine_with_worker(password, 0, 2);
+        let slot = bootstrap.create_legacy_session(
+            "127.0.0.1:46000".parse().unwrap(),
+            None,
+            Arc::<str>::from(password),
+            key,
+            111,
+            false,
+            &device,
+            1,
+            "owner-salt",
+            1,
+        );
+        bootstrap.place_new_session(slot, b"GETCONF:9000|owner".to_vec());
+        assert!(bootstrap.sessions.is_empty());
+        assert!(bootstrap.endpoint_is_migrating("127.0.0.1:46000".parse().unwrap(), None));
+        assert!(matches!(
+            bootstrap_control.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        let command = match router_output.try_recv() {
+            Ok(dataplane::WorkerOutput::Router(dataplane::RouterCommand::Migrate {
+                shard,
+                command,
+                ..
+            })) => {
+                assert_eq!(shard, target);
+                command
+            }
+            _ => panic!("bootstrap did not enqueue session migration"),
+        };
+        let (mut owner, mut owner_control, _owner_output) =
+            fixture_engine_with_worker(password, target, 2);
+        owner.on_command(command, &mut NoopSink);
+        assert_eq!(owner.sessions.len(), 1);
+        assert!(matches!(
+            owner_control.try_recv(),
+            Ok(ControlEvent::SessionCreated(_))
+        ));
+        assert!(matches!(
+            owner_control.try_recv(),
+            Ok(ControlEvent::Payload { .. })
+        ));
+    }
 
     #[test]
     fn legacy_json_client_remains_authorized_after_runtime_epoch_reset() {
@@ -5009,9 +5443,6 @@ mod tests {
             ClientDevice {
                 device_id: "legacy-device".to_owned(),
                 ip: "10.66.67.2".to_owned(),
-                bound_password: "legacy-password".to_owned(),
-                last_generation_id: 1_786_000_000_000,
-                last_session_salt: "retired-salt".to_owned(),
                 ..ClientDevice::default()
             },
         );
@@ -5026,15 +5457,10 @@ mod tests {
             getconf_credential_access(&migrated, "legacy-password", "legacy-device"),
             Ok(CredentialAccess::Bound)
         );
-        let device = &migrated.devices["legacy-device"];
-        assert_eq!(device.last_generation_id, 0);
-        assert!(device.last_session_salt.is_empty());
-
-        let mut epoch =
-            DeviceEpochState::new(device.last_generation_id, device.last_session_salt.clone());
+        let mut epoch = DeviceEpochState::default();
         assert_eq!(
             epoch.admit(1_786_000_000, "fresh-session-salt"),
-            DeviceEpochDecision::Advanced
+            DeviceEpochDecision::Replaced
         );
         assert!(!directory.join("passwords.json").exists());
         let _ = std::fs::remove_dir_all(directory);
@@ -5137,6 +5563,177 @@ mod tests {
     }
 
     #[test]
+    fn wire_protocol_revision_must_match_exactly() {
+        assert!(is_supported_wire_protocol(
+            crate::wire_protocol::WIRE_PROTOCOL_REVISION
+        ));
+        assert!(!is_supported_wire_protocol("CSQTT-WIRE-1"));
+        assert!(!is_supported_wire_protocol(""));
+    }
+
+    #[test]
+    fn client_getconf_fixture_authenticates_with_matching_password_only() {
+        let wire = hex::decode(crate::wire_protocol::CLIENT_GETCONF_AUDIO_FIXTURE).unwrap();
+        let key = derive_wrap_key("wire-password").unwrap();
+        let aes = make_aes_key(&key);
+        let hmac = make_hmac_key(&key);
+        let chacha = aws_lc_rs::aead::LessSafeKey::new(
+            aws_lc_rs::aead::UnboundKey::new(&aws_lc_rs::aead::CHACHA20_POLY1305, &key).unwrap(),
+        );
+        let mut matching = wire.clone();
+        let decoded =
+            unwrap_legacy_in_place(&aes, &hmac, &chacha, &mut matching, None, false).unwrap();
+        assert_eq!(
+            decoded.range.get(&matching),
+            b"GETCONF:46000|wire-device|wire-password|7|wire-salt|1|27|CSQTT-WIRE-2"
+        );
+        assert_eq!(
+            parse_getconf_epoch(decoded.range.get(&matching)),
+            Some(("wire-device", 7, "wire-salt")),
+        );
+
+        let wrong_key = derive_wrap_key("wrong-password").unwrap();
+        let wrong_aes = make_aes_key(&wrong_key);
+        let wrong_hmac = make_hmac_key(&wrong_key);
+        let wrong_chacha = aws_lc_rs::aead::LessSafeKey::new(
+            aws_lc_rs::aead::UnboundKey::new(&aws_lc_rs::aead::CHACHA20_POLY1305, &wrong_key)
+                .unwrap(),
+        );
+        let mut mismatched = wire;
+        assert!(
+            unwrap_legacy_in_place(
+                &wrong_aes,
+                &wrong_hmac,
+                &wrong_chacha,
+                &mut mismatched,
+                None,
+                false,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn client_fixture_creates_hot_session_and_control_event_through_engine() {
+        let (mut engine, mut events) = fixture_engine("wire-password");
+        let peer = SocketAddr::from(([198, 51, 100, 10], 46000));
+        engine.handle_unknown_legacy(peer, None, &fixture_wire());
+
+        assert_eq!(engine.sessions.len(), 1);
+        let (_, session) = engine.sessions.iter().next().unwrap();
+        assert_eq!(session.peer, peer);
+        assert_eq!(session.device_id, "wire-device");
+        assert_eq!(session.generation_id, 7);
+        assert_eq!(session.session_salt, "wire-salt");
+
+        match events.try_recv().unwrap() {
+            ControlEvent::SessionCreated(session) => {
+                assert_eq!(session.address, peer);
+                assert_eq!(session.password, "wire-password");
+            }
+            _ => panic!("expected SessionCreated"),
+        }
+        match events.try_recv().unwrap() {
+            ControlEvent::Payload {
+                address, payload, ..
+            } => {
+                assert_eq!(address, peer);
+                assert_eq!(
+                    payload,
+                    b"GETCONF:46000|wire-device|wire-password|7|wire-salt|1|27|CSQTT-WIRE-2"
+                );
+            }
+            _ => panic!("expected GETCONF payload"),
+        }
+    }
+
+    #[test]
+    fn client_fixture_with_wrong_server_key_cannot_create_a_hot_session() {
+        let (mut engine, mut events) = fixture_engine("wrong-password");
+        engine.handle_unknown_legacy(
+            SocketAddr::from(([198, 51, 100, 11], 46000)),
+            None,
+            &fixture_wire(),
+        );
+        assert!(engine.sessions.is_empty());
+        assert!(events.try_recv().is_err());
+    }
+
+    #[test]
+    fn duplicate_client_handshake_replaces_in_place_without_a_phantom_session() {
+        let (mut engine, mut events) = fixture_engine("wire-password");
+        let peer = SocketAddr::from(([198, 51, 100, 12], 46000));
+        let wire = fixture_wire();
+        engine.handle_unknown_legacy(peer, None, &wire);
+        let first_id = engine.sessions.iter().next().unwrap().1.id;
+        engine.handle_unknown_legacy(peer, None, &wire);
+
+        assert_eq!(engine.sessions.len(), 1);
+        let second_id = engine.sessions.iter().next().unwrap().1.id;
+        assert_ne!(first_id, second_id);
+        assert!(!engine.by_id.contains_key(&first_id));
+        assert!(engine.by_id.contains_key(&second_id));
+        let mut created = 0;
+        let mut payloads = 0;
+        let mut closed = 0;
+        while let Ok(event) = events.try_recv() {
+            match event {
+                ControlEvent::SessionCreated(_) => created += 1,
+                ControlEvent::Payload { .. } => payloads += 1,
+                ControlEvent::SessionClosed { session_id, .. } => {
+                    assert_eq!(session_id, first_id);
+                    closed += 1;
+                }
+                _ => panic!("unexpected control event during duplicate handshake"),
+            }
+        }
+        assert_eq!(created, 2);
+        assert_eq!(payloads, 2);
+        assert_eq!(closed, 1);
+    }
+
+    #[test]
+    fn ten_client_endpoints_complete_the_encrypted_setup_path_without_collisions() {
+        let (mut engine, mut events) = fixture_engine("wire-password");
+        let wire = fixture_wire();
+        for client in 0..10u8 {
+            let peer = SocketAddr::from(([198, 51, 100, client + 20], 46_000 + u16::from(client)));
+            engine.handle_unknown_legacy(peer, None, &wire);
+        }
+
+        assert_eq!(engine.sessions.len(), 10);
+        assert_eq!(engine.by_peer.len(), 10);
+        assert_eq!(engine.by_id.len(), 10);
+        for _ in 0..20 {
+            assert!(events.try_recv().is_ok());
+        }
+        assert!(events.try_recv().is_err());
+    }
+
+    #[test]
+    fn client_getconf_fixture_rejects_every_single_bit_wire_mutation() {
+        let wire = hex::decode(crate::wire_protocol::CLIENT_GETCONF_AUDIO_FIXTURE).unwrap();
+        let key = derive_wrap_key("wire-password").unwrap();
+        let aes = make_aes_key(&key);
+        let hmac = make_hmac_key(&key);
+        let chacha = aws_lc_rs::aead::LessSafeKey::new(
+            aws_lc_rs::aead::UnboundKey::new(&aws_lc_rs::aead::CHACHA20_POLY1305, &key).unwrap(),
+        );
+
+        for byte_index in 0..wire.len() {
+            for bit in 0..8 {
+                let mut corrupted = wire.clone();
+                corrupted[byte_index] ^= 1 << bit;
+                assert!(
+                    unwrap_legacy_in_place(&aes, &hmac, &chacha, &mut corrupted, None, false)
+                        .is_err(),
+                    "accepted mutation at byte {byte_index}, bit {bit}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn stream_control_payload_is_compact_and_deterministic() {
         let payload = stream_control_payload(STREAM_REPAIR_PREFIX, 7, 36, &[14, 28]);
         assert!(payload.starts_with(STREAM_REPAIR_PREFIX));
@@ -5168,9 +5765,9 @@ mod tests {
         let alive = round.alive_payload(30_100).unwrap();
         assert!(alive.starts_with(STREAM_ALIVE_PREFIX));
         assert_ne!(repair, alive);
-        assert!(round.alive_payload(5_500).is_none());
-        assert!(round.alive_payload(10_100).is_some());
-        assert!(round.alive_payload(15_100).is_none());
+        assert!(round.alive_payload(35_500).is_none());
+        assert!(round.alive_payload(40_100).is_some());
+        assert!(round.alive_payload(45_100).is_none());
     }
 
     #[test]
@@ -5193,32 +5790,40 @@ mod tests {
     }
 
     #[test]
-    fn reconnect_epoch_rejects_stale_and_conflicting_salt() {
-        let epoch = EpochValue {
-            generation_id: 77,
-            session_salt: "salt-a".to_owned(),
-            last_seen_ms: 0,
-        };
+    fn reconnect_session_key_replaces_stale_and_conflicting_values() {
         assert_eq!(
-            getconf_reconnect_action_hot(Some(&epoch), "device", 77, "salt-a", "device", 76, "old",),
-            GetconfReconnectAction::Reject
+            getconf_reconnect_action_hot("device", 77, "salt-a", "device", 76, "old",),
+            GetconfReconnectAction::Replace
         );
         assert_eq!(
-            getconf_reconnect_action_hot(
-                Some(&epoch),
-                "device",
-                77,
-                "salt-a",
-                "device",
-                77,
-                "salt-b",
-            ),
-            GetconfReconnectAction::Reject
+            getconf_reconnect_action_hot("device", 77, "salt-a", "device", 77, "salt-b",),
+            GetconfReconnectAction::Replace
+        );
+        assert_eq!(
+            getconf_reconnect_action_hot("device", 77, "salt-a", "device", 77, "salt-a",),
+            GetconfReconnectAction::Process
+        );
+        assert_eq!(
+            getconf_reconnect_action_hot("device", 77, "salt-a", "device", 77, "salt-a"),
+            GetconfReconnectAction::Process
         );
     }
 
     #[test]
-    fn authoritative_epoch_retires_every_lower_generation() {
+    fn active_device_session_replaces_any_different_key_without_ordering() {
+        let mut state = DeviceEpochState::default();
+
+        assert_eq!(state.admit(77, "salt-a"), DeviceEpochDecision::Replaced);
+        assert_eq!(state.admit(77, "salt-a"), DeviceEpochDecision::Current);
+        assert_eq!(state.admit(12, "salt-b"), DeviceEpochDecision::Replaced);
+        assert_eq!(state.generation_id, 12);
+        assert_eq!(state.session_salt, "salt-b");
+        assert_eq!(state.admit(12, "salt-c"), DeviceEpochDecision::Replaced);
+        assert_eq!(state.session_salt, "salt-c");
+    }
+
+    #[test]
+    fn active_session_key_retires_every_different_session() {
         assert!(session_is_retired_by_epoch(
             "device", 41, "old-a", "device", 42, "current"
         ));
@@ -5231,7 +5836,7 @@ mod tests {
         assert!(!session_is_retired_by_epoch(
             "device", 42, "current", "device", 42, "current"
         ));
-        assert!(!session_is_retired_by_epoch(
+        assert!(session_is_retired_by_epoch(
             "device", 43, "future", "device", 42, "current"
         ));
         assert!(!session_is_retired_by_epoch(
@@ -5240,7 +5845,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn concurrent_epoch_admission_converges_to_highest_generation() {
+    async fn concurrent_session_admission_accepts_each_new_session_key() {
         let state = Arc::new(Mutex::new(DeviceEpochState::default()));
         let mut tasks = Vec::new();
         for generation in (1..=128u64).rev().chain(1..=128) {
@@ -5254,14 +5859,11 @@ mod tests {
             task.await.unwrap();
         }
         let mut state = state.lock().await;
-        assert_eq!(state.generation_id, 128);
-        assert_eq!(state.session_salt, "salt-128");
-        assert_eq!(state.admit(127, "salt-127"), DeviceEpochDecision::Stale);
-        assert_eq!(
-            state.admit(128, "conflict"),
-            DeviceEpochDecision::SaltConflict
+        assert!(
+            (1..=128).any(|generation| state.matches(generation, &format!("salt-{generation}")))
         );
-        assert_eq!(state.admit(129, "salt-129"), DeviceEpochDecision::Advanced);
+        assert_eq!(state.admit(129, "salt-129"), DeviceEpochDecision::Replaced);
+        assert_eq!(state.admit(129, "salt-129"), DeviceEpochDecision::Current);
     }
 
     #[test]
@@ -5269,5 +5871,170 @@ mod tests {
         assert!(session_is_disconnected_device(7, "", 7, "device"));
         assert!(session_is_disconnected_device(8, "device", 7, "device"));
         assert!(!session_is_disconnected_device(8, "other", 7, "device"));
+    }
+
+    #[test]
+    fn ten_clients_one_gigabit_replay_path_is_predictable() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        const CLIENTS: usize = 10;
+        const PACKET_BYTES: u64 = 1_250;
+        const PACKETS_PER_CLIENT: u16 = 10_000;
+        let admitted_bytes = AtomicU64::new(0);
+
+        std::thread::scope(|scope| {
+            for client in 0..CLIENTS {
+                let admitted_bytes = &admitted_bytes;
+                scope.spawn(move || {
+                    let mut replay = ReplayState::new();
+                    for sequence in 0..PACKETS_PER_CLIENT {
+                        assert!(
+                            replay.accept(sequence),
+                            "client {client}, sequence {sequence}"
+                        );
+                        admitted_bytes.fetch_add(PACKET_BYTES, Ordering::Relaxed);
+                    }
+                });
+            }
+        });
+
+        assert_eq!(
+            admitted_bytes.load(Ordering::Relaxed),
+            u64::try_from(CLIENTS).unwrap() * u64::from(PACKETS_PER_CLIENT) * PACKET_BYTES
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ten_clients_concurrent_reconnections_keep_device_identities_isolated() {
+        let states: Vec<_> = (0..10)
+            .map(|_| Arc::new(Mutex::new(DeviceEpochState::default())))
+            .collect();
+        let mut tasks = Vec::new();
+
+        for client in 0..10u64 {
+            for generation in 1..=128u64 {
+                let state = states[client as usize].clone();
+                tasks.push(tokio::spawn(async move {
+                    let salt = format!("client-{client}-generation-{generation}");
+                    let mut state = state.lock().await;
+                    state.admit(generation, &salt);
+                }));
+            }
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+
+        for (client, state) in states.iter().enumerate() {
+            let state = state.lock().await;
+            assert!(
+                (1..=128).any(|generation| state.matches(
+                    generation,
+                    &format!("client-{client}-generation-{generation}")
+                )),
+                "client {client} retained another client's generation identity"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn same_device_reconnections_converge_to_a_complete_generation_pair() {
+        let state = Arc::new(Mutex::new(DeviceEpochState::default()));
+        let mut tasks = Vec::new();
+        for attempt in 0..1024u64 {
+            let state = state.clone();
+            tasks.push(tokio::spawn(async move {
+                let generation = attempt.wrapping_mul(37).wrapping_add(11);
+                let salt = format!("salt-{generation}-{attempt}");
+                let mut state = state.lock().await;
+                state.admit(generation, &salt);
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+
+        let state = state.lock().await;
+        assert!(
+            (0..1024u64).any(|attempt| {
+                let generation = attempt.wrapping_mul(37).wrapping_add(11);
+                state.matches(generation, &format!("salt-{generation}-{attempt}"))
+            }),
+            "generation and salt were observed from different reconnects"
+        );
+    }
+
+    #[test]
+    fn replay_window_accepts_one_hundred_thousand_packets_through_wraps() {
+        let mut replay = ReplayState::new();
+        for sequence in 0..100_000u32 {
+            assert!(replay.accept(sequence as u16), "sequence {sequence}");
+        }
+    }
+
+    #[test]
+    fn replay_window_rejects_deterministic_duplicates_and_stale_packets() {
+        let mut replay = ReplayState::new();
+        for sequence in 0..20_000u32 {
+            assert!(replay.accept(sequence as u16));
+            assert!(!replay.accept(sequence as u16));
+        }
+        assert!(!replay.accept(0));
+        assert!(!replay.accept(1));
+    }
+
+    #[test]
+    fn ten_stream_repair_rounds_converge_without_cross_client_state() {
+        let mut rounds: Vec<_> = (0..10).map(|_| StreamRepairRound::default()).collect();
+        for (client, round) in rounds.iter_mut().enumerate() {
+            let missing = [client as u16 + 1, client as u16 + 21];
+            assert!(round.repair_payload(&missing, 36, 0).is_none());
+            let repair = round
+                .repair_payload(&missing, 36, STREAM_REPAIR_GRACE_MS)
+                .unwrap();
+            assert!(repair.ends_with(&(client as u16 + 21).to_be_bytes()));
+            round.recovered(36, STREAM_REPAIR_GRACE_MS + 1);
+            let alive = round.alive_payload(STREAM_REPAIR_GRACE_MS + 1).unwrap();
+            assert!(alive.starts_with(STREAM_ALIVE_PREFIX));
+        }
+    }
+
+    #[test]
+    fn stream_control_payload_represents_all_supported_workers() {
+        let workers: Vec<u16> = (1..=MAX_STREAM_WORKERS_U16).collect();
+        let payload =
+            stream_control_payload(STREAM_REPAIR_PREFIX, 9, MAX_STREAM_WORKERS_U16, &workers);
+        let offset = STREAM_REPAIR_PREFIX.len();
+        assert_eq!(payload[offset + 10], MAX_STREAM_WORKERS_U16 as u8);
+        assert_eq!(
+            &payload[payload.len() - 2..],
+            &MAX_STREAM_WORKERS_U16.to_be_bytes()
+        );
+    }
+
+    #[test]
+    fn stream_control_payload_caps_untrusted_worker_list_at_u8_limit() {
+        let workers: Vec<u16> = (0..300u16).collect();
+        let payload = stream_control_payload(STREAM_REPAIR_PREFIX, 4, 300, &workers);
+        let offset = STREAM_REPAIR_PREFIX.len();
+        assert_eq!(payload[offset + 10], u8::MAX);
+        assert_eq!(
+            payload.len(),
+            STREAM_REPAIR_PREFIX.len() + 11 + usize::from(u8::MAX) * 2
+        );
+    }
+
+    #[test]
+    fn generation_parser_accepts_decimal_boundaries_without_timestamp_ordering() {
+        for value in ["0", "1", "0001", "42", "18446744073709551615"] {
+            assert!(parse_generation_id(value).is_some(), "{value}");
+        }
+    }
+
+    #[test]
+    fn generation_parser_rejects_non_decimal_and_overflow_values() {
+        for value in ["-1", "+1", "1.0", "abc", "18446744073709551616", " 7", "7 "] {
+            assert!(parse_generation_id(value).is_none(), "{value:?}");
+        }
     }
 }

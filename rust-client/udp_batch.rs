@@ -1,28 +1,14 @@
 // SPDX-FileCopyrightText: 2026 amurcanov
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 
-//! Bounded batched I/O for Tokio UDP sockets.
-//!
-//! The public `try_*` functions never wait.  On Android and Linux they use
-//! `recvmmsg` / `sendmmsg`; other targets preserve the same prefix semantics
-//! with ordinary Tokio UDP calls.  Both connected and unconnected sockets are
-//! supported. The async wrappers wait for Tokio readiness and retry only work
-//! that the kernel did not accept.
-//!
-//! Callers own the `PacketBuf`s supplied to [`try_recv_connected`] and must
-//! acquire them only when they are prepared to receive.  A successful receive
-//! has already set the `PacketBuf` lengths for the returned prefix.
-
 use crate::packet::PacketBuf;
 #[cfg(any(target_os = "android", target_os = "linux"))]
 use crate::packet::{PACKET_CAPACITY, PACKET_HEADROOM};
 use std::io::{self, ErrorKind};
 use tokio::net::UdpSocket;
 
-/// Upper bound for a single kernel batch.  It bounds stack metadata and keeps
-/// fairness predictable for a Tokio task.
 pub const MIN_DATAGRAMS: usize = 16;
-pub const MAX_DATAGRAMS: usize = 100;
+pub const MAX_DATAGRAMS: usize = 128;
 
 pub const fn adapt_batch_limit(current: usize, received: usize) -> usize {
     if received >= current && current < MAX_DATAGRAMS {
@@ -42,24 +28,12 @@ pub const fn adapt_batch_limit(current: usize, received: usize) -> usize {
     }
 }
 
-/// Receive up to `packets.len()` datagrams from a connected UDP socket without
-/// waiting.
-///
-/// On success, returns the number of leading `PacketBuf`s whose read lengths
-/// were set.  If no datagram is currently available, returns
-/// [`ErrorKind::WouldBlock`].  `packets` must contain no more than
-/// [`MAX_DATAGRAMS`] elements.
 pub fn try_recv_connected(socket: &UdpSocket, packets: &mut [PacketBuf]) -> io::Result<usize> {
     validate_batch_len(packets.len())?;
     platform::try_recv_connected(socket, packets)
 }
 
-/// Await one or more datagrams from a connected UDP socket.
-///
-/// The returned prefix has the same meaning as [`try_recv_connected`].  The
-/// helper never allocates packet storage; callers keep control over the packet
-/// pool and its backpressure policy.
-#[allow(dead_code)] // TURN's hot path owns readiness so it can preserve pool backpressure.
+#[allow(dead_code)]
 pub async fn recv_connected(socket: &UdpSocket, packets: &mut [PacketBuf]) -> io::Result<usize> {
     validate_batch_len(packets.len())?;
     if packets.is_empty() {
@@ -75,24 +49,11 @@ pub async fn recv_connected(socket: &UdpSocket, packets: &mut [PacketBuf]) -> io
     }
 }
 
-/// Send the leading datagrams accepted by a connected UDP socket without
-/// waiting.
-///
-/// The result is a prefix count: `Ok(n)` means exactly `datagrams[..n]` was
-/// emitted.  It intentionally never retries the unsent suffix, so it is safe
-/// for best-effort traffic such as an optional FEC duplicate.  For a complete
-/// delivery attempt use [`send_connected`].
 pub fn try_send_connected(socket: &UdpSocket, datagrams: &[&[u8]]) -> io::Result<usize> {
     validate_batch_len(datagrams.len())?;
     platform::try_send_connected(socket, datagrams)
 }
 
-/// Send every datagram to a connected UDP socket, waiting for writability as
-/// necessary.
-///
-/// `sendmmsg` may accept only a prefix of a batch.  This function advances past
-/// that prefix and retries *only* the remaining suffix, never retransmitting a
-/// datagram that was already accepted by the kernel.
 pub async fn send_connected(socket: &UdpSocket, datagrams: &[&[u8]]) -> io::Result<()> {
     validate_batch_len(datagrams.len())?;
 
@@ -101,9 +62,6 @@ pub async fn send_connected(socket: &UdpSocket, datagrams: &[&[u8]]) -> io::Resu
         socket.writable().await?;
         match try_send_connected(socket, &datagrams[sent..]) {
             Ok(0) => {
-                // A nonempty UDP batch cannot make forward progress with a
-                // successful zero-message send.  Treat it as stale readiness
-                // and wait again instead of spinning.
                 continue;
             }
             Ok(count) => sent += count,
@@ -114,13 +72,6 @@ pub async fn send_connected(socket: &UdpSocket, datagrams: &[&[u8]]) -> io::Resu
     Ok(())
 }
 
-/// Receive up to `packets.len()` datagrams and their source addresses from an
-/// unconnected UDP socket without waiting.
-///
-/// `sources` must have exactly one slot for each supplied packet. On success,
-/// the first returned-count entries in both slices form matching datagrams and
-/// source addresses in wire order. If no datagram is currently available, the
-/// function returns [`ErrorKind::WouldBlock`].
 pub fn try_recv_from(
     socket: &UdpSocket,
     packets: &mut [PacketBuf],
@@ -130,12 +81,7 @@ pub fn try_recv_from(
     platform::try_recv_from(socket, packets, sources)
 }
 
-/// Await one or more datagrams and their source addresses from an unconnected
-/// UDP socket.
-///
-/// The returned prefixes of `packets` and `sources` correspond one-to-one and
-/// are ordered as delivered by the kernel.
-#[allow(dead_code)] // Dispatcher owns readiness to avoid reserving pool buffers while idle.
+#[allow(dead_code)]
 pub async fn recv_from(
     socket: &UdpSocket,
     packets: &mut [PacketBuf],
@@ -155,12 +101,6 @@ pub async fn recv_from(
     }
 }
 
-/// Send the leading datagrams accepted by an unconnected UDP socket to one
-/// destination without waiting.
-///
-/// The result has the same prefix semantics as [`try_send_connected`]. The
-/// destination is copied into every native `mmsghdr`, so a caller can safely
-/// reuse or replace its `SocketAddr` as soon as this function returns.
 pub fn try_send_to(
     socket: &UdpSocket,
     destination: std::net::SocketAddr,
@@ -170,11 +110,7 @@ pub fn try_send_to(
     platform::try_send_to(socket, destination, datagrams)
 }
 
-/// Send every datagram to one destination, waiting for writability as needed.
-///
-/// A partial native `sendmmsg` advances the cursor before waiting or retrying,
-/// so a datagram accepted by the kernel is never emitted a second time.
-#[allow(dead_code)] // Dispatcher uses its own loop to retain cancellation semantics.
+#[allow(dead_code)]
 pub async fn send_to(
     socket: &UdpSocket,
     destination: std::net::SocketAddr,
@@ -235,6 +171,7 @@ mod platform {
     use socket2::{SockAddr, SockAddrStorage};
     use std::{
         io::{self, ErrorKind},
+        mem::MaybeUninit,
         net::SocketAddr,
         os::fd::AsRawFd,
         ptr,
@@ -242,10 +179,6 @@ mod platform {
     };
     use tokio::{io::Interest, net::UdpSocket};
 
-    // Some Android kernels or seccomp profiles can expose the libc symbols but
-    // reject the mmsg syscalls.  Capability is process-wide and direction
-    // specific: one receive failure must not disable batch sends, or vice
-    // versa.
     static RECV_MMSG_ENABLED: AtomicBool = AtomicBool::new(true);
     static SEND_MMSG_ENABLED: AtomicBool = AtomicBool::new(true);
     static RECV_FROM_MMSG_ENABLED: AtomicBool = AtomicBool::new(true);
@@ -272,22 +205,22 @@ mod platform {
             return Ok(0);
         }
 
-        let mut iovecs = empty_iovecs();
-        let mut messages = empty_messages();
+        let mut iovecs = uninit_iovecs();
+        let mut messages = uninit_messages();
         for (index, packet) in packets.iter_mut().enumerate() {
             let area = packet.read_area();
-            iovecs[index] = libc::iovec {
+            iovecs[index].write(libc::iovec {
                 iov_base: area.as_mut_ptr().cast(),
                 iov_len: area.len(),
-            };
-            messages[index].msg_hdr.msg_iov = &mut iovecs[index];
-            messages[index].msg_hdr.msg_iovlen = 1;
+            });
+            messages[index].write(mmsg_header(iovecs[index].as_mut_ptr()));
         }
+        let messages = initialized_messages(&mut messages, packets.len());
 
         let received = socket.try_io(Interest::READABLE, || {
             loop {
                 let result = unsafe {
-                    libc::recvmmsg(
+                    recv_mmsg(
                         socket.as_raw_fd(),
                         messages.as_mut_ptr(),
                         packets.len() as libc::c_uint,
@@ -316,9 +249,6 @@ mod platform {
             ));
         }
 
-        // Do not hand truncated data to the protocol parser.  Check every
-        // header before changing PacketBuf ranges so an error leaves no packet
-        // marked as valid.
         for message in &messages[..received] {
             if message.msg_hdr.msg_flags & libc::MSG_TRUNC != 0 {
                 return Err(io::Error::new(
@@ -369,27 +299,26 @@ mod platform {
             return Ok(0);
         }
 
-        let mut iovecs = empty_iovecs();
-        let mut messages = empty_messages();
-        let mut source_storage: [SockAddrStorage; MAX_DATAGRAMS] =
-            std::array::from_fn(|_| SockAddrStorage::zeroed());
+        let mut iovecs = uninit_iovecs();
+        let mut messages = uninit_messages();
+        let mut source_storage = uninit_sources();
         for (index, packet) in packets.iter_mut().enumerate() {
             let area = packet.read_area();
-            iovecs[index] = libc::iovec {
+            iovecs[index].write(libc::iovec {
                 iov_base: area.as_mut_ptr().cast(),
                 iov_len: area.len(),
-            };
-            messages[index].msg_hdr.msg_name =
-                (&mut source_storage[index] as *mut SockAddrStorage).cast();
-            messages[index].msg_hdr.msg_namelen = source_storage[index].size_of();
-            messages[index].msg_hdr.msg_iov = &mut iovecs[index];
-            messages[index].msg_hdr.msg_iovlen = 1;
+            });
+            let mut header = mmsg_header(iovecs[index].as_mut_ptr());
+            header.msg_hdr.msg_name = source_storage[index].as_mut_ptr().cast();
+            header.msg_hdr.msg_namelen = std::mem::size_of::<SockAddrStorage>() as libc::socklen_t;
+            messages[index].write(header);
         }
+        let messages = initialized_messages(&mut messages, packets.len());
 
         let received = socket.try_io(Interest::READABLE, || {
             loop {
                 let result = unsafe {
-                    libc::recvmmsg(
+                    recv_mmsg(
                         socket.as_raw_fd(),
                         messages.as_mut_ptr(),
                         packets.len() as libc::c_uint,
@@ -435,7 +364,7 @@ mod platform {
                 ));
             }
             received_sources[index] = Some(socket_addr_from_storage(
-                std::mem::replace(&mut source_storage[index], SockAddrStorage::zeroed()),
+                unsafe { source_storage[index].assume_init_read() },
                 message.msg_hdr.msg_namelen,
             )?);
         }
@@ -450,7 +379,6 @@ mod platform {
             packets[index]
                 .set_read_len(messages[index].msg_len as usize)
                 .map_err(|error| io::Error::new(ErrorKind::InvalidData, error.to_string()))?;
-            // The address was validated into this exact matching slot above.
             sources[index] = source;
         }
         Ok(received)
@@ -474,21 +402,21 @@ mod platform {
             return Ok(0);
         }
 
-        let mut iovecs = empty_iovecs();
-        let mut messages = empty_messages();
+        let mut iovecs = uninit_iovecs();
+        let mut messages = uninit_messages();
         for (index, datagram) in datagrams.iter().enumerate() {
-            iovecs[index] = libc::iovec {
+            iovecs[index].write(libc::iovec {
                 iov_base: datagram.as_ptr().cast_mut().cast(),
                 iov_len: datagram.len(),
-            };
-            messages[index].msg_hdr.msg_iov = &mut iovecs[index];
-            messages[index].msg_hdr.msg_iovlen = 1;
+            });
+            messages[index].write(mmsg_header(iovecs[index].as_mut_ptr()));
         }
+        let messages = initialized_messages(&mut messages, datagrams.len());
 
         let sent = socket.try_io(Interest::WRITABLE, || {
             loop {
                 let result = unsafe {
-                    libc::sendmmsg(
+                    send_mmsg(
                         socket.as_raw_fd(),
                         messages.as_mut_ptr(),
                         datagrams.len() as libc::c_uint,
@@ -544,27 +472,25 @@ mod platform {
             return Ok(0);
         }
 
-        // `sendmmsg` consumes every header synchronously. A single immutable
-        // `SockAddr` is therefore sufficient for all messages and keeps IPv4,
-        // IPv6, scope-id, and network-byte-order conversion in socket2.
         let destination = SockAddr::from(destination);
-        let mut iovecs = empty_iovecs();
-        let mut messages = empty_messages();
+        let mut iovecs = uninit_iovecs();
+        let mut messages = uninit_messages();
         for (index, datagram) in datagrams.iter().enumerate() {
-            iovecs[index] = libc::iovec {
+            iovecs[index].write(libc::iovec {
                 iov_base: datagram.as_ptr().cast_mut().cast(),
                 iov_len: datagram.len(),
-            };
-            messages[index].msg_hdr.msg_name = destination.as_ptr().cast_mut().cast();
-            messages[index].msg_hdr.msg_namelen = destination.len();
-            messages[index].msg_hdr.msg_iov = &mut iovecs[index];
-            messages[index].msg_hdr.msg_iovlen = 1;
+            });
+            let mut header = mmsg_header(iovecs[index].as_mut_ptr());
+            header.msg_hdr.msg_name = destination.as_ptr().cast_mut().cast();
+            header.msg_hdr.msg_namelen = destination.len();
+            messages[index].write(header);
         }
+        let messages = initialized_messages(&mut messages, datagrams.len());
 
         let sent = socket.try_io(Interest::WRITABLE, || {
             loop {
                 let result = unsafe {
-                    libc::sendmmsg(
+                    send_mmsg(
                         socket.as_raw_fd(),
                         messages.as_mut_ptr(),
                         datagrams.len() as libc::c_uint,
@@ -602,6 +528,56 @@ mod platform {
         )
     }
 
+    unsafe fn recv_mmsg(
+        fd: libc::c_int,
+        messages: *mut libc::mmsghdr,
+        count: libc::c_uint,
+        flags: libc::c_int,
+        timeout: *mut libc::timespec,
+    ) -> libc::c_int {
+        #[cfg(target_os = "android")]
+        {
+            unsafe {
+                libc::syscall(
+                    libc::SYS_recvmmsg as libc::c_long,
+                    fd,
+                    messages,
+                    count,
+                    flags,
+                    timeout,
+                ) as libc::c_int
+            }
+        }
+        #[cfg(target_os = "linux")]
+        {
+            unsafe { libc::recvmmsg(fd, messages, count, flags, timeout) }
+        }
+    }
+
+    unsafe fn send_mmsg(
+        fd: libc::c_int,
+        messages: *mut libc::mmsghdr,
+        count: libc::c_uint,
+        flags: libc::c_int,
+    ) -> libc::c_int {
+        #[cfg(target_os = "android")]
+        {
+            unsafe {
+                libc::syscall(
+                    libc::SYS_sendmmsg as libc::c_long,
+                    fd,
+                    messages,
+                    count,
+                    flags,
+                ) as libc::c_int
+            }
+        }
+        #[cfg(target_os = "linux")]
+        {
+            unsafe { libc::sendmmsg(fd, messages, count, flags) }
+        }
+    }
+
     fn socket_addr_from_storage(
         mut storage: SockAddrStorage,
         length: libc::socklen_t,
@@ -616,9 +592,6 @@ mod platform {
             ));
         }
 
-        // `SockAddr::new` requires a family-compatible initialized storage.
-        // Read only the initialized family field first, validate the complete
-        // structure size for that family, and construct SockAddr only then.
         let family = unsafe { storage.view_as::<libc::sockaddr>() }.sa_family as libc::c_int;
         let minimum_length = match family {
             libc::AF_INET => std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
@@ -646,26 +619,38 @@ mod platform {
         })
     }
 
-    fn empty_iovecs() -> [libc::iovec; MAX_DATAGRAMS] {
-        std::array::from_fn(|_| libc::iovec {
-            iov_base: ptr::null_mut(),
-            iov_len: 0,
-        })
+    fn uninit_iovecs() -> [MaybeUninit<libc::iovec>; MAX_DATAGRAMS] {
+        [const { MaybeUninit::uninit() }; MAX_DATAGRAMS]
     }
 
-    fn empty_messages() -> [libc::mmsghdr; MAX_DATAGRAMS] {
-        std::array::from_fn(|_| libc::mmsghdr {
+    fn uninit_messages() -> [MaybeUninit<libc::mmsghdr>; MAX_DATAGRAMS] {
+        [const { MaybeUninit::uninit() }; MAX_DATAGRAMS]
+    }
+
+    fn uninit_sources() -> [MaybeUninit<SockAddrStorage>; MAX_DATAGRAMS] {
+        [const { MaybeUninit::zeroed() }; MAX_DATAGRAMS]
+    }
+
+    fn initialized_messages(
+        messages: &mut [MaybeUninit<libc::mmsghdr>; MAX_DATAGRAMS],
+        count: usize,
+    ) -> &mut [libc::mmsghdr] {
+        unsafe { std::slice::from_raw_parts_mut(messages.as_mut_ptr().cast(), count) }
+    }
+
+    fn mmsg_header(iovec: *mut libc::iovec) -> libc::mmsghdr {
+        libc::mmsghdr {
             msg_hdr: libc::msghdr {
                 msg_name: ptr::null_mut(),
                 msg_namelen: 0,
-                msg_iov: ptr::null_mut(),
-                msg_iovlen: 0,
+                msg_iov: iovec,
+                msg_iovlen: 1,
                 msg_control: ptr::null_mut(),
                 msg_controllen: 0,
                 msg_flags: 0,
             },
             msg_len: 0,
-        })
+        }
     }
 }
 
@@ -869,6 +854,41 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn maximum_unconnected_mmsg_batch_preserves_every_datagram_and_source() {
+        let (sender, receiver) = unconnected_pair().await.unwrap();
+        let destination = receiver.local_addr().unwrap();
+        let source = sender.local_addr().unwrap();
+        let payloads: Vec<Vec<u8>> = (0..MAX_DATAGRAMS)
+            .map(|index| vec![index as u8; 192])
+            .collect();
+        let datagrams: Vec<&[u8]> = payloads.iter().map(Vec::as_slice).collect();
+
+        send_to(&sender, destination, &datagrams).await.unwrap();
+
+        let pool = PacketPool::new(MAX_DATAGRAMS);
+        let mut packets: Vec<_> = (0..MAX_DATAGRAMS).map(|_| pool.acquire()).collect();
+        let mut sources = vec![std::net::SocketAddr::from(([0, 0, 0, 0], 0)); MAX_DATAGRAMS];
+        let mut total_received = 0usize;
+        while total_received < MAX_DATAGRAMS {
+            let received = recv_from(
+                &receiver,
+                &mut packets[total_received..],
+                &mut sources[total_received..],
+            )
+            .await
+            .unwrap();
+            assert!(received > 0);
+            total_received += received;
+        }
+
+        assert_eq!(total_received, MAX_DATAGRAMS);
+        for index in 0..MAX_DATAGRAMS {
+            assert_eq!(packets[index].as_slice(), datagrams[index]);
+            assert_eq!(sources[index], source);
+        }
+    }
+
     #[test]
     fn rejects_batches_larger_than_the_fixed_limit() {
         let oversized = vec![b"packet".as_slice(); MAX_DATAGRAMS + 1];
@@ -891,4 +911,60 @@ mod tests {
         let error = validate_receive_batch(2, 1).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::InvalidInput);
     }
+
+    macro_rules! adaptive_limit_case {
+        ($name:ident, $current:expr, $received:expr, $expected:expr) => {
+            #[test]
+            fn $name() {
+                assert_eq!(adapt_batch_limit($current, $received), $expected);
+            }
+        };
+    }
+
+    adaptive_limit_case!(adaptive_limit_promotes_minimum_batch, 16, 16, 32);
+    adaptive_limit_case!(adaptive_limit_promotes_32_to_64, 32, 32, 64);
+    adaptive_limit_case!(adaptive_limit_promotes_64_to_maximum, 64, 64, MAX_DATAGRAMS);
+    adaptive_limit_case!(
+        adaptive_limit_keeps_full_maximum_batch,
+        MAX_DATAGRAMS,
+        MAX_DATAGRAMS,
+        MAX_DATAGRAMS
+    );
+    adaptive_limit_case!(
+        adaptive_limit_reduces_maximum_on_quarter_fill,
+        MAX_DATAGRAMS,
+        MAX_DATAGRAMS / 4,
+        64
+    );
+    adaptive_limit_case!(adaptive_limit_reduces_64_on_quarter_fill, 64, 16, 32);
+    adaptive_limit_case!(adaptive_limit_reduces_32_on_quarter_fill, 32, 8, 16);
+    adaptive_limit_case!(adaptive_limit_keeps_minimum_when_socket_is_empty, 16, 0, 16);
+
+    macro_rules! accepted_batch_length_case {
+        ($name:ident, $length:expr) => {
+            #[test]
+            fn $name() {
+                assert!(validate_batch_len($length).is_ok());
+            }
+        };
+    }
+
+    accepted_batch_length_case!(batch_length_accepts_empty_control_batch, 0);
+    accepted_batch_length_case!(batch_length_accepts_single_datagram, 1);
+    accepted_batch_length_case!(batch_length_accepts_minimum_batch, MIN_DATAGRAMS);
+    accepted_batch_length_case!(batch_length_accepts_maximum_batch, MAX_DATAGRAMS);
+
+    macro_rules! matching_receive_slots_case {
+        ($name:ident, $length:expr) => {
+            #[test]
+            fn $name() {
+                assert!(validate_receive_batch($length, $length).is_ok());
+            }
+        };
+    }
+
+    matching_receive_slots_case!(receive_slots_accept_empty_batch, 0);
+    matching_receive_slots_case!(receive_slots_accept_single_datagram, 1);
+    matching_receive_slots_case!(receive_slots_accept_minimum_batch, MIN_DATAGRAMS);
+    matching_receive_slots_case!(receive_slots_accept_maximum_batch, MAX_DATAGRAMS);
 }

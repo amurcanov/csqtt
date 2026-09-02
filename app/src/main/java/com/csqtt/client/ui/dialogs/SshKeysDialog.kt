@@ -42,6 +42,7 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
@@ -53,6 +54,8 @@ private const val PRIVATE_KEY_PLACEHOLDER =
 
 private const val CERTIFICATE_PLACEHOLDER =
     "ssh-ed25519-cert-v01@openssh.com AAAAIHNzaC1lZDI1NTE5...\nuser-cert"
+
+private val SshKeyFieldShape = RoundedCornerShape(8.dp)
 
 private val PRIVATE_KEY_HEADERS = listOf(
     "BEGIN OPENSSH PRIVATE KEY",
@@ -164,7 +167,7 @@ internal fun SshKeysDialog(
                     },
                     isError = privateKeyError != null,
                     modifier = Modifier.fillMaxWidth().heightIn(min = 140.dp),
-                    shape = CsqttShapes.Control,
+                    shape = SshKeyFieldShape,
                     textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
                     keyboardOptions = KeyboardOptions(imeAction = ImeAction.Default),
                 )
@@ -176,7 +179,7 @@ internal fun SshKeysDialog(
                     placeholder = { Text("если приватный ключ зашифрован", maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis) },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth(),
-                    shape = CsqttShapes.Control,
+                    shape = SshKeyFieldShape,
                     visualTransformation = if (passphraseVisible) VisualTransformation.None else PasswordVisualTransformation(),
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
                     trailingIcon = {
@@ -202,7 +205,7 @@ internal fun SshKeysDialog(
                     } else null,
                     isError = certificateError != null,
                     modifier = Modifier.fillMaxWidth().heightIn(min = 90.dp),
-                    shape = CsqttShapes.Control,
+                    shape = SshKeyFieldShape,
                     textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
                     keyboardOptions = KeyboardOptions(imeAction = ImeAction.Default),
                 )

@@ -3,7 +3,7 @@
 
 [package]
 name = "csqtt-client"
-version = "2.0.5"
+version = "2.1.9"
 edition = "2024"
 rust-version = "1.97.1"
 license = "PolyForm-Noncommercial-1.0.0"

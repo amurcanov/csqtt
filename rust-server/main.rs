@@ -25,6 +25,8 @@ pub(crate) fn collect_allocator_thread_heap() -> bool {
 
 mod dataplane;
 mod downlink_queue;
+#[path = "../shared/flow_frame.rs"]
+mod flow_frame;
 mod memory_metrics;
 mod model;
 mod net_setup;
@@ -42,6 +44,8 @@ mod tun_device;
 #[cfg(test)]
 mod udp_supervisor;
 mod web_panel;
+#[path = "../shared/wire_protocol.rs"]
+mod wire_protocol;
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
@@ -69,6 +73,9 @@ use tokio::{
 #[derive(Parser, Debug)]
 #[command(name = "csqtt", version, about = "Сервер и консоль управления CSQTT")]
 struct Args {
+    #[arg(long, hide = true)]
+    protocol_revision: bool,
+
     #[arg(long, default_value = "0.0.0.0:46000", help = "UDP-адрес сервера")]
     listen: SocketAddr,
 
@@ -170,8 +177,6 @@ struct DeployOverrides {
     main_password: String,
     #[serde(default)]
     device_id: String,
-    #[serde(default)]
-    dns: String,
 }
 
 fn normalize_dns(value: &str) -> Result<String> {
@@ -196,7 +201,6 @@ pub struct App {
     pub db_persistence: DatabasePersistence,
     pub dns: RwLock<String>,
     pub startup_main_password: String,
-    pub startup_dns: String,
     pub config_dir: std::path::PathBuf,
     pub listen: SocketAddr,
     pub web_port: u16,
@@ -230,7 +234,8 @@ pub struct App {
     pub memory_trim_last_unix: AtomicU64,
     pub auto_restart_interval_tx: tokio::sync::watch::Sender<u8>,
     pub restart_pending: AtomicBool,
-    pub dataplane: std::sync::OnceLock<dataplane::DataplaneHandle<protocol::ProtocolCommand>>,
+    pub(crate) dataplane:
+        std::sync::OnceLock<dataplane::DataplaneHandle<protocol::ProtocolCommand>>,
 }
 
 #[inline]
@@ -1881,6 +1886,11 @@ async fn async_main() -> Result<()> {
 
     let args = Args::parse();
 
+    if args.protocol_revision {
+        println!("{}", wire_protocol::WIRE_PROTOCOL_REVISION);
+        return Ok(());
+    }
+
     if args.start {
         return run_systemctl("start");
     }
@@ -1938,7 +1948,8 @@ async fn async_main() -> Result<()> {
     db.web_sessions.clear();
 
     let deploy_overrides_path = args.config_dir.join("deploy-overrides.json");
-    let deploy_overrides = if deploy_overrides_path.exists() {
+    let deploy_overrides_present = deploy_overrides_path.exists();
+    let deploy_overrides = if deploy_overrides_present {
         let text = std::fs::read_to_string(&deploy_overrides_path)
             .with_context(|| format!("read {}", deploy_overrides_path.display()))?;
         serde_json::from_str::<DeployOverrides>(&text)
@@ -1962,21 +1973,16 @@ async fn async_main() -> Result<()> {
         println!("[INIT] generated main password: {}", db.main_password);
     }
 
-    let configured_dns = args
-        .dns
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned)
-        .or_else(|| {
-            let value = deploy_overrides.dns.trim();
-            (!value.is_empty()).then(|| value.to_owned())
-        });
-    let runtime_dns = match configured_dns {
-        Some(configured) => normalize_dns(&configured)?,
-        None if !db.dns.trim().is_empty() => normalize_dns(db.dns.trim())?,
-        None => "1.1.1.1".to_owned(),
-    };
+    let runtime_dns =
+        if let Some(configured) = args.dns.as_deref().filter(|value| !value.trim().is_empty()) {
+            normalize_dns(configured)?
+        } else if deploy_overrides_present {
+            web_panel::deploy_dns_profile_or_yandex(&db.dns)
+        } else if !db.dns.trim().is_empty() {
+            normalize_dns(db.dns.trim())?
+        } else {
+            "77.88.8.8,77.88.8.1".to_owned()
+        };
     db.dns = runtime_dns.clone();
     if !matches!(db.auto_restart_interval_hours(), 0 | 12 | 24 | 48 | 72) {
         db.set_auto_restart_interval_hours(DEFAULT_AUTO_RESTART_INTERVAL_HOURS);
@@ -2006,13 +2012,11 @@ async fn async_main() -> Result<()> {
     let (auto_restart_interval_tx, auto_restart_interval_rx) =
         tokio::sync::watch::channel(db.auto_restart_interval_hours());
     let startup_main_password = db.main_password.clone();
-    let startup_dns = runtime_dns.clone();
     let app = Arc::new(App {
         db_persistence: DatabasePersistence::new(args.config_dir.clone())?,
         db: RwLock::new(db),
         dns: RwLock::new(runtime_dns),
         startup_main_password,
-        startup_dns,
         config_dir: args.config_dir.clone(),
         listen: args.listen,
         web_port: args.web_port,
@@ -2049,7 +2053,7 @@ async fn async_main() -> Result<()> {
         dataplane: std::sync::OnceLock::new(),
     });
 
-    log_event(&app, "INFO", "SYSTEM", " CSQTT Server 2.1.5");
+    log_event(&app, "INFO", "SYSTEM", " CSQTT Server 2.1.9");
     log_event(
         &app,
         "INFO",

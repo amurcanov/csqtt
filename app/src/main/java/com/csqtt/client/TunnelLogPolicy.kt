@@ -9,7 +9,7 @@ object TunnelLogPolicy {
     }
 
     fun isInternalRecovery(line: String): Boolean {
-        if (line.contains("FATAL_AUTH", ignoreCase = true)) return false
+        if (line.contains("FATAL_", ignoreCase = true)) return false
         return line.contains("GETCONF", ignoreCase = true) ||
             line.contains("[СЕТЬ][RETRY]", ignoreCase = true) ||
             line.contains("PEER_LIVENESS_TIMEOUT", ignoreCase = true)

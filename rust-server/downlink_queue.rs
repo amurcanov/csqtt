@@ -1,4 +1,4 @@
-use crate::{packet::PacketBuffer, striped_scheduler::PacketClass};
+use crate::{flow_frame::FrameHeader, packet::PacketBuffer, striped_scheduler::PacketClass};
 use std::collections::VecDeque;
 
 const LATENCY_SLOTS: usize = 16;
@@ -72,6 +72,25 @@ impl PacketSlots {
         true
     }
 
+    fn enqueue_framed(&mut self, header: FrameHeader, packet: &[u8]) -> bool {
+        let Some(mut slot) = self.free.pop() else {
+            return false;
+        };
+        let total = packet.len().saturating_add(crate::flow_frame::FRAME_LEN);
+        if total > slot.capacity() || !slot.set_len(total) {
+            self.free.push(slot);
+            return false;
+        }
+        let output = slot.as_mut_slice();
+        if !header.encode(&mut output[..crate::flow_frame::FRAME_LEN]) {
+            self.free.push(slot);
+            return false;
+        }
+        output[crate::flow_frame::FRAME_LEN..].copy_from_slice(packet);
+        self.pending.push_back(slot);
+        true
+    }
+
     fn dequeue(&mut self) -> Option<PacketBuffer> {
         self.pending.pop_front()
     }
@@ -115,8 +134,8 @@ impl ClientEgressLane {
 
     fn queue_mut(&mut self, class: PacketClass) -> &mut PacketSlots {
         match class {
-            PacketClass::Latency => &mut self.latency,
-            PacketClass::Priority => &mut self.priority,
+            PacketClass::Small => &mut self.latency,
+            PacketClass::Medium => &mut self.priority,
             PacketClass::Bulk => &mut self.bulk,
         }
     }
@@ -130,8 +149,8 @@ impl ClientEgressLane {
     #[cfg(test)]
     fn queue(&self, class: PacketClass) -> &PacketSlots {
         match class {
-            PacketClass::Latency => &self.latency,
-            PacketClass::Priority => &self.priority,
+            PacketClass::Small => &self.latency,
+            PacketClass::Medium => &self.priority,
             PacketClass::Bulk => &self.bulk,
         }
     }
@@ -177,6 +196,18 @@ impl DownlinkQueue {
         self.lanes
             .get_mut(key)
             .is_some_and(|lane| lane.active_paths != 0 && lane.queue_mut(class).enqueue(packet))
+    }
+
+    pub fn enqueue_framed(
+        &mut self,
+        key: usize,
+        class: PacketClass,
+        header: FrameHeader,
+        packet: &[u8],
+    ) -> bool {
+        self.lanes.get_mut(key).is_some_and(|lane| {
+            lane.active_paths != 0 && lane.queue_mut(class).enqueue_framed(header, packet)
+        })
     }
 
     pub fn dequeue(&mut self, class: PacketClass) -> Option<(usize, PacketBuffer)> {
@@ -229,16 +260,16 @@ impl DownlinkQueue {
 
     fn ring_len(&self, class: PacketClass) -> usize {
         match class {
-            PacketClass::Latency => self.latency_ring.len(),
-            PacketClass::Priority => self.priority_ring.len(),
+            PacketClass::Small => self.latency_ring.len(),
+            PacketClass::Medium => self.priority_ring.len(),
             PacketClass::Bulk => self.bulk_ring.len(),
         }
     }
 
     fn next_key(&mut self, class: PacketClass) -> Option<usize> {
         let (ring, cursor) = match class {
-            PacketClass::Latency => (&self.latency_ring, &mut self.latency_cursor),
-            PacketClass::Priority => (&self.priority_ring, &mut self.priority_cursor),
+            PacketClass::Small => (&self.latency_ring, &mut self.latency_cursor),
+            PacketClass::Medium => (&self.priority_ring, &mut self.priority_cursor),
             PacketClass::Bulk => (&self.bulk_ring, &mut self.bulk_cursor),
         };
         let key = *ring.get(*cursor)?;
@@ -349,5 +380,23 @@ mod tests {
         assert!(!queue.enqueue(5, PacketClass::Bulk, &packet(3)));
         queue.configure(5, 18);
         assert!(queue.enqueue(5, PacketClass::Bulk, &packet(4)));
+    }
+
+    #[test]
+    fn framed_packet_preserves_the_header_and_inner_payload() {
+        let mut queue = DownlinkQueue::default();
+        queue.configure(7, 9);
+        let header = FrameHeader {
+            sender_id: 1,
+            flow_id: 2,
+            sequence: 3,
+        };
+        assert!(queue.enqueue_framed(7, PacketClass::Bulk, header, &packet(8)));
+        let (key, queued) = queue.dequeue(PacketClass::Bulk).unwrap();
+        let (decoded, payload) = FrameHeader::decode(queued.as_slice()).unwrap();
+        assert_eq!(key, 7);
+        assert_eq!(decoded, header);
+        assert_eq!(payload, packet(8));
+        queue.recycle(key, PacketClass::Bulk, queued);
     }
 }

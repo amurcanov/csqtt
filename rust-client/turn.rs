@@ -441,9 +441,8 @@ impl TurnAllocation {
                 }
             }
             TurnOutbound::Stream(writer) => {
-                let _ = client_perf::measure_sampled(PerfStage::TurnTx, 64, || {
-                    writer.try_write_data(packet)
-                })?;
+                client_perf::measure_wall_sampled(PerfStage::TurnTx, 64, writer.write_data(packet))
+                    .await?;
             }
         }
         Ok(())
@@ -495,9 +494,12 @@ impl TurnAllocation {
             }
             TurnOutbound::Stream(writer) => {
                 for packet in packets.drain(..) {
-                    let _ = client_perf::measure_sampled(PerfStage::TurnTx, 64, || {
-                        writer.try_write_data(packet)
-                    })?;
+                    client_perf::measure_wall_sampled(
+                        PerfStage::TurnTx,
+                        64,
+                        writer.write_data(packet),
+                    )
+                    .await?;
                 }
             }
         }

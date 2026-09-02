@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     io::Read,
-    net::SocketAddr,
+    net::{Ipv4Addr, SocketAddr},
     sync::{Arc, LazyLock, Mutex, atomic::Ordering},
     time::{Duration, Instant},
 };
@@ -52,11 +52,135 @@ struct SettingsRequest {
     #[serde(default)]
     main_password: Option<String>,
     #[serde(default)]
+    dns_provider: Option<String>,
+    #[serde(default)]
     dns_primary: Option<String>,
     #[serde(default)]
     dns_secondary: Option<String>,
     #[serde(default)]
     auto_restart_interval_hours: Option<u8>,
+}
+
+#[derive(Clone, Copy)]
+struct DnsProvider {
+    id: &'static str,
+    primary: &'static str,
+    secondary: &'static str,
+}
+
+const DNS_PROVIDERS: [DnsProvider; 13] = [
+    DnsProvider {
+        id: "yandex",
+        primary: "77.88.8.8",
+        secondary: "77.88.8.1",
+    },
+    DnsProvider {
+        id: "cloudflare",
+        primary: "1.1.1.1",
+        secondary: "1.0.0.1",
+    },
+    DnsProvider {
+        id: "google",
+        primary: "8.8.8.8",
+        secondary: "8.8.4.4",
+    },
+    DnsProvider {
+        id: "adguard",
+        primary: "94.140.14.14",
+        secondary: "94.140.15.14",
+    },
+    DnsProvider {
+        id: "xbox",
+        primary: "111.88.96.50",
+        secondary: "111.88.96.51",
+    },
+    DnsProvider {
+        id: "comms",
+        primary: "83.220.169.155",
+        secondary: "212.109.195.93",
+    },
+    DnsProvider {
+        id: "geohide",
+        primary: "95.182.120.241",
+        secondary: "37.230.192.51",
+    },
+    DnsProvider {
+        id: "quad9",
+        primary: "9.9.9.9",
+        secondary: "149.112.112.112",
+    },
+    DnsProvider {
+        id: "opendns",
+        primary: "208.67.222.222",
+        secondary: "208.67.220.220",
+    },
+    DnsProvider {
+        id: "rostelecom",
+        primary: "95.189.32.74",
+        secondary: "195.208.5.1",
+    },
+    DnsProvider {
+        id: "nextdns",
+        primary: "45.90.28.181",
+        secondary: "45.90.30.181",
+    },
+    DnsProvider {
+        id: "bizone",
+        primary: "195.208.6.1",
+        secondary: "195.208.7.1",
+    },
+    DnsProvider {
+        id: "nsdi",
+        primary: "195.208.4.1",
+        secondary: "195.208.5.1",
+    },
+];
+
+fn dns_provider_by_id(id: &str) -> Option<DnsProvider> {
+    DNS_PROVIDERS
+        .iter()
+        .copied()
+        .find(|provider| provider.id == id)
+}
+
+fn dns_provider_id(dns: &str) -> Option<&'static str> {
+    DNS_PROVIDERS
+        .iter()
+        .find(|provider| dns == format!("{},{}", provider.primary, provider.secondary))
+        .map(|provider| provider.id)
+}
+
+fn provider_dns(provider: DnsProvider) -> String {
+    format!("{},{}", provider.primary, provider.secondary)
+}
+
+pub(crate) fn deploy_dns_profile_or_yandex(existing_dns: &str) -> String {
+    let addresses: Vec<_> = existing_dns
+        .split(',')
+        .map(str::trim)
+        .filter(|address| !address.is_empty())
+        .collect();
+    let first = addresses.first().copied();
+    let selected = DNS_PROVIDERS
+        .iter()
+        .filter_map(|provider| {
+            let matches = addresses
+                .iter()
+                .filter(|address| **address == provider.primary || **address == provider.secondary)
+                .count();
+            (matches > 0).then_some((
+                provider,
+                (
+                    matches,
+                    usize::from(first == Some(provider.primary)),
+                    usize::from(first == Some(provider.secondary)),
+                ),
+            ))
+        })
+        .max_by_key(|(_, score)| *score)
+        .map(|(provider, _)| *provider)
+        .unwrap_or(DNS_PROVIDERS[0]);
+    provider_dns(selected)
 }
 
 const WEB_BODY_LIMIT_BYTES: usize = 16 * 1024;
@@ -613,6 +737,7 @@ fn format_total_memory_kib(kib: u64) -> String {
 
 async fn stats(State(state): State<WebState>, _headers: HeaderMap) -> impl IntoResponse {
     let (process_memory, process_rollup, total_ram) = cached_system_stats();
+    let io = *read_unpoison(&protocol::GLOBAL_IO_COUNTERS);
 
     let cpu_total = state.app.cpu_percent.load(Ordering::Relaxed);
     let cpu_cores = state.app.cpu_cores.load(Ordering::Relaxed).max(1);
@@ -692,6 +817,12 @@ async fn stats(State(state): State<WebState>, _headers: HeaderMap) -> impl IntoR
         "total": state.app.total_connections.load(Ordering::Relaxed),
         "up": state.app.bytes_from_client.load(Ordering::Relaxed),
         "down": state.app.bytes_to_client.load(Ordering::Relaxed),
+        "udp_rx_packets": io.udp_rx_packets,
+        "udp_rx_bytes": io.udp_rx_bytes,
+        "udp_rx_errors": io.udp_rx_errors,
+        "udp_tx_packets": io.udp_tx_packets,
+        "udp_tx_bytes": io.udp_tx_bytes,
+        "udp_tx_errors": io.udp_tx_errors,
         "passwords": db.passwords.len(),
         "devices": db.devices.len(),
         "transport": "RTP/ChaCha20-Poly1305",
@@ -761,15 +892,16 @@ async fn settings_get(State(state): State<WebState>) -> impl IntoResponse {
     let db = state.app.db.read().await;
     let dns = db.dns.clone();
     let mut parts = dns.splitn(2, ',');
-    let primary = parts.next().unwrap_or("1.1.1.1").trim().to_owned();
-    let secondary = parts.next().unwrap_or("1.0.0.1").trim().to_owned();
+    let primary = parts.next().unwrap_or("77.88.8.8").trim().to_owned();
+    let secondary = parts.next().unwrap_or("77.88.8.1").trim().to_owned();
+    let provider = dns_provider_id(&dns).unwrap_or("custom");
     Json(serde_json::json!({
         "main_password": db.main_password,
+        "dns_provider": provider,
         "dns_primary": primary,
         "dns_secondary": secondary,
         "auto_restart_interval_hours": db.auto_restart_interval_hours(),
         "restart_required": db.main_password != state.app.startup_main_password
-            || db.dns != state.app.startup_dns
     }))
 }
 
@@ -787,28 +919,35 @@ async fn settings_post(
         )
             .into_response();
     }
-    let dns = match (&request.dns_primary, &request.dns_secondary) {
-        (None, None) => None,
-        (Some(primary), secondary) => {
-            let primary = primary.trim();
-            let secondary = secondary.as_deref().unwrap_or_default().trim();
-            if primary.is_empty() {
+    let dns = if let Some(provider_id) = request.dns_provider.as_deref() {
+        let Some(provider) = dns_provider_by_id(provider_id) else {
+            return (StatusCode::BAD_REQUEST, "unknown DNS provider").into_response();
+        };
+        Some(provider_dns(provider))
+    } else {
+        match (&request.dns_primary, &request.dns_secondary) {
+            (None, None) => None,
+            (Some(primary), secondary) => {
+                let primary = primary.trim();
+                let secondary = secondary.as_deref().unwrap_or_default().trim();
+                if primary.is_empty() {
+                    return (StatusCode::BAD_REQUEST, "primary DNS is required").into_response();
+                }
+                if primary.parse::<Ipv4Addr>().is_err()
+                    || (!secondary.is_empty() && secondary.parse::<Ipv4Addr>().is_err())
+                {
+                    return (StatusCode::BAD_REQUEST, "DNS must be a valid IPv4 address")
+                        .into_response();
+                }
+                Some(if secondary.is_empty() {
+                    primary.to_owned()
+                } else {
+                    format!("{primary},{secondary}")
+                })
+            }
+            (None, Some(_)) => {
                 return (StatusCode::BAD_REQUEST, "primary DNS is required").into_response();
             }
-            if primary.parse::<std::net::Ipv4Addr>().is_err()
-                || (!secondary.is_empty() && secondary.parse::<std::net::Ipv4Addr>().is_err())
-            {
-                return (StatusCode::BAD_REQUEST, "DNS must be a valid IPv4 address")
-                    .into_response();
-            }
-            Some(if secondary.is_empty() {
-                primary.to_owned()
-            } else {
-                format!("{primary},{secondary}")
-            })
-        }
-        (None, Some(_)) => {
-            return (StatusCode::BAD_REQUEST, "primary DNS is required").into_response();
         }
     };
     if let Some(hours) = request.auto_restart_interval_hours
@@ -821,8 +960,7 @@ async fn settings_post(
             .into_response();
     }
     let requested_auto_restart_interval = request.auto_restart_interval_hours;
-    let credentials_changed = request.main_password.is_some() || dns.is_some();
-    let (revision, retired_main_password) = {
+    let (revision, retired_main_password, applied_dns) = {
         let mut db = state.app.db.write().await;
         let retired_main_password = if let Some(password) = request.main_password {
             (db.main_password != password)
@@ -830,8 +968,9 @@ async fn settings_post(
         } else {
             None
         };
-        if let Some(dns) = dns {
-            db.dns = dns;
+        let applied_dns = dns.filter(|dns| db.dns != *dns);
+        if let Some(dns) = applied_dns.as_ref() {
+            db.dns.clone_from(dns);
         }
         if let Some(hours) = requested_auto_restart_interval {
             db.set_auto_restart_interval_hours(hours);
@@ -839,6 +978,7 @@ async fn settings_post(
         (
             state.app.db_persistence.submit(db.clone()),
             retired_main_password,
+            applied_dns,
         )
     };
     match state.app.db_persistence.wait(revision).await {
@@ -855,18 +995,35 @@ async fn settings_post(
     if let Some(hours) = requested_auto_restart_interval {
         state.app.auto_restart_interval_tx.send_replace(hours);
     }
+    let main_password_changed = retired_main_password.is_some();
     if let Some(password) = retired_main_password
         && !password.is_empty()
     {
         state.app.derived_keys.remove(&password);
     }
-    if credentials_changed && let Err(message) = refresh_credentials_report(&state).await {
+    if main_password_changed && let Err(message) = refresh_credentials_report(&state).await {
         let warning = format!("saved but reload failed: {message}");
         return (StatusCode::OK, [("x-csqtt-reload-error", warning)], "saved").into_response();
     }
+    if let Some(dns) = applied_dns {
+        *state.app.dns.write().await = dns;
+        match crate::protocol::broadcast_tunnel_configuration(&state.app).await {
+            Ok(sent) => log_event(
+                &state.app,
+                "INFO",
+                "DNS",
+                &format!("DNS configuration applied to {sent} active paths"),
+            ),
+            Err(error) => {
+                let warning = format!("saved but DNS apply failed: {error:#}");
+                return (StatusCode::OK, [("x-csqtt-reload-error", warning)], "saved")
+                    .into_response();
+            }
+        }
+    }
     let restart_required = {
         let db = state.app.db.read().await;
-        db.main_password != state.app.startup_main_password || db.dns != state.app.startup_dns
+        db.main_password != state.app.startup_main_password
     };
     Json(serde_json::json!({ "restart_required": restart_required })).into_response()
 }
@@ -985,7 +1142,6 @@ async fn clients_create(
     let result = {
         let mut db = state.app.db.write().await;
         db.passwords.retain(|_, entry| !is_expired(entry));
-        db.prune_dangling_device_bindings();
         if db.passwords.len() >= MAX_PASSWORDS {
             return (StatusCode::BAD_REQUEST, "limit reached").into_response();
         }
@@ -1116,11 +1272,9 @@ async fn client_unbind(State(state): State<WebState>, Path(password): Path<Strin
         let mut db = state.app.db.write().await;
         if password == db.main_password {
             db.main_device_id.clear();
-            db.clear_device_binding(&password);
             state.app.db_persistence.submit(db.clone())
         } else if let Some(entry) = db.passwords.get_mut(&password) {
             entry.device_id.clear();
-            db.clear_device_binding(&password);
             state.app.db_persistence.submit(db.clone())
         } else {
             return StatusCode::NOT_FOUND.into_response();
@@ -1141,7 +1295,6 @@ async fn client_delete(State(state): State<WebState>, Path(password): Path<Strin
         if db.passwords.remove(&password).is_none() {
             return StatusCode::NOT_FOUND.into_response();
         };
-        db.clear_device_binding(&password);
         state.app.derived_keys.remove(&password);
         state.app.db_persistence.submit(db.clone())
     };
@@ -1873,7 +2026,7 @@ static PWA_ICON_512_PNG: LazyLock<Vec<u8>> = LazyLock::new(|| {
         .unwrap_or_default()
 });
 
-const PWA_SERVICE_WORKER: &str = r##"const CACHE_NAME = 'csqtt-panel-shell-2.1.5-pwa2';
+const PWA_SERVICE_WORKER: &str = r##"const CACHE_NAME = 'csqtt-panel-shell-2.1.9-pwa2';
 const SHELL_ASSETS = ['/manifest.webmanifest', '/pwa-icon.svg', '/pwa-icon-192.png', '/pwa-icon-512.png'];
 const OFFLINE_PAGE = '<!doctype html><html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>CSQTT</title><style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#0a0a0c;color:#f4f4f5;font:16px system-ui,-apple-system,Segoe UI,Roboto,sans-serif}main{max-width:320px;padding:28px;text-align:center}h1{margin:0 0 12px;color:#55adff;font-size:28px}p{margin:0;color:#a1a1aa;line-height:1.5}</style><main><h1>CSQTT</h1><p>Нет соединения с сервером. Проверьте сеть и откройте панель снова.</p></main></html>';
 
@@ -2124,6 +2277,7 @@ const PANEL_HTML: &str = r##"
         .stat-value { font-size: 28px; font-weight: 700; color: var(--text-main); line-height: 1.1; }
         #ram_val { white-space: nowrap; max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
         #ram_detail { white-space: nowrap; max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
+        #traffic_ingress { white-space: nowrap; max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
         .stat-sub { font-size: 13px; color: var(--text-muted); margin-top: 4px; }
         .progress-bar { width: 100%; height: 6px; background: var(--surface-hover); border-radius: 3px; margin-top: 8px; overflow: hidden; }
         .progress-fill { height: 100%; background: var(--primary); border-radius: 3px; transition: width 0.5s ease-out; }
@@ -2670,9 +2824,9 @@ const PANEL_HTML: &str = r##"
                 <button class="btn btn-ghost btn-icon" onclick="toggleTheme()" title="Сменить тему">
                     <svg id="themeIcon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>
                 </button>
-                <svg class="version-logo" viewBox="0 0 516 64" role="img" aria-label="v2.1.5 by amurcanov" fill="none" stroke="url(#versionLogoGradient)" stroke-width="6" stroke-linecap="round" stroke-linejoin="round">
+                <svg class="version-logo" viewBox="0 0 516 64" role="img" aria-label="v2.1.9 by amurcanov" fill="none" stroke="url(#versionLogoGradient)" stroke-width="6" stroke-linecap="round" stroke-linejoin="round">
                     <defs><linearGradient id="versionLogoGradient" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="516" y2="64"><stop offset="0" stop-color="#45B7FF"></stop><stop offset="0.45" stop-color="#2087FF"></stop><stop offset="1" stop-color="#075BFF"></stop></linearGradient></defs>
-                    <path d="M8,24 L18,48 L28,24 M34,20 Q38,14 46,14 H50 Q58,14 58,22 Q58,28 52,33 L36,48 H58 M67,47 L67.8,47 M86,14 V48 M107,47 L107.8,47 M142,14 H121 V30 Q126,24 133,24 Q142,24 142,36 Q142,48 132,48 Q125,48 121,42 M158,12 V48 M158,31 Q163,24 170,24 Q180,24 180,36 Q180,48 170,48 Q163,48 158,41 M190,24 L200,47 M210,24 L200,47 L196,57 Q194,60 189,58 M250,30 Q246,24 239,24 Q228,24 228,36 Q228,48 239,48 Q246,48 250,42 M250,24 V48 M260,48 V24 M260,31 Q264,24 270,24 Q277,24 277,32 V48 M277,31 Q281,24 287,24 Q294,24 294,32 V48 M304,24 V39 Q304,48 314,48 Q324,48 324,39 V24 M334,48 V24 M334,32 Q338,24 348,24 M382,29 Q378,24 370,24 Q360,24 360,36 Q360,48 370,48 Q378,48 382,43 M414,30 Q410,24 403,24 Q392,24 392,36 Q392,48 403,48 Q410,48 414,42 M414,24 V48 M424,48 V24 M424,32 Q429,24 436,24 Q446,24 446,35 V48 M467,24 Q456,24 456,36 Q456,48 467,48 Q478,48 478,36 Q478,24 467,24 Z M488,24 L498,48 L508,24"></path>
+                    <path d="M8,24 L18,48 L28,24 M34,20 Q38,14 46,14 H50 Q58,14 58,22 Q58,28 52,33 L36,48 H58 M67,47 L67.8,47 M86,14 V48 M107,47 L107.8,47 M142,26 Q142,14 132,14 Q121,14 121,26 Q121,36 132,36 Q142,36 142,26 V38 Q142,48 132,48 Q126,48 121,44 M158,12 V48 M158,31 Q163,24 170,24 Q180,24 180,36 Q180,48 170,48 Q163,48 158,41 M190,24 L200,47 M210,24 L200,47 L196,57 Q194,60 189,58 M250,30 Q246,24 239,24 Q228,24 228,36 Q228,48 239,48 Q246,48 250,42 M250,24 V48 M260,48 V24 M260,31 Q264,24 270,24 Q277,24 277,32 V48 M277,31 Q281,24 287,24 Q294,24 294,32 V48 M304,24 V39 Q304,48 314,48 Q324,48 324,39 V24 M334,48 V24 M334,32 Q338,24 348,24 M382,29 Q378,24 370,24 Q360,24 360,36 Q360,48 370,48 Q378,48 382,43 M414,30 Q410,24 403,24 Q392,24 392,36 Q392,48 403,48 Q410,48 414,42 M414,24 V48 M424,48 V24 M424,32 Q429,24 436,24 Q446,24 446,35 V48 M467,24 Q456,24 456,36 Q456,48 467,48 Q478,48 478,36 Q478,24 467,24 Z M488,24 L498,48 L508,24"></path>
                 </svg>
             </div>
         </div>
@@ -2757,6 +2911,7 @@ const PANEL_HTML: &str = r##"
                     <div style="display: flex; flex-direction: column; gap: 4px;">
                         <div class="stat-value" style="font-size: 20px; color: var(--primary);" id="traffic_up">↑ 0 B</div>
                         <div class="stat-value" style="font-size: 20px; color: var(--primary);" id="traffic_down">↓ 0 B</div>
+                        <div class="stat-sub" id="traffic_ingress">RX 0 · TX 0</div>
                     </div>
                 </div>
             </section>
@@ -2807,11 +2962,26 @@ const PANEL_HTML: &str = r##"
                         <button id="saveMainPasswordBtn" class="btn btn-primary" style="width: 100%; margin-top: 8px;" onclick="saveMainPassword()" disabled>Сохранить главный пароль</button>
                     </div>
                     <div class="glass-panel setting-card" style="display: flex; flex-direction: column; justify-content: space-between;">
-                        <div style="display: flex; gap: 12px; margin-top: 4px;">
-                            <div class="input-group" style="flex: 1; margin-bottom: 0;"><label for="dns_primary">Основной DNS</label><input id="dns_primary" placeholder="1.1.1.1"></div>
-                            <div class="input-group" style="flex: 1; margin-bottom: 0;"><label for="dns_secondary">Резервный DNS</label><input id="dns_secondary" placeholder="1.0.0.1"></div>
+                        <div class="input-group" style="margin-bottom: 0;">
+                            <label for="dns_provider">DNS Адреса</label>
+                            <select id="dns_provider">
+                                <option value="yandex" selected>Yandex DNS</option>
+                                <option value="cloudflare">Cloudflare DNS</option>
+                                <option value="google">Google DNS</option>
+                                <option value="adguard">AdGuard DNS</option>
+                                <option value="xbox">Xbox DNS</option>
+                                <option value="comms">Comms DNS</option>
+                                <option value="geohide">Geohide DNS</option>
+                                <option value="quad9">Quad9 DNS</option>
+                                <option value="opendns">OpenDNS</option>
+                                <option value="rostelecom">Rostelecom DNS</option>
+                                <option value="nextdns">NextDNS</option>
+                                <option value="bizone">BI.ZONE DNS</option>
+                                <option value="nsdi">НСДИ DNS</option>
+                                <option value="custom" hidden>Пользовательские DNS</option>
+                            </select>
                         </div>
-                        <button id="saveDnsBtn" class="btn btn-primary" style="width: 100%; margin-top: 22px;" onclick="saveDnsSettings()" disabled>Сохранить DNS</button>
+                        <button id="saveDnsBtn" class="btn btn-primary" style="width: 100%; margin-top: 22px;" onclick="saveDnsSettings()" disabled>Применить DNS</button>
                     </div>
                     <div class="glass-panel setting-card" style="display: flex; flex-direction: column; justify-content: space-between;">
                         <div class="input-group" style="margin-bottom: 0;">
@@ -3167,6 +3337,24 @@ const PANEL_HTML: &str = r##"
             return (n / 1073741824).toFixed(2) + " GB";
         };
 
+        const compactCounter = input => {
+            const count = Number(input);
+            if (!Number.isFinite(count) || count <= 0) return "0";
+            const units = ["", "K", "M", "G", "T", "P", "E"];
+            let value = count;
+            let unit = 0;
+            while (value >= 1000 && unit < units.length - 1) {
+                value /= 1000;
+                unit += 1;
+            }
+            if (value >= 999.5 && unit < units.length - 1) {
+                value /= 1000;
+                unit += 1;
+            }
+            const digits = value >= 100 ? 0 : value >= 10 ? 1 : 2;
+            return value.toFixed(digits).replace(/\.0+$/, "") + units[unit];
+        };
+
         const uptime = s => {
             const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60);
             return d > 0 ? d + "д " + h + "ч" : h > 0 ? h + "ч " + m + "м" : m + "м";
@@ -3253,6 +3441,7 @@ const PANEL_HTML: &str = r##"
             ].join('\n');
             document.getElementById('traffic_up').textContent = "↑ " + size(x.up);
             document.getElementById('traffic_down').textContent = "↓ " + size(x.down);
+            document.getElementById('traffic_ingress').textContent = `RX ${compactCounter(x.udp_rx_packets)} · TX ${compactCounter(x.udp_tx_packets)}`;
 
             updateLocalProxyRuntime(
                 Boolean(x.local_proxy_enabled),
@@ -3265,8 +3454,7 @@ const PANEL_HTML: &str = r##"
         }
 
         let savedMainPassword = '';
-        let savedDnsPrimary = '';
-        let savedDnsSecondary = '';
+        let savedDnsProvider = 'yandex';
         let savedAutoRestartInterval = 0;
 
         function setRestartRequired(required) {
@@ -3275,8 +3463,7 @@ const PANEL_HTML: &str = r##"
 
         function updateSettingsDirtyState() {
             const mainPassword = document.getElementById('mainpass')?.value ?? '';
-            const dnsPrimary = document.getElementById('dns_primary')?.value.trim() ?? '';
-            const dnsSecondary = document.getElementById('dns_secondary')?.value.trim() ?? '';
+            const dnsProvider = document.getElementById('dns_provider')?.value ?? '';
             const autoRestartInterval = Number(document.getElementById('auto_restart_interval')?.value ?? 0);
             const mainButton = document.getElementById('saveMainPasswordBtn');
             const dnsButton = document.getElementById('saveDnsBtn');
@@ -3285,7 +3472,7 @@ const PANEL_HTML: &str = r##"
                 mainButton.disabled = mainPassword === savedMainPassword;
             }
             if (dnsButton && !dnsButton.classList.contains('saving')) {
-                dnsButton.disabled = dnsPrimary === savedDnsPrimary && dnsSecondary === savedDnsSecondary;
+                dnsButton.disabled = dnsProvider === savedDnsProvider || dnsProvider === 'custom';
             }
             if (autoRestartButton && !autoRestartButton.classList.contains('saving')) {
                 autoRestartButton.disabled = autoRestartInterval === savedAutoRestartInterval;
@@ -3295,14 +3482,12 @@ const PANEL_HTML: &str = r##"
         async function loadSettings() {
             let r = await api("/api/settings"); if(!r.ok) return; let x = await r.json();
             savedMainPassword = x.main_password || '';
-            savedDnsPrimary = x.dns_primary || '';
-            savedDnsSecondary = x.dns_secondary || '';
+            savedDnsProvider = x.dns_provider || 'custom';
             savedAutoRestartInterval = [0, 12, 24, 48, 72].includes(Number(x.auto_restart_interval_hours))
                 ? Number(x.auto_restart_interval_hours)
                 : 0;
             document.getElementById('mainpass').value = savedMainPassword;
-            document.getElementById('dns_primary').value = savedDnsPrimary;
-            document.getElementById('dns_secondary').value = savedDnsSecondary;
+            document.getElementById('dns_provider').value = savedDnsProvider;
             document.getElementById('auto_restart_interval').value = String(savedAutoRestartInterval);
             setRestartRequired(x.restart_required);
             updateSettingsDirtyState();
@@ -3879,12 +4064,11 @@ const PANEL_HTML: &str = r##"
 
         async function saveDnsSettings() {
             const button = document.getElementById('saveDnsBtn');
-            if (!button || button.disabled) return;
+            const provider = document.getElementById('dns_provider')?.value || '';
+            if (!button || button.disabled || provider === 'custom') return;
             button.classList.add('saving'); button.disabled = true;
-            const primary = document.getElementById('dns_primary').value.trim();
-            const secondary = document.getElementById('dns_secondary').value.trim();
             const response = await api('/api/settings', {
-                method: 'POST', body: JSON.stringify({ dns_primary: primary, dns_secondary: secondary })
+                method: 'POST', body: JSON.stringify({ dns_provider: provider })
             });
             if (!response.ok) {
                 button.classList.remove('saving');
@@ -3893,10 +4077,9 @@ const PANEL_HTML: &str = r##"
                 return;
             }
             const result = await response.json();
-            savedDnsPrimary = primary;
-            savedDnsSecondary = secondary;
+            savedDnsProvider = provider;
             setRestartRequired(result.restart_required);
-            await animateSavedButton(button, 'Сохранить DNS');
+            await animateSavedButton(button, 'Применить DNS');
         }
         async function saveAutoRestartInterval() {
             const button = document.getElementById('saveAutoRestartIntervalBtn');
@@ -3979,8 +4162,10 @@ const PANEL_HTML: &str = r##"
         }
 
         document.getElementById('mainpass')?.addEventListener('input', updateSettingsDirtyState);
-        document.getElementById('dns_primary')?.addEventListener('input', updateSettingsDirtyState);
-        document.getElementById('dns_secondary')?.addEventListener('input', updateSettingsDirtyState);
+        const dnsProviderSelect = document.getElementById('dns_provider');
+        dnsProviderSelect?.addEventListener('change', () => {
+            updateSettingsDirtyState();
+        });
         document.getElementById('auto_restart_interval')?.addEventListener('change', updateSettingsDirtyState);
         loadStats(); loadSettings(); if (savedTab === 'clients') { loadClients(); } if (savedTab === 'logs') { loadLogs(); }
         
@@ -3999,10 +4184,59 @@ const PANEL_HTML: &str = r##"
 #[cfg(test)]
 mod tests {
     use super::{
-        LOGIN_HTML, MAX_CLIENT_NAME_BYTES, PANEL_HTML, PWA_ICON_192_PNG, PWA_ICON_512_PNG,
-        PWA_MANIFEST, PWA_SERVICE_WORKER, normalize_client_vk_hashes, process_memory,
-        process_memory_rollup, validate_client_name, validate_proxy_profile_name,
+        DNS_PROVIDERS, LOGIN_HTML, MAX_CLIENT_NAME_BYTES, PANEL_HTML, PWA_ICON_192_PNG,
+        PWA_ICON_512_PNG, PWA_MANIFEST, PWA_SERVICE_WORKER, deploy_dns_profile_or_yandex,
+        dns_provider_by_id, dns_provider_id, normalize_client_vk_hashes, process_memory,
+        process_memory_rollup, provider_dns, validate_client_name, validate_proxy_profile_name,
     };
+
+    #[test]
+    fn dns_provider_catalog_is_complete_and_has_exact_yandex_default() {
+        assert_eq!(DNS_PROVIDERS.len(), 13);
+        let yandex = dns_provider_by_id("yandex").unwrap();
+        assert_eq!(provider_dns(yandex), "77.88.8.8,77.88.8.1");
+        assert_eq!(dns_provider_id("1.1.1.1,1.0.0.1"), Some("cloudflare"));
+        assert_eq!(
+            dns_provider_id("45.90.28.181,45.90.30.181"),
+            Some("nextdns")
+        );
+        assert_eq!(dns_provider_id("195.208.6.1,195.208.7.1"), Some("bizone"));
+        assert_eq!(dns_provider_id("195.208.4.1,195.208.5.1"), Some("nsdi"));
+        assert_eq!(dns_provider_id("10.0.0.1"), None);
+    }
+
+    #[test]
+    fn deploy_dns_migration_normalizes_known_partial_profiles_or_uses_yandex() {
+        assert_eq!(
+            deploy_dns_profile_or_yandex("111.88.96.51,203.0.113.7"),
+            "111.88.96.50,111.88.96.51"
+        );
+        assert_eq!(
+            deploy_dns_profile_or_yandex("8.8.8.8,1.1.1.1"),
+            "8.8.8.8,8.8.4.4"
+        );
+        assert_eq!(
+            deploy_dns_profile_or_yandex("203.0.113.7,198.51.100.9"),
+            "77.88.8.8,77.88.8.1"
+        );
+    }
+
+    #[test]
+    fn panel_uses_the_complete_dns_provider_list_without_network_checks() {
+        assert!(PANEL_HTML.contains("DNS Адреса"));
+        assert!(PANEL_HTML.contains("id=\"dns_provider\""));
+        assert!(PANEL_HTML.contains("Yandex DNS"));
+        assert!(PANEL_HTML.contains("Rostelecom DNS"));
+        assert!(PANEL_HTML.contains("NextDNS"));
+        assert!(PANEL_HTML.contains("BI.ZONE DNS"));
+        assert!(PANEL_HTML.contains("НСДИ DNS"));
+        assert!(PANEL_HTML.contains("dns_provider: provider"));
+        assert!(!PANEL_HTML.contains("/api/dns-providers"));
+        assert!(!PANEL_HTML.contains("dns_provider_health"));
+        assert!(!PANEL_HTML.contains("refreshDnsProviderPings"));
+        assert!(!PANEL_HTML.contains("id=\"dns_primary\""));
+        assert!(!PANEL_HTML.contains("id=\"dns_secondary\""));
+    }
 
     #[test]
     fn persisted_text_fields_have_byte_and_control_character_limits() {
@@ -4046,6 +4280,22 @@ mod tests {
         assert!(PANEL_HTML.contains("text-size-adjust: none"));
         assert!(PANEL_HTML.contains(".toggle-row label"));
         assert!(PANEL_HTML.contains("white-space: nowrap"));
+    }
+
+    #[test]
+    fn panel_displays_compact_udp_traffic_counters() {
+        assert!(PANEL_HTML.contains("id=\"traffic_ingress\""));
+        assert!(PANEL_HTML.contains("x.udp_rx_packets"));
+        assert!(PANEL_HTML.contains("x.udp_tx_packets"));
+        assert!(PANEL_HTML.contains("const compactCounter = input =>"));
+        assert!(
+            PANEL_HTML.contains("const units = [\"\", \"K\", \"M\", \"G\", \"T\", \"P\", \"E\"]")
+        );
+        assert!(PANEL_HTML.contains("#traffic_ingress { white-space: nowrap;"));
+        assert!(PANEL_HTML.contains(
+            "RX ${compactCounter(x.udp_rx_packets)} · TX ${compactCounter(x.udp_tx_packets)}"
+        ));
+        assert!(!PANEL_HTML.contains("UDP RX ${Number(x.udp_rx_packets) || 0}"));
     }
 
     #[test]

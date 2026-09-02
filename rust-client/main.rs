@@ -11,6 +11,8 @@ mod cpu_task;
 mod dispatcher;
 mod dns;
 mod events;
+#[path = "../shared/flow_frame.rs"]
+mod flow_frame;
 mod logging;
 mod namegen;
 mod obfs;
@@ -32,6 +34,8 @@ mod turn_endpoint;
 mod turn_stream;
 mod udp_batch;
 mod vk_js_calls;
+#[path = "../shared/wire_protocol.rs"]
+mod wire_protocol;
 mod worker;
 mod wrap;
 
@@ -327,6 +331,7 @@ async fn run(arguments: Arguments) -> Result<()> {
         ready_credential_tx,
         config_sent: Arc::new(AtomicBool::new(false)),
         config_in_flight: Arc::new(AtomicBool::new(false)),
+        server_stream_repair: Arc::new(AtomicBool::new(false)),
         repair,
         shutdown: Arc::new(ShutdownCoordinator::new()),
         cancel: cancel.clone(),

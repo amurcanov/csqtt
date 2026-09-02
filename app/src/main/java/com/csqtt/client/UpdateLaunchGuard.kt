@@ -7,6 +7,7 @@ import android.content.Context
 import android.content.pm.PackageInfo
 import android.os.Build
 import android.util.Log
+import androidx.core.content.edit
 
 /** Drops only stale Activity/Compose state on the first launch after package replace. */
 internal object UpdateLaunchGuard {
@@ -25,9 +26,7 @@ internal object UpdateLaunchGuard {
             packageWasUpdated = packageInfo.lastUpdateTime > packageInfo.firstInstallTime,
         )
         if (previous != token) {
-            if (!preferences.edit().putString(LAST_TOKEN, token).commit()) {
-                Log.w(TAG, "Unable to persist package-update launch marker")
-            }
+            preferences.edit(commit = true) { putString(LAST_TOKEN, token) }
         }
         discard
     }.getOrElse { error ->

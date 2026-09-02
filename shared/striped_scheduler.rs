@@ -1,129 +1,120 @@
 // SPDX-FileCopyrightText: 2026 amurcanov
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 
-use std::sync::atomic::{AtomicUsize, Ordering};
-
-pub const TCP_LATENCY_PACKET_LIMIT: usize = 192;
-pub const UDP_LATENCY_PACKET_LIMIT: usize = 300;
-pub const LATENCY_STRIPE_PACKET_CHUNK: usize = 1;
-pub const PRIORITY_STRIPE_PACKET_CHUNK: usize = 2;
-pub const BULK_STRIPE_PACKET_CHUNK: usize = 2;
+pub const SMALL_PACKET_MAX: usize = 164;
+pub const MEDIUM_PACKET_MAX: usize = 999;
+pub const SMALL_STREAM_STRIPE_PACKET_CHUNK: usize = 4;
+pub const MEDIUM_STREAM_STRIPE_PACKET_CHUNK: usize = 16;
+pub const BULK_STREAM_STRIPE_PACKET_CHUNK: usize = 32;
+pub const SMALL_DATAGRAM_BATCH: usize = 16;
+pub const MEDIUM_DATAGRAM_BATCH: usize = 64;
+pub const BULK_DATAGRAM_BATCH: usize = 128;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PacketClass {
-    Latency,
-    Priority,
+    Small,
+    Medium,
     Bulk,
+}
+
+impl PacketClass {
+    #[inline(always)]
+    pub const fn index(self) -> usize {
+        match self {
+            Self::Small => 0,
+            Self::Medium => 1,
+            Self::Bulk => 2,
+        }
+    }
+
+    #[inline(always)]
+    pub const fn stream_chunk(self) -> usize {
+        match self {
+            Self::Small => SMALL_STREAM_STRIPE_PACKET_CHUNK,
+            Self::Medium => MEDIUM_STREAM_STRIPE_PACKET_CHUNK,
+            Self::Bulk => BULK_STREAM_STRIPE_PACKET_CHUNK,
+        }
+    }
+
+    #[inline(always)]
+    pub const fn datagram_batch(self) -> usize {
+        match self {
+            Self::Small => SMALL_DATAGRAM_BATCH,
+            Self::Medium => MEDIUM_DATAGRAM_BATCH,
+            Self::Bulk => BULK_DATAGRAM_BATCH,
+        }
+    }
 }
 
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DispatchTicket {
     pub start_slot: usize,
-    pub worker_count: usize,
-    pub cohort_len: usize,
     pub class: PacketClass,
-}
-
-impl DispatchTicket {
-    #[allow(dead_code)]
-    #[inline(always)]
-    pub fn worker_index(self, offset: usize) -> usize {
-        (self.start_slot + offset) % self.worker_count
-    }
-}
-
-pub struct StripedScheduler {
-    latency_packet: AtomicUsize,
-    priority_packet: AtomicUsize,
-    bulk_packet: AtomicUsize,
-}
-
-impl StripedScheduler {
-    pub const fn new() -> Self {
-        Self {
-            latency_packet: AtomicUsize::new(0),
-            priority_packet: AtomicUsize::new(0),
-            bulk_packet: AtomicUsize::new(0),
-        }
-    }
-
-    #[allow(dead_code)]
-    #[inline(always)]
-    pub fn begin(&self, count: usize, packet: &[u8]) -> Option<DispatchTicket> {
-        self.begin_class(count, packet_class(packet))
-    }
-
-    #[inline(always)]
-    pub fn begin_class(&self, count: usize, class: PacketClass) -> Option<DispatchTicket> {
-        if count == 0 {
-            return None;
-        }
-
-        let worker_idx = match class {
-            PacketClass::Latency => {
-                (self.latency_packet.fetch_add(1, Ordering::Relaxed) / LATENCY_STRIPE_PACKET_CHUNK)
-                    % count
-            }
-            PacketClass::Priority => {
-                (self.priority_packet.fetch_add(1, Ordering::Relaxed)
-                    / PRIORITY_STRIPE_PACKET_CHUNK)
-                    % count
-            }
-            PacketClass::Bulk => {
-                (self.bulk_packet.fetch_add(1, Ordering::Relaxed) / BULK_STRIPE_PACKET_CHUNK)
-                    % count
-            }
-        };
-
-        let safe_idx = worker_idx.min(count.saturating_sub(1));
-
-        Some(DispatchTicket {
-            start_slot: safe_idx,
-            worker_count: count,
-            cohort_len: count,
-            class,
-        })
-    }
-
-    #[allow(dead_code)]
-    #[inline(always)]
-    pub fn select(&self, count: usize, packet: &[u8]) -> Option<usize> {
-        self.begin(count, packet).map(|ticket| ticket.start_slot)
-    }
-
-    #[allow(dead_code)]
-    #[inline(always)]
-    pub fn select_class(&self, count: usize, class: PacketClass) -> Option<usize> {
-        self.begin_class(count, class)
-            .map(|ticket| ticket.start_slot)
-    }
-}
-
-impl Default for StripedScheduler {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 #[inline(always)]
 pub fn packet_class(packet: &[u8]) -> PacketClass {
-    match internet_transport(packet) {
-        Some(1 | 58) => PacketClass::Latency,
-        Some(6) if packet.len() < TCP_LATENCY_PACKET_LIMIT => PacketClass::Latency,
-        Some(17) if packet.len() <= UDP_LATENCY_PACKET_LIMIT => PacketClass::Latency,
-        Some(17) => PacketClass::Priority,
-        _ => PacketClass::Bulk,
+    let packet = crate::flow_frame::payload(packet);
+    let Some((transport, offset)) = internet_transport(packet) else {
+        return size_class(packet.len());
+    };
+    if matches!(transport, 1 | 58) || is_dns(packet, transport, offset) {
+        return PacketClass::Small;
+    }
+    if transport == 6 && is_tcp_control(packet, offset) {
+        return PacketClass::Small;
+    }
+    size_class(packet.len())
+}
+
+#[inline(always)]
+const fn size_class(length: usize) -> PacketClass {
+    if length <= SMALL_PACKET_MAX {
+        PacketClass::Small
+    } else if length <= MEDIUM_PACKET_MAX {
+        PacketClass::Medium
+    } else {
+        PacketClass::Bulk
     }
 }
 
 #[inline(always)]
-fn internet_transport(packet: &[u8]) -> Option<u8> {
+fn is_dns(packet: &[u8], transport: u8, offset: usize) -> bool {
+    if !matches!(transport, 6 | 17) {
+        return false;
+    }
+    let Some(ports) = packet.get(offset..offset.saturating_add(4)) else {
+        return false;
+    };
+    let source = u16::from_be_bytes([ports[0], ports[1]]);
+    let destination = u16::from_be_bytes([ports[2], ports[3]]);
+    source == 53 || destination == 53
+}
+
+#[inline(always)]
+fn is_tcp_control(packet: &[u8], offset: usize) -> bool {
+    let Some(header) = packet.get(offset..offset.saturating_add(14)) else {
+        return false;
+    };
+    let flags = header[13];
+    if flags & (0x02 | 0x01 | 0x04) != 0 {
+        return true;
+    }
+    if flags & 0x10 == 0 {
+        return false;
+    }
+    let header_len = usize::from(header[12] >> 4).saturating_mul(4);
+    header_len >= 20 && packet.len() <= offset.saturating_add(header_len)
+}
+
+#[inline(always)]
+fn internet_transport(packet: &[u8]) -> Option<(u8, usize)> {
     match packet.first().map(|first| first >> 4) {
         Some(4) => {
             let header_len = usize::from(packet.first()? & 0x0f).checked_mul(4)?;
             if header_len >= 20 && packet.len() >= header_len {
-                Some(packet[9])
+                Some((packet[9], header_len))
             } else {
                 None
             }
@@ -134,7 +125,7 @@ fn internet_transport(packet: &[u8]) -> Option<u8> {
 }
 
 #[inline(always)]
-fn ipv6_transport(packet: &[u8]) -> Option<u8> {
+fn ipv6_transport(packet: &[u8]) -> Option<(u8, usize)> {
     let mut protocol = packet[6];
     let mut offset = 40usize;
     for _ in 0..8 {
@@ -157,13 +148,13 @@ fn ipv6_transport(packet: &[u8]) -> Option<u8> {
                 protocol = header[0];
                 offset = offset.checked_add((usize::from(header[1]) + 2).checked_mul(4)?)?;
             }
-            _ => return Some(protocol),
+            _ => return Some((protocol, offset)),
         }
         if offset > packet.len() {
             return None;
         }
     }
-    Some(protocol)
+    Some((protocol, offset))
 }
 
 #[cfg(test)]
@@ -177,92 +168,58 @@ mod tests {
         packet
     }
 
+    fn tcp(flags: u8, payload_len: usize) -> Vec<u8> {
+        let mut packet = ipv4(6, 40 + payload_len);
+        packet[32] = 0x50;
+        packet[33] = flags;
+        packet
+    }
+
+    fn dns(protocol: u8, length: usize) -> Vec<u8> {
+        let mut packet = ipv4(protocol, length.max(28));
+        packet[20..22].copy_from_slice(&53u16.to_be_bytes());
+        packet[22..24].copy_from_slice(&44444u16.to_be_bytes());
+        packet
+    }
+
+    #[test]
+    fn classifies_size_boundaries() {
+        assert_eq!(packet_class(&ipv4(17, 164)), PacketClass::Small);
+        assert_eq!(packet_class(&ipv4(17, 165)), PacketClass::Medium);
+        assert_eq!(packet_class(&ipv4(17, 999)), PacketClass::Medium);
+        assert_eq!(packet_class(&ipv4(17, 1_000)), PacketClass::Bulk);
+    }
+
+    #[test]
+    fn classifies_icmp_and_dns_as_small() {
+        assert_eq!(packet_class(&ipv4(1, 1_400)), PacketClass::Small);
+        assert_eq!(packet_class(&ipv6(58, 1_400)), PacketClass::Small);
+        assert_eq!(packet_class(&dns(17, 1_400)), PacketClass::Small);
+        assert_eq!(packet_class(&dns(6, 1_400)), PacketClass::Small);
+    }
+
+    #[test]
+    fn classifies_tcp_control_without_demoting_tcp_payload() {
+        assert_eq!(packet_class(&tcp(0x02, 1_200)), PacketClass::Small);
+        assert_eq!(packet_class(&tcp(0x01, 1_200)), PacketClass::Small);
+        assert_eq!(packet_class(&tcp(0x10, 0)), PacketClass::Small);
+        assert_eq!(packet_class(&tcp(0x18, 1_200)), PacketClass::Bulk);
+    }
+
+    #[test]
+    fn classes_expose_requested_chunks_and_batches() {
+        assert_eq!(PacketClass::Small.stream_chunk(), 4);
+        assert_eq!(PacketClass::Medium.stream_chunk(), 16);
+        assert_eq!(PacketClass::Bulk.stream_chunk(), 32);
+        assert_eq!(PacketClass::Small.datagram_batch(), 16);
+        assert_eq!(PacketClass::Medium.datagram_batch(), 64);
+        assert_eq!(PacketClass::Bulk.datagram_batch(), 128);
+    }
+
     fn ipv6(protocol: u8, length: usize) -> Vec<u8> {
         let mut packet = vec![0; length.max(40)];
         packet[0] = 0x60;
         packet[6] = protocol;
         packet
-    }
-
-    #[test]
-    fn classifies_only_requested_internet_packets_as_latency() {
-        assert_eq!(packet_class(&ipv4(1, 1_400)), PacketClass::Latency);
-        assert_eq!(packet_class(&ipv6(58, 1_400)), PacketClass::Latency);
-        assert_eq!(packet_class(&ipv4(6, 191)), PacketClass::Latency);
-        assert_eq!(packet_class(&ipv4(6, 192)), PacketClass::Bulk);
-        assert_eq!(packet_class(&ipv4(17, 199)), PacketClass::Latency);
-        assert_eq!(packet_class(&ipv4(17, 300)), PacketClass::Latency);
-        assert_eq!(packet_class(&ipv4(17, 301)), PacketClass::Priority);
-        assert_eq!(packet_class(&ipv4(17, 1_400)), PacketClass::Priority);
-        assert_eq!(packet_class(&ipv4(50, 60)), PacketClass::Bulk);
-        assert_eq!(packet_class(b"GETCONF:device"), PacketClass::Bulk);
-    }
-
-    #[test]
-    fn bulk_stripes_in_fixed_packet_chunks() {
-        let scheduler = StripedScheduler::new();
-        for _ in 0..BULK_STRIPE_PACKET_CHUNK {
-            assert_eq!(
-                scheduler
-                    .begin_class(2, PacketClass::Bulk)
-                    .unwrap()
-                    .start_slot,
-                0
-            );
-        }
-        assert_eq!(
-            scheduler
-                .begin_class(2, PacketClass::Bulk)
-                .unwrap()
-                .start_slot,
-            1
-        );
-    }
-
-    #[test]
-    fn bulk_chunk_is_fixed_for_every_stream_count() {
-        assert_eq!(BULK_STRIPE_PACKET_CHUNK, 2);
-    }
-
-    #[test]
-    fn latency_stripes_in_configured_packet_chunks() {
-        let scheduler = StripedScheduler::new();
-        for _ in 0..LATENCY_STRIPE_PACKET_CHUNK {
-            assert_eq!(
-                scheduler
-                    .begin_class(2, PacketClass::Latency)
-                    .unwrap()
-                    .start_slot,
-                0
-            );
-        }
-        assert_eq!(
-            scheduler
-                .begin_class(2, PacketClass::Latency)
-                .unwrap()
-                .start_slot,
-            1
-        );
-    }
-
-    #[test]
-    fn priority_stripes_in_configured_packet_chunks() {
-        let scheduler = StripedScheduler::new();
-        for _ in 0..PRIORITY_STRIPE_PACKET_CHUNK {
-            assert_eq!(
-                scheduler
-                    .begin_class(2, PacketClass::Priority)
-                    .unwrap()
-                    .start_slot,
-                0
-            );
-        }
-        assert_eq!(
-            scheduler
-                .begin_class(2, PacketClass::Priority)
-                .unwrap()
-                .start_slot,
-            1
-        );
     }
 }

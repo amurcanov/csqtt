@@ -32,11 +32,6 @@ pub struct ClientDevice {
     pub pub_key: String,
     pub up_bytes: i64,
     pub down_bytes: i64,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub bound_password: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub last_session_salt: String,
-    pub last_generation_id: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -253,34 +248,14 @@ impl Database {
         self.auto_restart_interval_hours = Some(hours);
     }
 
-    /// Clears `bound_password` on every device bound to `password`.
-    /// Keeps the password↔device relation symmetric when a password disappears
-    /// or is unbound, so an orphaned device can never be silently re-bound
-    /// by an unrelated credential.
-    pub fn clear_device_binding(&mut self, password: &str) -> bool {
+    pub fn repair_stale_password_bindings(&mut self) -> bool {
         let mut changed = false;
-        for device in self.devices.values_mut() {
-            if device.bound_password == password {
-                device.bound_password.clear();
+        let devices = &self.devices;
+        for entry in self.passwords.values_mut() {
+            if !entry.device_id.is_empty() && !devices.contains_key(&entry.device_id) {
+                entry.device_id.clear();
                 changed = true;
             }
-        }
-        changed
-    }
-
-    /// Clears bindings that point to passwords which no longer exist.
-    /// The main password never lives in `self.passwords`, so bindings to it stay.
-    pub fn prune_dangling_device_bindings(&mut self) -> bool {
-        let mut changed = false;
-        for device in self.devices.values_mut() {
-            if device.bound_password.is_empty()
-                || device.bound_password == self.main_password
-                || self.passwords.contains_key(&device.bound_password)
-            {
-                continue;
-            }
-            device.bound_password.clear();
-            changed = true;
         }
         changed
     }
@@ -622,10 +597,7 @@ CREATE TABLE IF NOT EXISTS devices (
     priv_key           TEXT    NOT NULL,
     pub_key            TEXT    NOT NULL,
     up_bytes           INTEGER NOT NULL DEFAULT 0,
-    down_bytes         INTEGER NOT NULL DEFAULT 0,
-    bound_password     TEXT    NOT NULL DEFAULT '',
-    last_session_salt  TEXT    NOT NULL DEFAULT '',
-    last_generation_id INTEGER NOT NULL DEFAULT 0
+    down_bytes         INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS local_proxy_profiles (
     id         TEXT PRIMARY KEY,
@@ -786,18 +758,14 @@ fn write_database_snapshot(connection: &mut Connection, db: &Database) -> Result
         let mut insert = transaction
             .prepare(
                 "INSERT INTO devices (
-                    device_id, ip, priv_key, pub_key, up_bytes, down_bytes,
-                    bound_password, last_session_salt, last_generation_id
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                    device_id, ip, priv_key, pub_key, up_bytes, down_bytes
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                 ON CONFLICT(device_id) DO UPDATE SET
                     ip = excluded.ip,
                     priv_key = excluded.priv_key,
                     pub_key = excluded.pub_key,
                     up_bytes = excluded.up_bytes,
-                    down_bytes = excluded.down_bytes,
-                    bound_password = excluded.bound_password,
-                    last_session_salt = excluded.last_session_salt,
-                    last_generation_id = excluded.last_generation_id",
+                    down_bytes = excluded.down_bytes",
             )
             .context("prepare devices insert")?;
         for device in db.devices.values() {
@@ -809,9 +777,6 @@ fn write_database_snapshot(connection: &mut Connection, db: &Database) -> Result
                     device.pub_key,
                     device.up_bytes,
                     device.down_bytes,
-                    device.bound_password,
-                    "",
-                    0u64,
                 ])
                 .with_context(|| format!("write device {}", device.device_id))?;
         }
@@ -939,11 +904,7 @@ fn read_database_snapshot(config_dir: &Path) -> Result<Database> {
     }
     {
         let mut select = connection
-            .prepare(
-                "SELECT device_id, ip, priv_key, pub_key, up_bytes, down_bytes,
-                        bound_password, last_session_salt, last_generation_id
-                 FROM devices",
-            )
+            .prepare("SELECT device_id, ip, priv_key, pub_key, up_bytes, down_bytes FROM devices")
             .context("prepare devices select")?;
         let mut rows = select.query([]).context("read devices")?;
         while let Some(row) = rows.next()? {
@@ -954,9 +915,6 @@ fn read_database_snapshot(config_dir: &Path) -> Result<Database> {
                 pub_key: row.get(3).context("read device pub_key")?,
                 up_bytes: row.get(4).context("read device up_bytes")?,
                 down_bytes: row.get(5).context("read device down_bytes")?,
-                bound_password: row.get(6).context("read device bound_password")?,
-                last_session_salt: row.get(7).context("read device last_session_salt")?,
-                last_generation_id: row.get(8).context("read device last_generation_id")?,
             };
             db.devices.insert(device.device_id.clone(), device);
         }
@@ -996,20 +954,25 @@ pub fn load_database(config_dir: &Path) -> Result<Database> {
     let _guard = DATABASE_SAVE_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let database_exists = config_dir.join(DATABASE_FILE).exists();
     let legacy_paths: Vec<PathBuf> = LEGACY_DATABASE_FILES
         .iter()
         .map(|name| config_dir.join(name))
         .filter(|path| path.exists())
         .collect();
+    if database_exists {
+        let mut db = read_database_snapshot(config_dir)?;
+        repair_loaded_database(config_dir, &mut db)?;
+        if !legacy_paths.is_empty() {
+            eprintln!(
+                "[DB] Ignoring {} retired JSON database file(s); {DATABASE_FILE} is authoritative",
+                legacy_paths.len()
+            );
+        }
+        return Ok(db);
+    }
     if legacy_paths.is_empty() {
-        return if config_dir.join(DATABASE_FILE).exists() {
-            let connection = open_database_connection(config_dir)?;
-            reset_device_runtime_epochs(&connection)?;
-            drop(connection);
-            read_database_snapshot(config_dir)
-        } else {
-            Ok(Database::default())
-        };
+        return Ok(Database::default());
     }
 
     let mut legacy_databases = Vec::with_capacity(legacy_paths.len());
@@ -1026,18 +989,18 @@ pub fn load_database(config_dir: &Path) -> Result<Database> {
     }
 
     let mut connection = open_database_connection(config_dir)?;
-    reset_device_runtime_epochs(&connection)?;
     for legacy in &legacy_databases {
         import_legacy_database_rows(&mut connection, legacy)
             .context("commit legacy JSON rows into SQLite")?;
     }
     drop(connection);
 
-    let db = read_database_snapshot(config_dir)?;
+    let mut db = read_database_snapshot(config_dir)?;
     for legacy in &legacy_databases {
         verify_legacy_database_rows(&db, legacy)
             .context("verify legacy JSON import into SQLite")?;
     }
+    repair_loaded_database(config_dir, &mut db)?;
 
     for legacy_path in &legacy_paths {
         fs::remove_file(legacy_path)
@@ -1050,15 +1013,13 @@ pub fn load_database(config_dir: &Path) -> Result<Database> {
     Ok(db)
 }
 
-fn reset_device_runtime_epochs(connection: &Connection) -> Result<()> {
-    connection
-        .execute(
-            "UPDATE devices
-             SET last_session_salt = '', last_generation_id = 0
-             WHERE last_session_salt <> '' OR last_generation_id <> 0",
-            [],
-        )
-        .context("reset persisted device runtime epochs")?;
+fn repair_loaded_database(config_dir: &Path, db: &mut Database) -> Result<()> {
+    if !db.repair_stale_password_bindings() {
+        return Ok(());
+    }
+    let mut connection = open_database_connection(config_dir)?;
+    write_database_snapshot(&mut connection, db)?;
+    eprintln!("[DB] Repaired stale password and device bindings in {DATABASE_FILE}");
     Ok(())
 }
 
@@ -1135,9 +1096,8 @@ fn import_legacy_database_rows(connection: &mut Connection, legacy: &Database) -
         let mut insert = transaction
             .prepare(
                 "INSERT INTO devices (
-                    device_id, ip, priv_key, pub_key, up_bytes, down_bytes,
-                    bound_password, last_session_salt, last_generation_id
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                    device_id, ip, priv_key, pub_key, up_bytes, down_bytes
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                 ON CONFLICT(device_id) DO NOTHING",
             )
             .context("prepare legacy devices import")?;
@@ -1150,9 +1110,6 @@ fn import_legacy_database_rows(connection: &mut Connection, legacy: &Database) -
                     device.pub_key,
                     device.up_bytes,
                     device.down_bytes,
-                    device.bound_password,
-                    "",
-                    0u64,
                 ])
                 .with_context(|| format!("merge legacy device {}", device.device_id))?;
         }
@@ -1246,7 +1203,6 @@ fn legacy_device_matches(sqlite: &ClientDevice, legacy: &ClientDevice) -> bool {
         && sqlite.ip == legacy.ip
         && sqlite.priv_key == legacy.priv_key
         && sqlite.pub_key == legacy.pub_key
-        && sqlite.bound_password == legacy.bound_password
 }
 
 fn persist_database_update(
@@ -1478,11 +1434,8 @@ mod tests {
                 ip: "10.66.67.2".to_owned(),
                 priv_key: "priv-1".to_owned(),
                 pub_key: "pub-1".to_owned(),
-                bound_password: "client-password-1".to_owned(),
                 up_bytes: 55,
                 down_bytes: 66,
-                last_session_salt: "salt-1".to_owned(),
-                last_generation_id: 77,
             },
         );
         legacy.devices.insert(
@@ -1492,11 +1445,8 @@ mod tests {
                 ip: "10.66.67.3".to_owned(),
                 priv_key: "priv-2".to_owned(),
                 pub_key: "pub-2".to_owned(),
-                bound_password: "client-password-2".to_owned(),
                 up_bytes: 88,
                 down_bytes: 99,
-                last_session_salt: "salt-2".to_owned(),
-                last_generation_id: 100,
             },
         );
 
@@ -1527,9 +1477,6 @@ mod tests {
 
         let device = restored.devices.get("device-1").unwrap();
         assert_eq!(device.ip, "10.66.67.2");
-        assert_eq!(device.bound_password, "client-password-1");
-        assert!(device.last_session_salt.is_empty());
-        assert_eq!(device.last_generation_id, 0);
         assert!(directory.join(super::DATABASE_FILE).exists());
         assert!(!legacy_path.exists());
 
@@ -1540,42 +1487,67 @@ mod tests {
     }
 
     #[test]
-    fn existing_sqlite_runtime_epoch_is_cleared_on_load() {
+    fn load_repairs_stale_password_and_device_bindings() {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let directory = std::env::temp_dir().join(format!("csqtt-sqlite-epoch-reset-{unique}"));
-        let mut database = Database::default();
+        let directory = std::env::temp_dir().join(format!("csqtt-binding-repair-{unique}"));
+        let mut database = Database {
+            main_password: "main-password".to_owned(),
+            main_device_id: "owner-device".to_owned(),
+            ..Database::default()
+        };
+        database.passwords.insert(
+            "orphaned".to_owned(),
+            PasswordEntry {
+                device_id: "missing-device".to_owned(),
+                ..PasswordEntry::default()
+            },
+        );
+        database.passwords.insert(
+            "one-sided".to_owned(),
+            PasswordEntry {
+                device_id: "device-1".to_owned(),
+                ..PasswordEntry::default()
+            },
+        );
         database.devices.insert(
-            "legacy-device".to_owned(),
+            "device-1".to_owned(),
             ClientDevice {
-                device_id: "legacy-device".to_owned(),
+                device_id: "device-1".to_owned(),
                 ip: "10.66.67.2".to_owned(),
                 ..ClientDevice::default()
             },
         );
+        database.devices.insert(
+            "stale-device".to_owned(),
+            ClientDevice {
+                device_id: "stale-device".to_owned(),
+                ip: "10.66.67.3".to_owned(),
+                ..ClientDevice::default()
+            },
+        );
+        database.devices.insert(
+            "owner-device".to_owned(),
+            ClientDevice {
+                device_id: "owner-device".to_owned(),
+                ip: "10.66.67.4".to_owned(),
+                ..ClientDevice::default()
+            },
+        );
         save_database(&directory, &database).unwrap();
-        let connection = rusqlite::Connection::open(directory.join(super::DATABASE_FILE)).unwrap();
-        connection
-            .execute(
-                "UPDATE devices
-                 SET last_session_salt = 'retired-salt', last_generation_id = 1786000000000
-                 WHERE device_id = 'legacy-device'",
-                [],
-            )
-            .unwrap();
-        drop(connection);
 
         let restored = load_database(&directory).unwrap();
-        let device = &restored.devices["legacy-device"];
-        assert!(device.last_session_salt.is_empty());
-        assert_eq!(device.last_generation_id, 0);
+        assert!(restored.passwords["orphaned"].device_id.is_empty());
+
+        let reloaded = load_database(&directory).unwrap();
+        assert!(reloaded.passwords["orphaned"].device_id.is_empty());
         let _ = std::fs::remove_dir_all(directory);
     }
 
     #[test]
-    fn legacy_json_merges_missing_rows_without_overwriting_sqlite() {
+    fn existing_sqlite_ignores_legacy_json() {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -1599,7 +1571,6 @@ mod tests {
             ClientDevice {
                 device_id: "sqlite-device".to_owned(),
                 ip: "10.66.67.10".to_owned(),
-                bound_password: "sqlite-client".to_owned(),
                 ..ClientDevice::default()
             },
         );
@@ -1623,7 +1594,6 @@ mod tests {
             ClientDevice {
                 device_id: "legacy-device".to_owned(),
                 ip: "10.66.67.11".to_owned(),
-                bound_password: "legacy-client".to_owned(),
                 ..ClientDevice::default()
             },
         );
@@ -1641,7 +1611,6 @@ mod tests {
             ClientDevice {
                 device_id: "sqlite-device".to_owned(),
                 ip: "10.66.67.10".to_owned(),
-                bound_password: "sqlite-client".to_owned(),
                 up_bytes: 1,
                 ..ClientDevice::default()
             },
@@ -1652,18 +1621,16 @@ mod tests {
         let restored = load_database(&directory).unwrap();
         assert_eq!(restored.main_password, "sqlite-main");
         assert_eq!(restored.main_up_bytes, 50);
-        assert_eq!(restored.passwords.len(), 2);
-        assert_eq!(restored.devices.len(), 2);
+        assert_eq!(restored.passwords.len(), 1);
+        assert_eq!(restored.devices.len(), 1);
         assert_eq!(restored.passwords["sqlite-client"].name, "current");
-        assert_eq!(restored.passwords["legacy-client"].name, "imported");
         assert_eq!(restored.devices["sqlite-device"].ip, "10.66.67.10");
-        assert_eq!(restored.devices["legacy-device"].ip, "10.66.67.11");
-        assert!(!legacy_path.exists());
+        assert!(legacy_path.exists());
         let _ = std::fs::remove_dir_all(directory);
     }
 
     #[test]
-    fn legacy_json_with_conflicting_password_stays_on_disk() {
+    fn existing_sqlite_ignores_conflicting_legacy_password() {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -1675,6 +1642,14 @@ mod tests {
             PasswordEntry {
                 device_id: "sqlite-device".to_owned(),
                 ..PasswordEntry::default()
+            },
+        );
+        sqlite.devices.insert(
+            "sqlite-device".to_owned(),
+            ClientDevice {
+                device_id: "sqlite-device".to_owned(),
+                ip: "10.66.67.2".to_owned(),
+                ..ClientDevice::default()
             },
         );
         save_database(&directory, &sqlite).unwrap();
@@ -1690,14 +1665,17 @@ mod tests {
         let legacy_path = directory.join(super::LEGACY_DATABASE_FILE);
         std::fs::write(&legacy_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
 
-        let error = format!("{:#}", load_database(&directory).unwrap_err());
-        assert!(error.contains("legacy password shared-password conflicts"));
+        let restored = load_database(&directory).unwrap();
+        assert_eq!(
+            restored.passwords["shared-password"].device_id,
+            "sqlite-device"
+        );
         assert!(legacy_path.exists());
         let _ = std::fs::remove_dir_all(directory);
     }
 
     #[test]
-    fn legacy_json_with_conflicting_device_stays_on_disk() {
+    fn existing_sqlite_ignores_conflicting_legacy_device() {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -1711,7 +1689,6 @@ mod tests {
                 ip: "10.66.67.2".to_owned(),
                 priv_key: "sqlite-private".to_owned(),
                 pub_key: "sqlite-public".to_owned(),
-                bound_password: "shared-password".to_owned(),
                 ..ClientDevice::default()
             },
         );
@@ -1725,15 +1702,14 @@ mod tests {
                 ip: "10.66.67.2".to_owned(),
                 priv_key: "legacy-private".to_owned(),
                 pub_key: "sqlite-public".to_owned(),
-                bound_password: "shared-password".to_owned(),
                 ..ClientDevice::default()
             },
         );
         let legacy_path = directory.join(super::LEGACY_DATABASE_FILE);
         std::fs::write(&legacy_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
 
-        let error = format!("{:#}", load_database(&directory).unwrap_err());
-        assert!(error.contains("legacy device shared-device conflicts"));
+        let restored = load_database(&directory).unwrap();
+        assert_eq!(restored.devices["shared-device"].priv_key, "sqlite-private");
         assert!(legacy_path.exists());
         let _ = std::fs::remove_dir_all(directory);
     }

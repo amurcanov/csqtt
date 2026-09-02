@@ -5,7 +5,6 @@ package com.csqtt.client
 
 import android.annotation.SuppressLint
 import android.content.Context
-import android.net.Uri
 import android.os.Handler
 import android.os.Looper
 import android.view.KeyEvent
@@ -16,6 +15,7 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import androidx.core.net.toUri
 import kotlinx.coroutines.launch
 import org.json.JSONObject
 import java.io.ByteArrayInputStream
@@ -365,7 +365,7 @@ internal class VkAuthSession(
                         switchToTokenPhase(view)
                     } else {
                         val currentUrl = view.url.orEmpty()
-                        val path = runCatching { Uri.parse(currentUrl).path }.getOrNull() ?: ""
+                        val path = runCatching { currentUrl.toUri().path }.getOrNull() ?: ""
                         if (path.startsWith("/feed")) {
                             switchToTokenPhase(view)
                         } else {
@@ -393,7 +393,7 @@ internal class VkAuthSession(
     }
 
     private fun handleUrl(url: String) {
-        val uri = runCatching { Uri.parse(url) }.getOrNull() ?: return
+        val uri = runCatching { url.toUri() }.getOrNull() ?: return
         val fragment = uri.fragment ?: return
         when {
             fragment.contains("access_token=") -> handleAccessToken(fragment)

@@ -113,6 +113,7 @@ pub struct GroupContext {
     pub ready_credential_tx: Option<mpsc::UnboundedSender<usize>>,
     pub config_sent: Arc<AtomicBool>,
     pub config_in_flight: Arc<AtomicBool>,
+    pub server_stream_repair: Arc<AtomicBool>,
     pub repair: Arc<RepairState>,
     pub shutdown: Arc<ShutdownCoordinator>,
     pub cancel: CancellationToken,
@@ -653,6 +654,7 @@ async fn worker_loop(
             wrap_key: context.params.wrap_key,
             get_config,
             desired_count: context.params.workers,
+            server_stream_repair: context.server_stream_repair.clone(),
             repair: context.repair.clone(),
             turn_endpoint_cursor,
         };
@@ -676,7 +678,7 @@ async fn worker_loop(
                 pool: context.pool.clone(),
                 stats: context.stats.clone(),
                 events: context.events.clone(),
-                config_tx: get_config.then(|| context.config_tx.clone()),
+                config_tx: context.config_tx.clone(),
                 config_delivery: get_config.then(|| ConfigDeliveryState {
                     sent: context.config_sent.clone(),
                     in_flight: context.config_in_flight.clone(),
@@ -715,6 +717,17 @@ async fn worker_loop(
             attempt = 0;
         }
         drop(config_guard);
+        if should_refresh_configuration_after_full_outage(
+            was_ready,
+            result.is_err(),
+            context.stats.active_connections.load(Ordering::Acquire),
+            context.cancel.is_cancelled(),
+        ) && context.config_sent.swap(false, Ordering::AcqRel)
+        {
+            crate::log_error!(
+                "[КОНФИГ] Все пути завершены; конфигурация будет запрошена при восстановлении"
+            );
+        }
         if context.cancel.is_cancelled() || group_creds.is_unavailable() {
             return;
         }
@@ -828,10 +841,14 @@ async fn worker_loop(
                 if is_transport_timeout(&lower) {
                     context.events.network_timeout();
                 }
-                if message.contains("FATAL_AUTH") || message.contains("хеш мёртв") {
+                if message.contains("FATAL_AUTH")
+                    || message.contains("FATAL_PROTOCOL")
+                    || message.contains("FATAL_HANDSHAKE")
+                    || message.contains("хеш мёртв")
+                {
                     delay = Duration::from_secs(5 + rand::random::<u64>() % 6);
                     crate::log_error!(
-                        "[ВОРКЕР #{id}] Ошибка авторизации, изолированный повтор через {:?}: {message}",
+                        "[ВОРКЕР #{id}] Критическая ошибка подключения, изолированный повтор через {:?}: {message}",
                         delay
                     );
                 } else if lower.contains("wrap_auth_timeout") {
@@ -876,6 +893,15 @@ async fn worker_loop(
             _ = tokio::time::sleep(delay) => {}
         }
     }
+}
+
+fn should_refresh_configuration_after_full_outage(
+    was_ready: bool,
+    failed: bool,
+    active_connections: i32,
+    cancelled: bool,
+) -> bool {
+    was_ready && failed && active_connections == 0 && !cancelled
 }
 
 fn worker_retry_delay(attempt: usize) -> Duration {
@@ -1201,6 +1227,33 @@ mod tests {
         let guard = ConfigFlightGuard::acquire(&sent, in_flight.clone());
         assert!(!guard.acquired);
         assert!(!in_flight.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn full_outage_reopens_single_configuration_flight() {
+        assert!(should_refresh_configuration_after_full_outage(
+            true, true, 0, false
+        ));
+        assert!(!should_refresh_configuration_after_full_outage(
+            false, true, 0, false
+        ));
+        assert!(!should_refresh_configuration_after_full_outage(
+            true, false, 0, false
+        ));
+        assert!(!should_refresh_configuration_after_full_outage(
+            true, true, 1, false
+        ));
+        assert!(!should_refresh_configuration_after_full_outage(
+            true, true, 0, true
+        ));
+
+        let sent = AtomicBool::new(true);
+        let in_flight = Arc::new(AtomicBool::new(false));
+        if should_refresh_configuration_after_full_outage(true, true, 0, false) {
+            sent.store(false, Ordering::Release);
+        }
+        let guard = ConfigFlightGuard::acquire(&sent, in_flight);
+        assert!(guard.acquired);
     }
 
     #[tokio::test(start_paused = true)]

@@ -5,6 +5,8 @@
 <lint>
     <issue id="AndroidGradlePluginVersion" severity="ignore" />
     <issue id="UnsafeNativeCodeLocation">
-        <ignore path="src/main/assets/csqtt" />
+        <ignore path="src/main/assets/csqtt-linux-amd64" />
+        <ignore path="src/main/assets/csqtt-linux-arm64" />
+        <ignore path="src/main/assets/csqtt-linux-armv7" />
     </issue>
 </lint>

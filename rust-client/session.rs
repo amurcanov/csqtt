@@ -46,14 +46,13 @@ const SESSION_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 const DISCONNECT_SEND_TIMEOUT: Duration = Duration::from_millis(300);
 const DISCONNECT_ACK_TIMEOUT: Duration = Duration::from_millis(350);
 const DISCONNECT_CONTROL_ATTEMPTS: usize = 2;
-const WORKER_LATENCY_CAPACITY: usize = 16;
-const WORKER_PRIORITY_CAPACITY: usize = 24;
-const WORKER_BULK_CAPACITY: usize = 24;
+const WORKER_LATENCY_CAPACITY: usize = crate::striped_scheduler::SMALL_DATAGRAM_BATCH;
+const WORKER_PRIORITY_CAPACITY: usize = crate::striped_scheduler::MEDIUM_DATAGRAM_BATCH;
+const WORKER_BULK_CAPACITY: usize = crate::striped_scheduler::BULK_DATAGRAM_BATCH;
 const WRITER_COMMAND_CAPACITY: usize = 16;
-const WRITER_COMMAND_CHECK_PACKETS: usize = 8;
-const WRITER_LATENCY_BATCH_LIMIT: usize = 1;
-const WRITER_PRIORITY_BATCH_LIMIT: usize = WRITER_COMMAND_CHECK_PACKETS;
-const WRITER_BULK_BATCH_LIMIT: usize = WRITER_COMMAND_CHECK_PACKETS;
+const WRITER_LATENCY_BATCH_LIMIT: usize = crate::striped_scheduler::SMALL_DATAGRAM_BATCH;
+const WRITER_PRIORITY_BATCH_LIMIT: usize = crate::striped_scheduler::MEDIUM_DATAGRAM_BATCH;
+const WRITER_BULK_BATCH_LIMIT: usize = crate::striped_scheduler::BULK_DATAGRAM_BATCH;
 static NEXT_INCARNATION_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug)]
@@ -97,6 +96,7 @@ pub struct SessionConfig {
     pub wrap_key: [u8; 32],
     pub get_config: bool,
     pub desired_count: usize,
+    pub server_stream_repair: Arc<AtomicBool>,
     pub repair: Arc<RepairState>,
 }
 
@@ -105,7 +105,7 @@ pub struct SessionRuntime {
     pub pool: Arc<PacketPool>,
     pub stats: Arc<Stats>,
     pub events: Events,
-    pub config_tx: Option<mpsc::Sender<String>>,
+    pub config_tx: mpsc::Sender<String>,
     pub config_delivery: Option<ConfigDeliveryState>,
     pub cancel: CancellationToken,
     pub shutdown: Arc<ShutdownCoordinator>,
@@ -122,7 +122,7 @@ fn build_registration_payload(config: &SessionConfig) -> Bytes {
         config.generation,
         &config.salt,
         config.id,
-        config.desired_count,
+        Some(config.desired_count),
     ))
 }
 
@@ -187,6 +187,7 @@ struct ReaderRuntime {
     events: Events,
     repair: Arc<RepairState>,
     shutdown: Arc<ShutdownCoordinator>,
+    config_tx: mpsc::Sender<String>,
 }
 
 pub struct ShutdownCoordinator {
@@ -639,7 +640,7 @@ pub async fn run_session(
     mut runtime: SessionRuntime,
 ) -> Result<bool> {
     if credentials.server_addresses.is_empty() {
-        bail!("РЅРµС‚ TURN URL РІ СѓС‡РµС‚РЅС‹С… РґР°РЅРЅС‹С…");
+        bail!("нет TURN URL в учётных данных");
     }
     let turn_address = select_turn_address(&credentials.server_addresses, &config)?;
     let turn_path = turn_path_key(turn_address, &config)?;
@@ -677,11 +678,7 @@ pub async fn run_session(
     if let Some(ready) = runtime.allocation_ready.take() {
         let _ = ready.send(());
     }
-    crate::log_error!(
-        "[РЎР•РЎРЎР˜РЇ #{}] Relay: {}",
-        config.id,
-        allocation.local_addr()
-    );
+    crate::log_error!("[СЕССИЯ #{}] Relay: {}", config.id, allocation.local_addr());
     let channel = tokio::select! {
         biased;
         result = allocation.prepare_channel() => result,
@@ -692,7 +689,7 @@ pub async fn run_session(
     };
     if let Err(error) = channel {
         let _ = tokio::time::timeout(DEALLOCATE_TIMEOUT, allocation.deallocate()).await;
-        return Err(error.context("TURN ChannelBind РѕР±СЏР·Р°С‚РµР»РµРЅ"));
+        return Err(error.context("TURN ChannelBind обязателен"));
     }
     let session = tokio::spawn(run_allocated_session(
         config,
@@ -713,8 +710,8 @@ async fn await_session_task(
         biased;
         result = &mut session => match result {
             Ok(result) => result,
-            Err(error) if error.is_panic() => Err(anyhow!("РїР°РЅРёРєР° СЃРµСЃСЃРёРё РёР·РѕР»РёСЂРѕРІР°РЅР°: {error}")),
-            Err(error) => Err(anyhow!("Р·Р°РґР°С‡Р° СЃРµСЃСЃРёРё Р·Р°РІРµСЂС€РµРЅР° Р°РІР°СЂРёР№РЅРѕ: {error}")),
+            Err(error) if error.is_panic() => Err(anyhow!("паника сессии изолирована: {error}")),
+            Err(error) => Err(anyhow!("задача сессии завершена аварийно: {error}")),
         },
         _ = cancel.cancelled() => {
             match tokio::time::timeout(SESSION_SHUTDOWN_GRACE, &mut session).await {
@@ -744,7 +741,7 @@ async fn run_allocated_session(
     let session_cancel = CancellationToken::new();
     let turn_receiver = allocation.take_receiver()?;
     crate::log_error!(
-        "[РЎР•РЎРЎРРЇ #{}] [DIRECT] РџСЂСЏРјРѕР№ СЂРµР¶РёРј РѕР±С„СѓСЃРєР°С†РёРё ({:?})",
+        "[СЕССИЯ #{}] [DIRECT] Прямой режим обфускации ({:?})",
         config.id,
         config.mode
     );
@@ -757,7 +754,7 @@ async fn run_allocated_session(
     let mut writer_transport = TransportWriter::new(shared.clone());
     let mut reader_transport = TransportReader::new(shared, turn_receiver);
     let incarnation_id = NEXT_INCARNATION_ID.fetch_add(1, Ordering::Relaxed).max(1);
-    let config_tx = config.get_config.then_some(runtime.config_tx).flatten();
+    let config_tx = config.get_config.then(|| runtime.config_tx.clone());
     let config_delivered = match request_configuration(
         &mut writer_transport,
         &mut reader_transport,
@@ -803,10 +800,7 @@ async fn run_allocated_session(
     if let Some(ready_tx) = runtime.ready_tx.take() {
         let _ = ready_tx.send(());
     }
-    crate::log_error!(
-        "[Р’РћР РљР•Р  #{}] [READY] РџРѕС‚РѕРє РіРѕС‚РѕРІ вњ“",
-        config.id
-    );
+    crate::log_error!("[ВОРКЕР #{}] [READY] Поток готов ✓", config.id);
     runtime.events.ready(config.id);
     config.repair.mark_ready(config.id);
     let _active = ActiveConnection::new(runtime.stats.clone(), runtime.events.clone());
@@ -829,6 +823,7 @@ async fn run_allocated_session(
             events: runtime.events.clone(),
             repair: config.repair.clone(),
             shutdown: runtime.shutdown.clone(),
+            config_tx: runtime.config_tx.clone(),
         },
         session_cancel.clone(),
     ));
@@ -854,7 +849,7 @@ async fn run_allocated_session(
     };
     session_cancel.cancel();
     stop_session_tasks(completed, writer, reader).await;
-    crate::log_error!("[РЎР•РЎРЎРРЇ #{}] Р—Р°РІРµСЂС€РµРЅР°", config.id);
+    crate::log_error!("[СЕССИЯ #{}] Завершена", config.id);
     session_result?;
     Ok(config_delivered)
 }
@@ -894,13 +889,12 @@ async fn request_configuration(
         writer
             .send_bytes(request.as_ref())
             .await
-            .context("РѕС‚РїСЂР°РІРєР° GETCONF")?;
+            .context("отправка GETCONF")?;
         let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
         let packet = loop {
             match tokio::time::timeout_at(deadline, reader.recv()).await {
                 Ok(result) => {
-                    let packet =
-                        result.context("GETCONF С‡С‚РµРЅРёРµ РѕС‚РІРµС‚Р° РєРѕРЅС„РёРіР°")?;
+                    let packet = result.context("GETCONF чтение ответа конфига")?;
                     if is_panel_restart_notice(packet.as_slice()) {
                         events.panel_restart();
                         continue;
@@ -912,25 +906,42 @@ async fn request_configuration(
                 }
                 Err(_) if attempt + 1 < CONFIG_RESPONSE_TIMEOUT_MS.len() => continue 'attempts,
                 Err(_) => {
-                    bail!(
-                        "GETCONF С‡С‚РµРЅРёРµ РѕС‚РІРµС‚Р° РєРѕРЅС„РёРіР°: timeout РїРѕСЃР»Рµ {} РїРѕРїС‹С‚РѕРє",
+                    let message = format!(
+                        "FATAL_HANDSHAKE: сервер не подтвердил конфигурацию после {} попыток; проверьте пароль подключения и совместимость клиента с сервером",
                         CONFIG_RESPONSE_TIMEOUT_MS.len()
-                    )
+                    );
+                    if config.get_config {
+                        events.error("handshake_timeout", &message, true);
+                    }
+                    bail!(message)
                 }
             }
         };
-        match parse_config_response(packet.as_slice())? {
+        let response = parse_config_response(packet.as_slice()).inspect_err(|error| {
+            let message = error.to_string();
+            if config.get_config && message.contains("FATAL_") {
+                events.error("handshake_rejected", &message, true);
+            }
+        })?;
+        match response {
             ConfigResponse::NoConfig => return Ok(false),
             ConfigResponse::Config(value) => {
+                if value.ends_with(":stream-v1") || value.ends_with(":stream-v2") {
+                    config.server_stream_repair.store(true, Ordering::Release);
+                }
                 if let Some(sender) = &config_tx {
                     let _ = sender.try_send(value);
                 }
-                crate::log_error!("[Р’РћР РљР•Р  #{}] РљРѕРЅС„РёРі РїРѕР»СѓС‡РµРЅ", config.id);
+                crate::log_error!("[ВОРКЕР #{}] Конфиг получен", config.id);
                 return Ok(true);
             }
         }
     }
-    bail!("GETCONF РѕС‚РІРµС‚ РЅРµ РїРѕР»СѓС‡РµРЅ")
+    let message = "FATAL_HANDSHAKE: сервер не подтвердил конфигурацию";
+    if config.get_config {
+        events.error("handshake_timeout", message, true);
+    }
+    bail!(message)
 }
 
 async fn writer_loop(
@@ -967,11 +978,11 @@ async fn writer_loop(
                 }
                 packet = latency.recv(&cancel) => packet.map(|packet| WriterPacket {
                     packet,
-                    class: PacketClass::Latency,
+                    class: PacketClass::Small,
                 }),
                 packet = priority.recv(&cancel) => packet.map(|packet| WriterPacket {
                     packet,
-                    class: PacketClass::Priority,
+                    class: PacketClass::Medium,
                 }),
                 packet = bulk.recv(&cancel) => packet.map(|packet| WriterPacket {
                     packet,
@@ -1003,8 +1014,8 @@ async fn send_writer_batch(
 ) -> Result<usize> {
     client_perf::observe(PerfStage::WriterBatch);
     let (receiver, limit) = match first.class {
-        PacketClass::Latency => (latency, WRITER_LATENCY_BATCH_LIMIT),
-        PacketClass::Priority => (priority, WRITER_PRIORITY_BATCH_LIMIT),
+        PacketClass::Small => (latency, WRITER_LATENCY_BATCH_LIMIT),
+        PacketClass::Medium => (priority, WRITER_PRIORITY_BATCH_LIMIT),
         PacketClass::Bulk => (bulk, WRITER_BULK_BATCH_LIMIT),
     };
     transport.queue_data(first.packet);
@@ -1035,8 +1046,8 @@ fn writer_batch_can_extend(
     priority_pending: bool,
 ) -> bool {
     match class {
-        PacketClass::Latency => true,
-        PacketClass::Priority => !latency_pending,
+        PacketClass::Small => true,
+        PacketClass::Medium => !latency_pending,
         PacketClass::Bulk => !latency_pending && !priority_pending,
     }
 }
@@ -1074,12 +1085,12 @@ fn next_writer_packet(
         .try_recv()
         .map(|packet| WriterPacket {
             packet,
-            class: PacketClass::Latency,
+            class: PacketClass::Small,
         })
         .or_else(|| {
             priority.try_recv().map(|packet| WriterPacket {
                 packet,
-                class: PacketClass::Priority,
+                class: PacketClass::Medium,
             })
         })
         .or_else(|| {
@@ -1100,6 +1111,7 @@ async fn reader_loop(
         events,
         repair,
         shutdown,
+        config_tx,
     } = runtime;
     loop {
         let packet = tokio::select! {
@@ -1128,6 +1140,12 @@ async fn reader_loop(
             continue;
         }
         if shutdown.observe_control_response(packet.as_slice()) {
+            continue;
+        }
+        if packet.as_slice().starts_with(b"TUNCONF:") {
+            if let Ok(ConfigResponse::Config(config)) = parse_config_response(packet.as_slice()) {
+                let _ = config_tx.try_send(config);
+            }
             continue;
         }
         if is_control_response(packet.as_slice()) {
@@ -1210,11 +1228,39 @@ mod tests {
             wrap_key: [0; 32],
             get_config: false,
             desired_count: 18,
+            server_stream_repair: Arc::new(AtomicBool::new(false)),
             repair: RepairState::new(18),
         };
         assert_eq!(
             select_turn_address(&addresses, &config).unwrap(),
             "turn:relay.example:3478?transport=tcp"
+        );
+    }
+
+    #[test]
+    fn first_registration_announces_the_full_stream_set_before_the_feature_reply() {
+        let config = SessionConfig {
+            id: 1,
+            peer: "127.0.0.1:46000".parse().unwrap(),
+            turn_host: None,
+            turn_port: None,
+            turn_transport: TurnTransportMode::Udp,
+            local_port: Arc::from("9000"),
+            device_id: Arc::from("device"),
+            password: Arc::from("password"),
+            generation: 7,
+            turn_endpoint_cursor: 0,
+            salt: Arc::from("generation-id"),
+            mode: ObfsMode::Audio,
+            wrap_key: [0; 32],
+            get_config: true,
+            desired_count: 9,
+            server_stream_repair: Arc::new(AtomicBool::new(false)),
+            repair: RepairState::new(9),
+        };
+        assert_eq!(
+            build_registration_payload(&config).as_ref(),
+            b"GETCONF:9000|device|password|7|generation-id|1|9|CSQTT-WIRE-3"
         );
     }
 
@@ -1463,17 +1509,17 @@ mod tests {
         for _ in 0..160 {
             let packet = next_writer_packet(&latency, &priority, &bulk).unwrap();
             assert_eq!(packet.packet.as_slice()[0], 0);
-            assert_eq!(packet.class, PacketClass::Latency);
+            assert_eq!(packet.class, PacketClass::Small);
         }
         let packet = next_writer_packet(&latency, &priority, &bulk).unwrap();
         assert_eq!(packet.packet.as_slice()[0], 1);
-        assert_eq!(packet.class, PacketClass::Priority);
+        assert_eq!(packet.class, PacketClass::Medium);
         for _ in 1..160 {
             assert_eq!(
                 next_writer_packet(&latency, &priority, &bulk)
                     .unwrap()
                     .class,
-                PacketClass::Priority
+                PacketClass::Medium
             );
         }
         let packet = next_writer_packet(&latency, &priority, &bulk).unwrap();
@@ -1482,12 +1528,23 @@ mod tests {
     }
 
     #[test]
-    fn worker_queues_are_bounded_for_a_two_megabit_turn_path() {
+    fn worker_queues_hold_one_full_mmsg_batch_per_data_lane() {
         const TUN_MTU: u128 = 1_300;
         const BITS_PER_SECOND: u128 = 2_000_000;
         let buffered_us = WORKER_BULK_CAPACITY as u128 * TUN_MTU * 8 * 1_000_000 / BITS_PER_SECOND;
-        assert!(buffered_us <= 125_000);
-        assert_eq!(WORKER_BULK_CAPACITY, 24);
+        assert!(buffered_us <= 700_000);
+        assert_eq!(
+            WORKER_LATENCY_CAPACITY,
+            crate::striped_scheduler::SMALL_DATAGRAM_BATCH
+        );
+        assert_eq!(
+            WORKER_PRIORITY_CAPACITY,
+            crate::striped_scheduler::MEDIUM_DATAGRAM_BATCH
+        );
+        assert_eq!(
+            WORKER_BULK_CAPACITY,
+            crate::striped_scheduler::BULK_DATAGRAM_BATCH
+        );
     }
 
     #[test]
@@ -1521,14 +1578,25 @@ mod tests {
         }
         let packet = next_writer_packet(&latency, &priority, &bulk).unwrap();
         assert_eq!(packet.packet.as_slice()[0], 0);
-        assert_eq!(packet.class, PacketClass::Latency);
+        assert_eq!(packet.class, PacketClass::Small);
     }
 
     #[test]
     fn writer_batches_respect_priority_lanes() {
-        assert_eq!(WRITER_LATENCY_BATCH_LIMIT, 1);
-        assert!(writer_batch_can_extend(PacketClass::Priority, false, true));
-        assert!(!writer_batch_can_extend(PacketClass::Priority, true, false));
+        assert_eq!(
+            WRITER_LATENCY_BATCH_LIMIT,
+            crate::striped_scheduler::SMALL_DATAGRAM_BATCH
+        );
+        assert_eq!(
+            WRITER_PRIORITY_BATCH_LIMIT,
+            crate::striped_scheduler::MEDIUM_DATAGRAM_BATCH
+        );
+        assert_eq!(
+            WRITER_BULK_BATCH_LIMIT,
+            crate::striped_scheduler::BULK_DATAGRAM_BATCH
+        );
+        assert!(writer_batch_can_extend(PacketClass::Medium, false, true));
+        assert!(!writer_batch_can_extend(PacketClass::Medium, true, false));
         assert!(writer_batch_can_extend(PacketClass::Bulk, false, false));
         assert!(!writer_batch_can_extend(PacketClass::Bulk, true, false));
         assert!(!writer_batch_can_extend(PacketClass::Bulk, false, true));

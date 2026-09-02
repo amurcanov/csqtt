@@ -1,13 +1,7 @@
 // SPDX-FileCopyrightText: 2026 amurcanov
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 
-use crate::{
-    packet::extract_dst_ipv4,
-    striped_scheduler::{
-        BULK_STRIPE_PACKET_CHUNK, LATENCY_STRIPE_PACKET_CHUNK, PRIORITY_STRIPE_PACKET_CHUNK,
-        PacketClass,
-    },
-};
+use crate::{packet::extract_dst_ipv4, striped_scheduler::PacketClass};
 use std::net::Ipv4Addr;
 
 pub const TUN_IFACE: &str = "csqtt1";
@@ -39,17 +33,16 @@ impl RouteSelection {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 struct LocalStripeCursor {
     next: usize,
     remaining: usize,
+    count: usize,
 }
 
 #[derive(Default)]
 struct LocalStripedScheduler {
-    latency: LocalStripeCursor,
-    priority: LocalStripeCursor,
-    bulk: LocalStripeCursor,
+    cursors: [LocalStripeCursor; 3],
 }
 
 impl LocalStripedScheduler {
@@ -58,17 +51,14 @@ impl LocalStripedScheduler {
         if count == 0 {
             return None;
         }
-        let (cursor, chunk) = match class {
-            PacketClass::Latency => (&mut self.latency, LATENCY_STRIPE_PACKET_CHUNK),
-            PacketClass::Priority => (&mut self.priority, PRIORITY_STRIPE_PACKET_CHUNK),
-            PacketClass::Bulk => (&mut self.bulk, BULK_STRIPE_PACKET_CHUNK),
-        };
-        if cursor.next >= count {
+        let cursor = &mut self.cursors[class.index()];
+        if cursor.count != count {
             cursor.next = 0;
             cursor.remaining = 0;
+            cursor.count = count;
         }
         if cursor.remaining == 0 {
-            cursor.remaining = chunk;
+            cursor.remaining = class.stream_chunk();
         }
         let selected = cursor.next;
         cursor.remaining -= 1;
@@ -346,7 +336,7 @@ mod tests {
             assert!(table.register(ip(2), id, id, id as u16, id as usize));
         }
 
-        for _ in 0..crate::striped_scheduler::BULK_STRIPE_PACKET_CHUNK {
+        for _ in 0..crate::striped_scheduler::BULK_STREAM_STRIPE_PACKET_CHUNK {
             assert_eq!(table.select(ip(2), PacketClass::Bulk).unwrap().worker_id, 1);
         }
         assert_eq!(table.select(ip(2), PacketClass::Bulk).unwrap().worker_id, 2);
@@ -355,11 +345,13 @@ mod tests {
     #[test]
     fn local_scheduler_restarts_safely_after_path_count_shrinks() {
         let mut scheduler = LocalStripedScheduler::default();
-        assert_eq!(scheduler.select(3, PacketClass::Bulk), Some(0));
-        assert_eq!(scheduler.select(3, PacketClass::Bulk), Some(0));
+        for _ in 0..crate::striped_scheduler::BULK_STREAM_STRIPE_PACKET_CHUNK {
+            assert_eq!(scheduler.select(3, PacketClass::Bulk), Some(0));
+        }
         assert_eq!(scheduler.select(3, PacketClass::Bulk), Some(1));
-        assert_eq!(scheduler.select(2, PacketClass::Bulk), Some(0));
-        assert_eq!(scheduler.select(2, PacketClass::Bulk), Some(0));
+        for _ in 0..crate::striped_scheduler::BULK_STREAM_STRIPE_PACKET_CHUNK {
+            assert_eq!(scheduler.select(2, PacketClass::Bulk), Some(0));
+        }
         assert_eq!(scheduler.select(2, PacketClass::Bulk), Some(1));
     }
 
@@ -379,21 +371,33 @@ mod tests {
     }
 
     #[test]
-    fn latency_packets_round_robin_independently_from_bulk() {
+    fn packet_classes_keep_independent_round_robin_cursors() {
         let mut table = RouteTable::new();
         assert!(table.register(ip(2), 1, 1, 1, 1));
         assert!(table.register(ip(2), 2, 2, 2, 2));
 
-        for _ in 0..8 {
-            assert!(table.select(ip(2), PacketClass::Bulk).is_some());
+        for _ in 0..crate::striped_scheduler::BULK_STREAM_STRIPE_PACKET_CHUNK {
+            assert_eq!(table.select(ip(2), PacketClass::Bulk).unwrap().worker_id, 1);
         }
 
+        for _ in 0..crate::striped_scheduler::SMALL_STREAM_STRIPE_PACKET_CHUNK {
+            assert_eq!(
+                table.select(ip(2), PacketClass::Small).unwrap().worker_id,
+                1
+            );
+        }
         assert_eq!(
-            table.select(ip(2), PacketClass::Latency).unwrap().worker_id,
-            1
+            table.select(ip(2), PacketClass::Small).unwrap().worker_id,
+            2
         );
+        for _ in 0..crate::striped_scheduler::MEDIUM_STREAM_STRIPE_PACKET_CHUNK {
+            assert_eq!(
+                table.select(ip(2), PacketClass::Medium).unwrap().worker_id,
+                1
+            );
+        }
         assert_eq!(
-            table.select(ip(2), PacketClass::Latency).unwrap().worker_id,
+            table.select(ip(2), PacketClass::Medium).unwrap().worker_id,
             2
         );
     }

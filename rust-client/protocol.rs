@@ -3,6 +3,8 @@
 
 use anyhow::{Result, bail};
 
+use crate::wire_protocol::WIRE_PROTOCOL_REVISION;
+
 pub const PANEL_RESTART_NOTICE: &[u8] = b"\xffCSQTT_PANEL_RESTART_V1\x00\x91\x7d\x03\xa8";
 pub const STREAM_REPAIR_PREFIX: &[u8] = b"\xffCSQTT_STREAM_REPAIR_V1";
 pub const STREAM_ALIVE_PREFIX: &[u8] = b"\xffCSQTT_STREAM_ALIVE_V1";
@@ -28,10 +30,11 @@ pub fn config_request(
     generation_id: u64,
     salt: &str,
     worker_id: usize,
-    desired_count: usize,
+    desired_count: Option<usize>,
 ) -> String {
+    let desired_count = desired_count.map_or_else(String::new, |value| value.to_string());
     format!(
-        "GETCONF:{local_port}|{device_id}|{password}|{generation_id}|{salt}|{worker_id}|{desired_count}"
+        "GETCONF:{local_port}|{device_id}|{password}|{generation_id}|{salt}|{worker_id}|{desired_count}|{WIRE_PROTOCOL_REVISION}"
     )
 }
 
@@ -47,6 +50,9 @@ pub fn parse_config_response(response: &[u8]) -> Result<ConfigResponse> {
             "device_mismatch" => {
                 bail!("FATAL_AUTH: пароль привязан к другому устройству")
             }
+            "protocol_mismatch" | "invalid_worker_count" => bail!(
+                "FATAL_PROTOCOL: клиент и сервер используют разные версии протокола; выполните деплой из этой версии приложения"
+            ),
             _ => bail!("FATAL_AUTH: доступ запрещён ({reason})"),
         }
     }
@@ -137,8 +143,12 @@ mod tests {
     #[test]
     fn request_matches_go_contract() {
         assert_eq!(
-            config_request("9000", "device", "password", 7, "salt", 4, 36),
-            "GETCONF:9000|device|password|7|salt|4|36"
+            config_request("9000", "device", "password", 7, "salt", 4, None),
+            "GETCONF:9000|device|password|7|salt|4||CSQTT-WIRE-3"
+        );
+        assert_eq!(
+            config_request("9000", "device", "password", 7, "salt", 4, Some(36)),
+            "GETCONF:9000|device|password|7|salt|4|36|CSQTT-WIRE-3"
         );
     }
 
@@ -153,6 +163,12 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("FATAL_AUTH")
+        );
+        assert!(
+            parse_config_response(b"DENIED:protocol_mismatch")
+                .unwrap_err()
+                .to_string()
+                .contains("FATAL_PROTOCOL")
         );
     }
 

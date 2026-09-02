@@ -69,8 +69,8 @@ android {
         applicationId = "csqtt.quic.amurcanov"
         minSdk = 26
         targetSdk = 37
-        versionCode = 215
-        versionName = "2.1.5"
+        versionCode = 221
+        versionName = "2.1.9"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -78,7 +78,7 @@ android {
         }
 
         ndk {
-            abiFilters.addAll(listOf("arm64-v8a", "armeabi-v7a"))
+            abiFilters.addAll(listOf("arm64-v8a", "armeabi-v7a", "x86_64"))
         }
     }
 
@@ -86,7 +86,7 @@ android {
         abi {
             isEnable = true
             reset()
-            include("arm64-v8a", "armeabi-v7a")
+            include("arm64-v8a", "armeabi-v7a", "x86_64")
             isUniversalApk = true
         }
     }
@@ -130,6 +130,8 @@ android {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
             excludes += "/META-INF/INDEX.LIST"
             excludes += "/META-INF/DEPENDENCIES"
+            excludes += "/META-INF/LICENSE.md"
+            excludes += "/META-INF/NOTICE.md"
         }
     }
 
@@ -173,7 +175,7 @@ tasks.configureEach {
 
 dependencies {
     implementation("androidx.core:core-ktx:1.19.0")
-    implementation(platform("androidx.compose:compose-bom:2026.06.01"))
+    implementation(platform("androidx.compose:compose-bom:2026.08.00"))
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.ui:ui-graphics")
     implementation("androidx.compose.ui:ui-tooling-preview")
@@ -189,17 +191,18 @@ dependencies {
         exclude(group = "org.bouncycastle", module = "bcpkix-jdk18on")
         exclude(group = "org.bouncycastle", module = "bcutil-jdk18on")
     }
-    implementation("org.bouncycastle:bcprov-jdk15to18:1.78.1")
-    implementation("org.bouncycastle:bcpkix-jdk15to18:1.78.1")
+    implementation("org.bouncycastle:bcprov-jdk18on:1.85")
+    implementation("org.bouncycastle:bcpkix-jdk18on:1.85")
+    implementation("org.bouncycastle:bcutil-jdk18on:1.85")
 
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.11.0")
     testImplementation("org.mockito:mockito-core:5.23.0")
-    testImplementation("org.json:json:20260719")
+    testImplementation("org.json:json:20260814")
 
     androidTestImplementation("androidx.test.ext:junit:1.3.0")
     androidTestImplementation("androidx.test.espresso:espresso-core:3.7.0")
-    androidTestImplementation(platform("androidx.compose:compose-bom:2026.06.01"))
+    androidTestImplementation(platform("androidx.compose:compose-bom:2026.08.00"))
     androidTestImplementation("androidx.compose.ui:ui-test-junit4")
     debugImplementation("androidx.compose.ui:ui-test-manifest")
 }

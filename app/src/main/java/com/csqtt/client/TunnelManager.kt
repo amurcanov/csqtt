@@ -57,6 +57,23 @@ internal fun displayVkHash(hash: String): String = hash.trim().let { value ->
     if (value.length <= 10) value else value.take(10) + "…"
 }
 
+internal fun dnsProfileName(dns: String): String = when (dns.trim()) {
+    "77.88.8.8,77.88.8.1" -> "Yandex DNS"
+    "1.1.1.1,1.0.0.1" -> "Cloudflare DNS"
+    "8.8.8.8,8.8.4.4" -> "Google DNS"
+    "94.140.14.14,94.140.15.14" -> "AdGuard DNS"
+    "111.88.96.50,111.88.96.51" -> "Xbox DNS"
+    "83.220.169.155,212.109.195.93" -> "Comms DNS"
+    "95.182.120.241,37.230.192.51" -> "Geohide DNS"
+    "9.9.9.9,149.112.112.112" -> "Quad9 DNS"
+    "208.67.222.222,208.67.220.220" -> "OpenDNS"
+    "95.189.32.74,195.208.5.1" -> "Rostelecom DNS"
+    "45.90.28.181,45.90.30.181" -> "NextDNS"
+    "195.208.6.1,195.208.7.1" -> "BI.ZONE DNS"
+    "195.208.4.1,195.208.5.1" -> "НСДИ DNS"
+    else -> "Пользовательский DNS"
+}
+
 internal fun withoutLogStickers(message: String): String = message
     .replace(LOG_STICKERS) { symbol ->
         symbol.value.takeIf { it == "✓" || it == "✗" }.orEmpty()
@@ -85,14 +102,11 @@ object TunnelManager {
     private var workerRecoveryJob: Job? = null
     private val transportRestartPending = AtomicBoolean(false)
     private val panelRestartPending = AtomicBoolean(false)
-    // A server restart can carry a changed TUNCONF DNS while the Android VPN
-    // interface is still alive. Rebuild that interface once the replacement
-    // client returns its configuration instead of merely re-sending its FD.
-    private val vpnRebuildAfterPanelRestart = AtomicBoolean(false)
     private val callRecoveryPending = AtomicBoolean(false)
     private val workerRecoveryPolicy = WorkerRecoveryPolicy()
     private var crashRestartStreak = 0
     private const val WORKER_ZERO_CONFIRMATION_MS = 4_000L
+    private const val PANEL_SERVER_RESTART_DELAY_MS = 4_000L
     private const val STARTUP_DIAGNOSTIC_MS = 30_000L
     // A process that lived shorter than this counts toward the crash-loop
     // backoff; a longer-lived run resets it.
@@ -267,8 +281,16 @@ object TunnelManager {
         }
     }
 
-    fun onVpnInterfaceReady() {
+    fun onVpnInterfaceReady(dns: String? = null) {
         vpnReady.value = true
+        if (!dns.isNullOrBlank()) {
+            updateLog(
+                key = "vpn_dns_active_${dnsProfileName(dns)}",
+                message = "[SERVER] DNS применён: ${dnsProfileName(dns)} ✓",
+                priority = 32,
+                level = LogLevel.OK,
+            )
+        }
     }
 
     fun onVpnInterfaceStopped() {
@@ -353,11 +375,7 @@ object TunnelManager {
                     activeScope.launch(Dispatchers.Main) {
                         if (!isCurrent(identity)) return@launch
                         if (configStr.startsWith("TUNCONF:")) {
-                            ensureVpnStarted(
-                                configStr,
-                                identity,
-                                forceRebuild = vpnRebuildAfterPanelRestart.getAndSet(false),
-                            )
+                            ensureVpnStarted(configStr, identity)
                         } else {
                             updateProcessLog(identity, "vpn_config_err", "Получен неизвестный формат конфига", 99, true)
                         }
@@ -530,12 +548,11 @@ object TunnelManager {
     private fun schedulePanelServerRestart(identity: ProcessIdentity) {
         if (!isCurrent(identity) || !running.value) return
         if (!panelRestartPending.compareAndSet(false, true)) return
-        vpnRebuildAfterPanelRestart.set(true)
         resetWorkerRecoveryState()
         panelRestartJob?.cancel()
         panelRestartJob = activeScope.launch {
             try {
-                delay(3_000L)
+                delay(PANEL_SERVER_RESTART_DELAY_MS)
                 if (!isCurrent(identity) || !running.value) return@launch
                 val context = activeContext() ?: return@launch
                 requestTransportRestart(
@@ -710,7 +727,7 @@ object TunnelManager {
         level: LogLevel?,
     ) {
         if (identity != null && !isCurrent(identity)) return
-        if (!isLoggingEnabled) return
+        if (!isLoggingEnabled && !TunnelLogPolicy.isAllowedWhenInactiveLogging(key, isError, level)) return
         val cleanMessage = withoutLogStickers(message).take(MAX_LOG_MESSAGE_LENGTH)
         if (cleanMessage.isEmpty()) return
         val pendingKey = "${identity?.generation ?: 0L}:$key:$priority:$isError:${level?.name.orEmpty()}"
@@ -1066,7 +1083,7 @@ object TunnelManager {
 
                     if (!isLoggingEnabled &&
                         !lineTrim.startsWith("CAPTCHA_SOLVE|") &&
-                        !lineTrim.contains("FATAL_AUTH")
+                        !lineTrim.contains("FATAL_")
                     ) {
                         return@forEachLine
                     }
@@ -1121,6 +1138,22 @@ object TunnelManager {
                         return@forEachLine
                     }
 
+                    if (lineTrim.contains("FATAL_PROTOCOL")) {
+                        handleCriticalError(
+                            "🔁 Клиент и сервер используют разные версии протокола. Выполните деплой из этой версии приложения. Воркеры остановлены.",
+                            identity,
+                        )
+                        return@forEachLine
+                    }
+
+                    if (lineTrim.contains("FATAL_HANDSHAKE")) {
+                        handleCriticalError(
+                            "🔐 Сервер не подтвердил подключение. Проверьте пароль туннеля и совместимость клиента с сервером. Воркеры остановлены.",
+                            identity,
+                        )
+                        return@forEachLine
+                    }
+
                     if (lineTrim.startsWith("CAPTCHA_SOLVE|")) {
                         val payload = lineTrim.substringAfter("CAPTCHA_SOLVE|")
                         val parts = payload.split("|", limit = 3)
@@ -1153,7 +1186,7 @@ object TunnelManager {
 
                     // Computed this late so early-returning lines (events,
                     // recovery noise, WRAP/CAPTCHA) skip the six scans.
-                    val isError = lineTrim.contains("Ошибка", true) || lineTrim.contains("error", true) || lineTrim.contains("FAIL", true) || lineTrim.contains("timeout", true) || lineTrim.contains("refused", true) || lineTrim.contains("FATAL_AUTH", true)
+                    val isError = lineTrim.contains("Ошибка", true) || lineTrim.contains("error", true) || lineTrim.contains("FAIL", true) || lineTrim.contains("timeout", true) || lineTrim.contains("refused", true) || lineTrim.contains("FATAL_", true)
 
                     when {
                         lineTrim.contains("[КАПЧА] AUTO:") -> {
@@ -1399,7 +1432,7 @@ object TunnelManager {
         val nextGen = store.reserveConnectionGeneration(proposed = proposed)
         return copy(
             generationId = nextGen,
-            sessionSalt = java.util.UUID.randomUUID().toString().replace("-", ""),
+            sessionSalt = newTunnelSessionId(),
         )
     }
 
@@ -1501,7 +1534,6 @@ object TunnelManager {
         panelRestartJob?.cancel()
         panelRestartJob = null
         panelRestartPending.set(false)
-        vpnRebuildAfterPanelRestart.set(false)
         transportRestartPending.set(false)
         activeContext()?.let { ctx ->
             val stopIntent = Intent(ctx, TunVpnService::class.java).apply { action = "STOP" }

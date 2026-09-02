@@ -3,15 +3,41 @@
 
 use super::*;
 use crate::stun_codec::{Class as StunClass, Message as StunMessage};
+use crate::{
+    auth::TurnCredentials,
+    dispatcher::Dispatcher,
+    events::Events,
+    obfs::ObfsMode,
+    repair::RepairState,
+    session::{
+        ConfigDeliveryState, SessionConfig, SessionRuntime, ShutdownCoordinator, run_session,
+    },
+    stats::Stats,
+    wrap::derive_wrap_key,
+};
 use hmac::{Hmac, Mac};
 use md5::{Digest, Md5};
 use sha1::Sha1;
+#[cfg(unix)]
+use std::collections::VecDeque;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
+#[cfg(unix)]
+use std::{
+    fs::File,
+    os::{
+        fd::{FromRawFd, IntoRawFd},
+        unix::net::UnixDatagram as StdUnixDatagram,
+    },
+};
 use tokio::sync::oneshot;
+#[cfg(unix)]
+use tokio::time::Instant;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream, UdpSocket},
 };
+use tokio_util::sync::CancellationToken;
 
 const STUN_COOKIE: u32 = 0x2112_a442;
 const ALLOCATE_REQUEST: u16 = 0x0003;
@@ -951,5 +977,1154 @@ async fn cancelled_before_first_control_send_never_creates_allocation() {
         tokio::time::timeout(Duration::from_millis(200), server.recv_from(&mut wire))
             .await
             .is_err()
+    );
+}
+
+fn parse_channel_payload(wire: &[u8], channel: u16) -> Option<&[u8]> {
+    if wire.len() < 4 || u16::from_be_bytes([wire[0], wire[1]]) != channel {
+        return None;
+    }
+    let payload_len = usize::from(u16::from_be_bytes([wire[2], wire[3]]));
+    let end = 4usize.checked_add(payload_len)?;
+    (end <= wire.len()).then_some(&wire[4..end])
+}
+
+async fn relay_bound_turn_channel_to_peer(
+    relay: Arc<UdpSocket>,
+    peer: SocketAddr,
+    stop: CancellationToken,
+) {
+    let relay_address = SocketAddr::from(([127, 0, 0, 1], relay.local_addr().unwrap().port()));
+    let client = receive_challenged_allocate(&relay, relay_address).await;
+    receive_create_permission(&relay, client, peer).await;
+
+    let (channel_wire, channel_client) = recv_datagram(&relay).await;
+    assert_eq!(channel_client, client);
+    let channel_request = assert_authenticated_request(&channel_wire, CHANNEL_BIND_REQUEST);
+    let channel = channel_number(&channel_request);
+    let encoded_peer = channel_request.attribute(ATTR_XOR_PEER_ADDRESS).unwrap();
+    assert_eq!(
+        decode_xor_address(encoded_peer.value, &channel_request.transaction()),
+        peer
+    );
+    relay
+        .send_to(
+            &empty_authenticated_success(CHANNEL_BIND_SUCCESS, channel_request.transaction()),
+            client,
+        )
+        .await
+        .unwrap();
+
+    let mut buffer = [0u8; 65_535];
+    loop {
+        tokio::select! {
+            _ = stop.cancelled() => return,
+            received = relay.recv_from(&mut buffer) => {
+                let (length, source) = received.unwrap();
+                let wire = &buffer[..length];
+                if source == client {
+                    if let Some(payload) = parse_channel_payload(wire, channel) {
+                        relay.send_to(payload, peer).await.unwrap();
+                        continue;
+                    }
+                    let control = assert_authenticated_request(wire, REFRESH_REQUEST);
+                    assert_eq!(attribute_u32(&control, ATTR_LIFETIME), 0);
+                    relay
+                        .send_to(&refresh_zero_success(control.transaction()), client)
+                        .await
+                        .unwrap();
+                } else if source == peer {
+                    relay.send_to(&channel_data(channel, wire), client).await.unwrap();
+                }
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+struct LimitedRelayMeter {
+    upstream_bytes: AtomicU64,
+    downstream_bytes: AtomicU64,
+}
+
+#[cfg(unix)]
+struct LimitedRelayRuntime {
+    endpoints: Vec<Arc<str>>,
+    meters: Vec<Arc<LimitedRelayMeter>>,
+    stop: CancellationToken,
+    task: std::thread::JoinHandle<f64>,
+}
+
+#[cfg(unix)]
+impl LimitedRelayRuntime {
+    fn stop(self) -> f64 {
+        self.stop.cancel();
+        self.task
+            .join()
+            .expect("the limited relay runtime panicked")
+    }
+}
+
+#[cfg(unix)]
+struct StreamRateLimiter {
+    available_bits: u128,
+    last_refill: Instant,
+    bits_per_second: u64,
+    maximum_bits: u128,
+}
+
+#[cfg(unix)]
+impl StreamRateLimiter {
+    fn new(bits_per_second: u64) -> Self {
+        Self {
+            available_bits: 0,
+            last_refill: Instant::now(),
+            bits_per_second,
+            maximum_bits: u128::from(bits_per_second) / 4,
+        }
+    }
+
+    fn refill(&mut self, now: Instant) {
+        let elapsed = now.saturating_duration_since(self.last_refill);
+        let added = elapsed
+            .as_nanos()
+            .saturating_mul(u128::from(self.bits_per_second))
+            / 1_000_000_000;
+        self.available_bits = self
+            .available_bits
+            .saturating_add(added)
+            .min(self.maximum_bits);
+        self.last_refill = now;
+    }
+
+    fn try_take(&mut self, bytes: usize, now: Instant) -> bool {
+        self.refill(now);
+        let required = (bytes as u128).saturating_mul(8);
+        if self.available_bits < required {
+            return false;
+        }
+        self.available_bits -= required;
+        true
+    }
+
+    fn ready_at(&mut self, bytes: usize, now: Instant) -> Instant {
+        self.refill(now);
+        let required = (bytes as u128).saturating_mul(8);
+        if self.available_bits >= required {
+            return now;
+        }
+        let wait_ns = required
+            .saturating_sub(self.available_bits)
+            .saturating_mul(1_000_000_000)
+            .div_ceil(u128::from(self.bits_per_second))
+            .max(1);
+        now.checked_add(std::time::Duration::from_nanos(
+            wait_ns.min(u128::from(u64::MAX)) as u64,
+        ))
+        .unwrap_or(now)
+    }
+}
+
+#[cfg(unix)]
+async fn flush_limited_relay_queue(
+    queue: &mut VecDeque<Vec<u8>>,
+    limiter: &mut StreamRateLimiter,
+    relay: &UdpSocket,
+    destination: SocketAddr,
+    counter: &AtomicU64,
+) {
+    while let Some(payload) = queue.front() {
+        if !limiter.try_take(payload.len(), Instant::now()) {
+            return;
+        }
+        let payload = queue.pop_front().expect("the queued packet disappeared");
+        relay.send_to(&payload, destination).await.unwrap();
+        counter.fetch_add(payload.len() as u64, Ordering::Relaxed);
+    }
+}
+
+#[cfg(unix)]
+fn next_limited_relay_deadline(
+    queue: &VecDeque<Vec<u8>>,
+    limiter: &mut StreamRateLimiter,
+    now: Instant,
+) -> Option<Instant> {
+    queue
+        .front()
+        .map(|payload| limiter.ready_at(payload.len(), now))
+}
+
+#[cfg(unix)]
+fn enqueue_limited_relay_packet(queue: &mut VecDeque<Vec<u8>>, packet: Vec<u8>) {
+    const LIMITED_RELAY_QUEUE_CAPACITY: usize = 256;
+    assert!(
+        queue.len() < LIMITED_RELAY_QUEUE_CAPACITY,
+        "a per-stream TURN limiter queue overflowed"
+    );
+    queue.push_back(packet);
+}
+
+#[cfg(unix)]
+async fn relay_limited_turn_channel_to_peer(
+    relay: Arc<UdpSocket>,
+    peer: SocketAddr,
+    bits_per_second: u64,
+    meter: Arc<LimitedRelayMeter>,
+    stop: CancellationToken,
+) {
+    let relay_address = SocketAddr::from(([127, 0, 0, 1], relay.local_addr().unwrap().port()));
+    let client = receive_challenged_allocate(&relay, relay_address).await;
+    receive_create_permission(&relay, client, peer).await;
+
+    let (channel_wire, channel_client) = recv_datagram(&relay).await;
+    assert_eq!(channel_client, client);
+    let channel_request = assert_authenticated_request(&channel_wire, CHANNEL_BIND_REQUEST);
+    let channel = channel_number(&channel_request);
+    let encoded_peer = channel_request.attribute(ATTR_XOR_PEER_ADDRESS).unwrap();
+    assert_eq!(
+        decode_xor_address(encoded_peer.value, &channel_request.transaction()),
+        peer
+    );
+    relay
+        .send_to(
+            &empty_authenticated_success(CHANNEL_BIND_SUCCESS, channel_request.transaction()),
+            client,
+        )
+        .await
+        .unwrap();
+
+    let mut upstream = StreamRateLimiter::new(bits_per_second);
+    let mut downstream = StreamRateLimiter::new(bits_per_second);
+    let mut upstream_queue = VecDeque::with_capacity(256);
+    let mut downstream_queue = VecDeque::with_capacity(256);
+    let mut buffer = [0u8; 65_535];
+    loop {
+        flush_limited_relay_queue(
+            &mut upstream_queue,
+            &mut upstream,
+            &relay,
+            peer,
+            &meter.upstream_bytes,
+        )
+        .await;
+        flush_limited_relay_queue(
+            &mut downstream_queue,
+            &mut downstream,
+            &relay,
+            client,
+            &meter.downstream_bytes,
+        )
+        .await;
+
+        let now = Instant::now();
+        let deadline = [
+            next_limited_relay_deadline(&upstream_queue, &mut upstream, now),
+            next_limited_relay_deadline(&downstream_queue, &mut downstream, now),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
+        let received = match deadline {
+            Some(deadline) => tokio::select! {
+                _ = stop.cancelled() => return,
+                result = relay.recv_from(&mut buffer) => result.unwrap(),
+                _ = tokio::time::sleep_until(deadline) => continue,
+            },
+            None => tokio::select! {
+                _ = stop.cancelled() => return,
+                result = relay.recv_from(&mut buffer) => result.unwrap(),
+            },
+        };
+        let (length, source) = received;
+        let wire = &buffer[..length];
+        if source == client {
+            if let Some(payload) = parse_channel_payload(wire, channel) {
+                enqueue_limited_relay_packet(&mut upstream_queue, payload.to_vec());
+                continue;
+            }
+            let control = assert_authenticated_request(wire, REFRESH_REQUEST);
+            assert_eq!(attribute_u32(&control, ATTR_LIFETIME), 0);
+            relay
+                .send_to(&refresh_zero_success(control.transaction()), client)
+                .await
+                .unwrap();
+        } else if source == peer {
+            enqueue_limited_relay_packet(&mut downstream_queue, channel_data(channel, wire));
+        }
+    }
+}
+
+#[cfg(unix)]
+fn start_limited_relay_runtime(
+    peer: SocketAddr,
+    workers: usize,
+    bits_per_second: u64,
+) -> LimitedRelayRuntime {
+    let stop = CancellationToken::new();
+    let runtime_stop = stop.clone();
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+    let task = std::thread::Builder::new()
+        .name("csqtt-e2e-relay".to_owned())
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("could not create the limited relay runtime");
+            runtime.block_on(async move {
+                let mut relays = Vec::with_capacity(workers);
+                let mut endpoints = Vec::with_capacity(workers);
+                let mut meters = Vec::with_capacity(workers);
+                for _ in 0..workers {
+                    let relay = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+                    endpoints.push(Arc::from(format!(
+                        "turn:127.0.0.1:{}?transport=udp",
+                        relay.local_addr().unwrap().port()
+                    )));
+                    meters.push(Arc::new(LimitedRelayMeter {
+                        upstream_bytes: AtomicU64::new(0),
+                        downstream_bytes: AtomicU64::new(0),
+                    }));
+                    relays.push(relay);
+                }
+                ready_tx.send((endpoints, meters.clone())).unwrap();
+                let cpu_start = e2e_thread_cpu_seconds();
+                let relay_tasks: Vec<_> = relays
+                    .into_iter()
+                    .zip(meters)
+                    .map(|(relay, meter)| {
+                        tokio::spawn(relay_limited_turn_channel_to_peer(
+                            relay,
+                            peer,
+                            bits_per_second,
+                            meter,
+                            runtime_stop.clone(),
+                        ))
+                    })
+                    .collect();
+                runtime_stop.cancelled().await;
+                for relay_task in relay_tasks {
+                    tokio::time::timeout(Duration::from_secs(5), relay_task)
+                        .await
+                        .expect("a limited relay did not stop")
+                        .expect("a limited relay panicked");
+                }
+                (e2e_thread_cpu_seconds() - cpu_start).max(0.0)
+            })
+        })
+        .expect("could not spawn the limited relay runtime");
+    let (endpoints, meters) = ready_rx
+        .recv()
+        .expect("the limited relay runtime did not initialize");
+    LimitedRelayRuntime {
+        endpoints,
+        meters,
+        stop,
+        task,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a separately started CSQTT WSL server and CSQTT_E2E_PEER"]
+async fn windows_client_reaches_wsl_server_through_a_real_turn_channel_and_dispatcher() {
+    let peer: SocketAddr = std::env::var("CSQTT_E2E_PEER")
+        .expect("CSQTT_E2E_PEER is required")
+        .parse()
+        .expect("CSQTT_E2E_PEER must be an IP:port socket address");
+    let relay = Arc::new(UdpSocket::bind("0.0.0.0:0").await.unwrap());
+    let endpoint = format!(
+        "turn:127.0.0.1:{}?transport=udp",
+        relay.local_addr().unwrap().port()
+    );
+    let relay_stop = CancellationToken::new();
+    let relay_task = tokio::spawn(relay_bound_turn_channel_to_peer(
+        relay,
+        peer,
+        relay_stop.clone(),
+    ));
+
+    let cancel = CancellationToken::new();
+    let pool = PacketPool::new(96);
+    let stats = Arc::new(Stats::default());
+    let (dispatcher, local_port) = Dispatcher::start(
+        "127.0.0.1:0",
+        None,
+        pool.clone(),
+        stats.clone(),
+        cancel.clone(),
+    )
+    .await
+    .unwrap();
+    let password: Arc<str> = Arc::from("e2e-local-password-20260830");
+    let device_id: Arc<str> = Arc::from("e2e-windows-client");
+    let (config_tx, mut config_rx) = tokio::sync::mpsc::channel(1);
+    let delivered = Arc::new(AtomicBool::new(false));
+    let in_flight = Arc::new(AtomicBool::new(true));
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let session = tokio::spawn(run_session(
+        SessionConfig {
+            id: 1,
+            peer,
+            turn_host: None,
+            turn_port: None,
+            turn_transport: TurnTransportMode::Udp,
+            local_port: Arc::from(local_port),
+            device_id: device_id.clone(),
+            password: password.clone(),
+            generation: 20_260_830,
+            turn_endpoint_cursor: 0,
+            salt: Arc::from("e2e-windows-generation"),
+            mode: ObfsMode::Audio,
+            wrap_key: derive_wrap_key(&password).unwrap(),
+            get_config: true,
+            desired_count: 9,
+            server_stream_repair: Arc::new(AtomicBool::new(false)),
+            repair: RepairState::new(9),
+        },
+        TurnCredentials {
+            username: Arc::from(USERNAME),
+            password: Arc::from(PASSWORD),
+            server_addresses: vec![Arc::from(endpoint)].into(),
+        },
+        SessionRuntime {
+            dispatcher: dispatcher.clone(),
+            pool,
+            stats,
+            events: Events::new(false),
+            config_tx,
+            config_delivery: Some(ConfigDeliveryState {
+                sent: delivered.clone(),
+                in_flight: in_flight.clone(),
+            }),
+            cancel: cancel.clone(),
+            shutdown: Arc::new(ShutdownCoordinator::new()),
+            ready_tx: Some(ready_tx),
+            allocation_started: None,
+            allocation_ready: None,
+        },
+    ));
+
+    let configuration = tokio::time::timeout(Duration::from_secs(12), config_rx.recv())
+        .await
+        .expect("the client did not receive TUNCONF from the WSL server")
+        .expect("the configuration channel was closed");
+    assert!(configuration.starts_with("TUNCONF:"), "{configuration}");
+    tokio::time::timeout(Duration::from_secs(3), ready_rx)
+        .await
+        .expect("the dispatcher was not registered")
+        .expect("the ready signal was dropped");
+    assert!(delivered.load(Ordering::Acquire));
+    assert!(!in_flight.load(Ordering::Acquire));
+    assert_eq!(dispatcher.active_count(), 1);
+
+    cancel.cancel();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(6), session)
+            .await
+            .expect("the client session did not stop")
+            .expect("the client session panicked")
+            .expect("the client session returned an error")
+    );
+    dispatcher.shutdown().await;
+    relay_stop.cancel();
+    tokio::time::timeout(Duration::from_secs(3), relay_task)
+        .await
+        .expect("the local TURN relay did not stop")
+        .expect("the local TURN relay panicked");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a separately started CSQTT WSL server, CSQTT_E2E_PEER, and CSQTT_E2E_WEB"]
+async fn running_client_receives_hot_dns_configuration_without_reconnect() {
+    let peer: SocketAddr = std::env::var("CSQTT_E2E_PEER")
+        .expect("CSQTT_E2E_PEER is required")
+        .parse()
+        .expect("CSQTT_E2E_PEER must be an IP:port socket address");
+    let web_url = std::env::var("CSQTT_E2E_WEB").expect("CSQTT_E2E_WEB is required");
+    let relay = Arc::new(UdpSocket::bind("0.0.0.0:0").await.unwrap());
+    let endpoint = format!(
+        "turn:127.0.0.1:{}?transport=udp",
+        relay.local_addr().unwrap().port()
+    );
+    let relay_stop = CancellationToken::new();
+    let relay_task = tokio::spawn(relay_bound_turn_channel_to_peer(
+        relay,
+        peer,
+        relay_stop.clone(),
+    ));
+    let cancel = CancellationToken::new();
+    let pool = PacketPool::new(96);
+    let stats = Arc::new(Stats::default());
+    let (dispatcher, local_port) = Dispatcher::start(
+        "127.0.0.1:0",
+        None,
+        pool.clone(),
+        stats.clone(),
+        cancel.clone(),
+    )
+    .await
+    .unwrap();
+    let password: Arc<str> = Arc::from("e2e-local-password-20260830");
+    let (config_tx, mut config_rx) = tokio::sync::mpsc::channel(4);
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let session = tokio::spawn(run_session(
+        SessionConfig {
+            id: 1,
+            peer,
+            turn_host: None,
+            turn_port: None,
+            turn_transport: TurnTransportMode::Udp,
+            local_port: Arc::from(local_port),
+            device_id: Arc::from("e2e-windows-client"),
+            password: password.clone(),
+            generation: 20_260_830,
+            turn_endpoint_cursor: 0,
+            salt: Arc::from("e2e-windows-generation"),
+            mode: ObfsMode::Audio,
+            wrap_key: derive_wrap_key(&password).unwrap(),
+            get_config: true,
+            desired_count: 1,
+            server_stream_repair: Arc::new(AtomicBool::new(false)),
+            repair: RepairState::new(1),
+        },
+        TurnCredentials {
+            username: Arc::from(USERNAME),
+            password: Arc::from(PASSWORD),
+            server_addresses: vec![Arc::from(endpoint)].into(),
+        },
+        SessionRuntime {
+            dispatcher: dispatcher.clone(),
+            pool,
+            stats,
+            events: Events::new(false),
+            config_tx,
+            config_delivery: Some(ConfigDeliveryState {
+                sent: Arc::new(AtomicBool::new(false)),
+                in_flight: Arc::new(AtomicBool::new(true)),
+            }),
+            cancel: cancel.clone(),
+            shutdown: Arc::new(ShutdownCoordinator::new()),
+            ready_tx: Some(ready_tx),
+            allocation_started: None,
+            allocation_ready: None,
+        },
+    ));
+
+    let initial = tokio::time::timeout(Duration::from_secs(12), config_rx.recv())
+        .await
+        .expect("the client did not receive its initial TUNCONF")
+        .expect("the configuration channel was closed");
+    assert!(initial.starts_with("TUNCONF:"), "{initial}");
+    tokio::time::timeout(Duration::from_secs(3), ready_rx)
+        .await
+        .expect("the dispatcher was not registered")
+        .expect("the ready signal was dropped");
+    let (dns_provider, expected_dns) = if initial.contains(":8.8.8.8,8.8.4.4:") {
+        ("yandex", "77.88.8.8,77.88.8.1")
+    } else {
+        ("google", "8.8.8.8,8.8.4.4")
+    };
+    apply_e2e_dns(&web_url, dns_provider);
+    let changed = tokio::time::timeout(Duration::from_secs(12), config_rx.recv())
+        .await
+        .expect("the running client did not receive hot TUNCONF")
+        .expect("the configuration channel was closed");
+    assert!(
+        changed.contains(&format!(":{expected_dns}:")),
+        "unexpected hot DNS configuration: {changed}"
+    );
+    assert_eq!(dispatcher.active_count(), 1);
+    println!("CSQTT_E2E_HOT_DNS received={changed}");
+
+    cancel.cancel();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(6), session)
+            .await
+            .expect("the client session did not stop")
+            .expect("the client session panicked")
+            .expect("the client session returned an error")
+    );
+    dispatcher.shutdown().await;
+    relay_stop.cancel();
+    tokio::time::timeout(Duration::from_secs(3), relay_task)
+        .await
+        .expect("the local TURN relay did not stop")
+        .expect("the local TURN relay panicked");
+}
+
+fn apply_e2e_dns(web_url: &str, provider: &str) {
+    let cookie_path = format!("/tmp/csqtt-e2e-dns-{}.cookie", std::process::id());
+    let login = std::process::Command::new("curl")
+        .args([
+            "-kfsS",
+            "-c",
+            &cookie_path,
+            "-H",
+            "content-type: application/json",
+            "-d",
+            r#"{"user":"e2e-test","pass":"e2e-test-password"}"#,
+            &format!("{web_url}/api/login"),
+        ])
+        .output()
+        .expect("could not invoke curl for CSQTT panel login");
+    assert!(
+        login.status.success(),
+        "CSQTT panel login failed: {}",
+        String::from_utf8_lossy(&login.stderr)
+    );
+    let update = std::process::Command::new("curl")
+        .args([
+            "-kfsS",
+            "-b",
+            &cookie_path,
+            "-H",
+            "content-type: application/json",
+            "-d",
+            &format!(r#"{{"dns_provider":"{provider}"}}"#),
+            &format!("{web_url}/api/settings"),
+        ])
+        .output()
+        .expect("could not invoke curl for CSQTT DNS update");
+    let _ = std::fs::remove_file(&cookie_path);
+    assert!(
+        update.status.success(),
+        "CSQTT hot DNS update failed: {}",
+        String::from_utf8_lossy(&update.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&update.stdout).contains("\"restart_required\":false"),
+        "CSQTT hot DNS update unexpectedly requires restart"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a separately started CSQTT WSL server and CSQTT_E2E_PEER"]
+async fn nine_windows_workers_register_with_a_wsl_server_without_missing_or_duplicate_streams() {
+    const WORKERS: usize = 9;
+    let peer: SocketAddr = std::env::var("CSQTT_E2E_PEER")
+        .expect("CSQTT_E2E_PEER is required")
+        .parse()
+        .expect("CSQTT_E2E_PEER must be an IP:port socket address");
+    let cancel = CancellationToken::new();
+    let pool = PacketPool::new(96 * WORKERS);
+    let stats = Arc::new(Stats::default());
+    let (dispatcher, local_port) = Dispatcher::start(
+        "127.0.0.1:0",
+        None,
+        pool.clone(),
+        stats.clone(),
+        cancel.clone(),
+    )
+    .await
+    .unwrap();
+    let password: Arc<str> = Arc::from("e2e-local-password-20260830");
+    let device_id: Arc<str> = Arc::from("e2e-windows-client");
+    let wrap_key = derive_wrap_key(&password).unwrap();
+    let repair = RepairState::new(WORKERS);
+    let server_stream_repair = Arc::new(AtomicBool::new(false));
+    let shutdown = Arc::new(ShutdownCoordinator::new());
+    let (config_tx, mut config_rx) = tokio::sync::mpsc::channel(1);
+    let delivered = Arc::new(AtomicBool::new(false));
+    let in_flight = Arc::new(AtomicBool::new(true));
+    let mut sessions = Vec::with_capacity(WORKERS);
+    let mut ready = Vec::with_capacity(WORKERS);
+    let mut relay_stops = Vec::with_capacity(WORKERS);
+    let mut relay_tasks = Vec::with_capacity(WORKERS);
+
+    for id in 1..=WORKERS {
+        let relay = Arc::new(UdpSocket::bind("0.0.0.0:0").await.unwrap());
+        let endpoint = format!(
+            "turn:127.0.0.1:{}?transport=udp",
+            relay.local_addr().unwrap().port()
+        );
+        let relay_stop = CancellationToken::new();
+        relay_tasks.push(tokio::spawn(relay_bound_turn_channel_to_peer(
+            relay,
+            peer,
+            relay_stop.clone(),
+        )));
+        relay_stops.push(relay_stop);
+        let (ready_tx, ready_rx) = oneshot::channel();
+        ready.push(ready_rx);
+        let get_config = id == 1;
+        sessions.push(tokio::spawn(run_session(
+            SessionConfig {
+                id,
+                peer,
+                turn_host: None,
+                turn_port: None,
+                turn_transport: TurnTransportMode::Udp,
+                local_port: Arc::from(local_port.clone()),
+                device_id: device_id.clone(),
+                password: password.clone(),
+                generation: 20_260_830,
+                turn_endpoint_cursor: 0,
+                salt: Arc::from("e2e-windows-generation"),
+                mode: ObfsMode::Audio,
+                wrap_key,
+                get_config,
+                desired_count: WORKERS,
+                server_stream_repair: server_stream_repair.clone(),
+                repair: repair.clone(),
+            },
+            TurnCredentials {
+                username: Arc::from(USERNAME),
+                password: Arc::from(PASSWORD),
+                server_addresses: vec![Arc::from(endpoint)].into(),
+            },
+            SessionRuntime {
+                dispatcher: dispatcher.clone(),
+                pool: pool.clone(),
+                stats: stats.clone(),
+                events: Events::new(false),
+                config_tx: config_tx.clone(),
+                config_delivery: get_config.then(|| ConfigDeliveryState {
+                    sent: delivered.clone(),
+                    in_flight: in_flight.clone(),
+                }),
+                cancel: cancel.clone(),
+                shutdown: shutdown.clone(),
+                ready_tx: Some(ready_tx),
+                allocation_started: None,
+                allocation_ready: None,
+            },
+        )));
+    }
+    drop(config_tx);
+
+    let configuration = tokio::time::timeout(Duration::from_secs(15), config_rx.recv())
+        .await
+        .expect("the first worker did not receive TUNCONF from the WSL server")
+        .expect("the configuration channel was closed");
+    assert!(configuration.starts_with("TUNCONF:"), "{configuration}");
+    for ready_rx in ready {
+        tokio::time::timeout(Duration::from_secs(8), ready_rx)
+            .await
+            .expect("a worker was not registered in the dispatcher")
+            .expect("a worker ready signal was dropped");
+    }
+    assert!(delivered.load(Ordering::Acquire));
+    assert!(!in_flight.load(Ordering::Acquire));
+    assert_eq!(dispatcher.active_count(), WORKERS);
+
+    cancel.cancel();
+    for (index, session) in sessions.into_iter().enumerate() {
+        let delivered = tokio::time::timeout(Duration::from_secs(8), session)
+            .await
+            .expect("a client worker did not stop")
+            .expect("a client worker panicked")
+            .expect("a client worker returned an error");
+        assert_eq!(delivered, index == 0);
+    }
+    dispatcher.shutdown().await;
+    for stop in relay_stops {
+        stop.cancel();
+    }
+    for relay_task in relay_tasks {
+        tokio::time::timeout(Duration::from_secs(3), relay_task)
+            .await
+            .expect("a local TURN relay did not stop")
+            .expect("a local TURN relay panicked");
+    }
+}
+
+#[cfg(unix)]
+fn e2e_env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value != 0)
+        .unwrap_or(default)
+}
+
+#[cfg(unix)]
+fn e2e_process_cpu_seconds() -> f64 {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+    let result = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
+    assert_eq!(result, 0, "getrusage failed");
+    let usage = unsafe { usage.assume_init() };
+    let user = usage.ru_utime.tv_sec as f64 + usage.ru_utime.tv_usec as f64 / 1_000_000.0;
+    let system = usage.ru_stime.tv_sec as f64 + usage.ru_stime.tv_usec as f64 / 1_000_000.0;
+    user + system
+}
+
+#[cfg(unix)]
+fn e2e_thread_cpu_seconds() -> f64 {
+    let mut time = std::mem::MaybeUninit::<libc::timespec>::zeroed();
+    let result = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, time.as_mut_ptr()) };
+    assert_eq!(result, 0, "clock_gettime failed");
+    let time = unsafe { time.assume_init() };
+    time.tv_sec as f64 + time.tv_nsec as f64 / 1_000_000_000.0
+}
+
+#[cfg(unix)]
+fn e2e_tunnel_ip(configuration: &str) -> [u8; 4] {
+    configuration
+        .split(':')
+        .nth(1)
+        .and_then(|value| value.parse::<std::net::Ipv4Addr>().ok())
+        .map(|value| value.octets())
+        .expect("TUNCONF must contain a client tunnel IPv4 address")
+}
+
+#[cfg(unix)]
+fn e2e_ipv4_checksum(header: &[u8]) -> u16 {
+    let mut sum = 0u32;
+    for word in header.chunks_exact(2) {
+        sum = sum.saturating_add(u16::from_be_bytes([word[0], word[1]]) as u32);
+    }
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+#[cfg(unix)]
+fn e2e_udp_packet(source: [u8; 4], destination_port: u16, sequence: u64) -> [u8; 1_200] {
+    let mut packet = [0u8; 1_200];
+    let packet_length = packet.len();
+    packet[0] = 0x45;
+    packet[2..4].copy_from_slice(&(packet_length as u16).to_be_bytes());
+    packet[4..6].copy_from_slice(&(sequence as u16).to_be_bytes());
+    packet[8] = 64;
+    packet[9] = 17;
+    packet[12..16].copy_from_slice(&source);
+    packet[16..20].copy_from_slice(&[10, 66, 67, 1]);
+    packet[20..22].copy_from_slice(&47_214u16.to_be_bytes());
+    packet[22..24].copy_from_slice(&destination_port.to_be_bytes());
+    packet[24..26].copy_from_slice(&((packet_length - 20) as u16).to_be_bytes());
+    packet[28..36].copy_from_slice(&sequence.to_be_bytes());
+    for (offset, value) in packet[36..].iter_mut().enumerate() {
+        *value = sequence.wrapping_add(offset as u64) as u8;
+    }
+    let checksum = e2e_ipv4_checksum(&packet[..20]);
+    packet[10..12].copy_from_slice(&checksum.to_be_bytes());
+    packet
+}
+
+#[cfg(unix)]
+fn e2e_echo_sequence(packet: &[u8], destination: [u8; 4], destination_port: u16) -> Option<u64> {
+    if packet.len() != 1_200
+        || packet.first().copied()? != 0x45
+        || packet[9] != 17
+        || packet[16..20] != destination
+        || u16::from_be_bytes([packet[22], packet[23]]) != destination_port
+    {
+        return None;
+    }
+    Some(u64::from_be_bytes(packet[28..36].try_into().ok()?))
+}
+
+#[cfg(unix)]
+async fn collect_e2e_echoes(
+    tun: Arc<tokio::net::UnixDatagram>,
+    tunnel_ip: [u8; 4],
+    destination_port: u16,
+    received_bytes: Arc<AtomicU64>,
+    received_packets: Arc<AtomicU64>,
+    stop: CancellationToken,
+) {
+    let mut packet = [0u8; 2_048];
+    loop {
+        tokio::select! {
+            _ = stop.cancelled() => return,
+            received = tun.recv(&mut packet) => {
+                match received {
+                    Ok(length) if e2e_echo_sequence(&packet[..length], tunnel_ip, destination_port).is_some() => {
+                        received_bytes.fetch_add(length as u64, Ordering::Relaxed);
+                        received_packets.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Ok(_) => {}
+                    Err(_) => return,
+                }
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+struct E2eTunResult {
+    sent_bytes: u64,
+    received_bytes: u64,
+    received_packets: u64,
+    cpu_seconds: f64,
+}
+
+#[cfg(unix)]
+struct E2eTunRuntime {
+    task: std::thread::JoinHandle<E2eTunResult>,
+}
+
+#[cfg(unix)]
+impl E2eTunRuntime {
+    async fn finish(self) -> E2eTunResult {
+        tokio::task::spawn_blocking(move || self.task.join().expect("the E2E TUN runtime panicked"))
+            .await
+            .expect("the E2E TUN runtime join task panicked")
+    }
+}
+
+#[cfg(unix)]
+fn start_e2e_tun_runtime(
+    test_tun: StdUnixDatagram,
+    tunnel_ip: [u8; 4],
+    destination_port: u16,
+    target_mbit: u64,
+    duration_seconds: u64,
+) -> E2eTunRuntime {
+    let task = std::thread::Builder::new()
+        .name("csqtt-e2e-tun".to_owned())
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("could not create the E2E TUN runtime");
+            runtime.block_on(async move {
+                let tun = Arc::new(tokio::net::UnixDatagram::from_std(test_tun).unwrap());
+                let received_bytes = Arc::new(AtomicU64::new(0));
+                let received_packets = Arc::new(AtomicU64::new(0));
+                let collector_stop = CancellationToken::new();
+                let collector = tokio::spawn(collect_e2e_echoes(
+                    tun.clone(),
+                    tunnel_ip,
+                    destination_port,
+                    received_bytes.clone(),
+                    received_packets.clone(),
+                    collector_stop.clone(),
+                ));
+                let packet_bytes = 1_200u64;
+                let start = Instant::now();
+                let cpu_start = e2e_thread_cpu_seconds();
+                let duration = Duration::from_secs(duration_seconds);
+                let deadline = start + duration;
+                let mut next_tick = start;
+                let mut sequence = 0u64;
+                let mut sent_bytes = 0u64;
+                while Instant::now() < deadline {
+                    let now = Instant::now();
+                    let due_packets = now
+                        .saturating_duration_since(start)
+                        .as_nanos()
+                        .saturating_mul(u128::from(target_mbit).saturating_mul(1_000_000))
+                        / (u128::from(packet_bytes)
+                            .saturating_mul(8)
+                            .saturating_mul(1_000_000_000));
+                    let missing_packets = due_packets.saturating_sub(u128::from(sequence)) as usize;
+                    if missing_packets == 0 {
+                        let next = next_tick + Duration::from_millis(4);
+                        next_tick = if next <= now {
+                            now + Duration::from_millis(4)
+                        } else {
+                            next
+                        };
+                        tokio::time::sleep_until(next_tick.min(deadline)).await;
+                        continue;
+                    }
+                    for _ in 0..missing_packets.min(256) {
+                        let packet = e2e_udp_packet(tunnel_ip, destination_port, sequence);
+                        if tun.send(&packet).await.unwrap() != packet.len() {
+                            panic!("test TUN accepted a short packet");
+                        }
+                        sequence = sequence.wrapping_add(1);
+                        sent_bytes = sent_bytes.saturating_add(packet_bytes);
+                    }
+                    if missing_packets > 256 {
+                        tokio::task::yield_now().await;
+                    }
+                }
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                collector_stop.cancel();
+                collector.await.unwrap();
+                E2eTunResult {
+                    sent_bytes,
+                    received_bytes: received_bytes.load(Ordering::Relaxed),
+                    received_packets: received_packets.load(Ordering::Relaxed),
+                    cpu_seconds: (e2e_thread_cpu_seconds() - cpu_start).max(0.0),
+                }
+            })
+        })
+        .expect("could not spawn the E2E TUN runtime");
+    E2eTunRuntime { task }
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires a separately started CSQTT WSL server and CSQTT_E2E_PEER"]
+async fn seventy_two_linux_workers_hold_per_stream_rate_through_server_dataplane() {
+    const WORKERS: usize = 72;
+    const STREAM_RATE_BITS_PER_SECOND: u64 = 2_300_000;
+    const DEFAULT_TARGET_MBIT: u64 = 160;
+    const DEFAULT_MIN_MBIT: u64 = 144;
+    const DEFAULT_MIN_STREAM_KBIT: u64 = 2_000;
+    const DEFAULT_DURATION_SECONDS: u64 = 12;
+    const ECHO_PORT: u16 = 47_214;
+
+    let peer: SocketAddr = std::env::var("CSQTT_E2E_PEER")
+        .expect("CSQTT_E2E_PEER is required")
+        .parse()
+        .expect("CSQTT_E2E_PEER must be an IP:port socket address");
+    let duration_seconds = e2e_env_u64("CSQTT_E2E_DURATION_SECONDS", DEFAULT_DURATION_SECONDS);
+    let target_mbit = e2e_env_u64("CSQTT_E2E_TARGET_MBIT", DEFAULT_TARGET_MBIT);
+    let min_mbit = e2e_env_u64("CSQTT_E2E_MIN_MBIT", DEFAULT_MIN_MBIT);
+    let min_stream_mbit =
+        e2e_env_u64("CSQTT_E2E_MIN_STREAM_KBIT", DEFAULT_MIN_STREAM_KBIT) as f64 / 1_000.0;
+    let echo_port = e2e_env_u64("CSQTT_E2E_ECHO_PORT", u64::from(ECHO_PORT)) as u16;
+    assert!(target_mbit <= (WORKERS as u64 * STREAM_RATE_BITS_PER_SECOND) / 1_000_000);
+
+    let (test_tun, dispatcher_tun) = StdUnixDatagram::pair().unwrap();
+    test_tun.set_nonblocking(true).unwrap();
+    dispatcher_tun.set_nonblocking(true).unwrap();
+    let dispatcher_file = unsafe { File::from_raw_fd(dispatcher_tun.into_raw_fd()) };
+    let cancel = CancellationToken::new();
+    let pool = PacketPool::new(12_288);
+    let stats = Arc::new(Stats::default());
+    let dispatcher =
+        Dispatcher::start_test_tun(dispatcher_file, pool.clone(), stats, cancel.clone()).await;
+    let password: Arc<str> = Arc::from("e2e-local-password-20260830");
+    let device_id: Arc<str> = Arc::from("e2e-windows-client");
+    let wrap_key = derive_wrap_key(&password).unwrap();
+    let repair = RepairState::new(WORKERS);
+    let server_stream_repair = Arc::new(AtomicBool::new(false));
+    let shutdown = Arc::new(ShutdownCoordinator::new());
+    let (config_tx, mut config_rx) = tokio::sync::mpsc::channel(1);
+    let delivered = Arc::new(AtomicBool::new(false));
+    let in_flight = Arc::new(AtomicBool::new(true));
+    let mut sessions = Vec::with_capacity(WORKERS);
+    let mut ready = Vec::with_capacity(WORKERS);
+    let relay_runtime = start_limited_relay_runtime(peer, WORKERS, STREAM_RATE_BITS_PER_SECOND);
+
+    for id in 1..=WORKERS {
+        let (ready_tx, ready_rx) = oneshot::channel();
+        ready.push(ready_rx);
+        let get_config = id == 1;
+        sessions.push(tokio::spawn(run_session(
+            SessionConfig {
+                id,
+                peer,
+                turn_host: None,
+                turn_port: None,
+                turn_transport: TurnTransportMode::Udp,
+                local_port: Arc::from("0"),
+                device_id: device_id.clone(),
+                password: password.clone(),
+                generation: 20_260_901,
+                turn_endpoint_cursor: 0,
+                salt: Arc::from("e2e-wsl-throughput-generation"),
+                mode: ObfsMode::Audio,
+                wrap_key,
+                get_config,
+                desired_count: WORKERS,
+                server_stream_repair: server_stream_repair.clone(),
+                repair: repair.clone(),
+            },
+            TurnCredentials {
+                username: Arc::from(USERNAME),
+                password: Arc::from(PASSWORD),
+                server_addresses: vec![relay_runtime.endpoints[id - 1].clone()].into(),
+            },
+            SessionRuntime {
+                dispatcher: dispatcher.clone(),
+                pool: pool.clone(),
+                stats: Arc::new(Stats::default()),
+                events: Events::new(false),
+                config_tx: config_tx.clone(),
+                config_delivery: get_config.then(|| ConfigDeliveryState {
+                    sent: delivered.clone(),
+                    in_flight: in_flight.clone(),
+                }),
+                cancel: cancel.clone(),
+                shutdown: shutdown.clone(),
+                ready_tx: Some(ready_tx),
+                allocation_started: None,
+                allocation_ready: None,
+            },
+        )));
+    }
+    drop(config_tx);
+
+    let configuration = tokio::time::timeout(Duration::from_secs(30), config_rx.recv())
+        .await
+        .expect("the first worker did not receive TUNCONF")
+        .expect("the configuration channel was closed");
+    let tunnel_ip = e2e_tunnel_ip(&configuration);
+    for ready_rx in ready {
+        tokio::time::timeout(Duration::from_secs(20), ready_rx)
+            .await
+            .expect("a throughput worker was not registered")
+            .expect("a throughput worker ready signal was dropped");
+    }
+    assert!(delivered.load(Ordering::Acquire));
+    assert!(!in_flight.load(Ordering::Acquire));
+    assert_eq!(dispatcher.active_count(), WORKERS);
+
+    let start = Instant::now();
+    let cpu_start = e2e_process_cpu_seconds();
+    let tun_result = start_e2e_tun_runtime(
+        test_tun,
+        tunnel_ip,
+        echo_port,
+        target_mbit,
+        duration_seconds,
+    )
+    .finish()
+    .await;
+    let elapsed = Duration::from_secs(duration_seconds).as_secs_f64();
+    let measurement_elapsed = start.elapsed().as_secs_f64();
+    let process_cpu_percent =
+        (e2e_process_cpu_seconds() - cpu_start).max(0.0) * 100.0 / measurement_elapsed;
+    let tun_harness_cpu_percent = tun_result.cpu_seconds * 100.0 / measurement_elapsed;
+    let sent_mbit = tun_result.sent_bytes as f64 * 8.0 / elapsed / 1_000_000.0;
+    let received_mbit = tun_result.received_bytes as f64 * 8.0 / elapsed / 1_000_000.0;
+    let per_stream_up: Vec<f64> = relay_runtime
+        .meters
+        .iter()
+        .map(|meter| {
+            meter.upstream_bytes.load(Ordering::Relaxed) as f64 * 8.0 / elapsed / 1_000_000.0
+        })
+        .collect();
+    let per_stream_down: Vec<f64> = relay_runtime
+        .meters
+        .iter()
+        .map(|meter| {
+            meter.downstream_bytes.load(Ordering::Relaxed) as f64 * 8.0 / elapsed / 1_000_000.0
+        })
+        .collect();
+    let min_stream_up = per_stream_up.iter().copied().fold(f64::INFINITY, f64::min);
+    let min_stream_down = per_stream_down
+        .iter()
+        .copied()
+        .fold(f64::INFINITY, f64::min);
+    assert!(
+        sent_mbit >= min_mbit as f64,
+        "client TUN input was only {sent_mbit:.2} Mbit/s"
+    );
+    assert!(
+        received_mbit >= min_mbit as f64,
+        "client TUN output was only {received_mbit:.2} Mbit/s"
+    );
+    assert!(
+        min_stream_up >= min_stream_mbit,
+        "a stream received less than {min_stream_mbit:.2} Mbit/s upstream"
+    );
+    assert!(
+        min_stream_down >= min_stream_mbit,
+        "a stream received less than {min_stream_mbit:.2} Mbit/s downstream"
+    );
+
+    cancel.cancel();
+    for (index, session) in sessions.into_iter().enumerate() {
+        let delivered = tokio::time::timeout(Duration::from_secs(12), session)
+            .await
+            .expect("a throughput worker did not stop")
+            .expect("a throughput worker panicked")
+            .expect("a throughput worker returned an error");
+        assert_eq!(delivered, index == 0);
+    }
+    dispatcher.shutdown().await;
+    let relay_cpu_percent = relay_runtime.stop() * 100.0 / measurement_elapsed;
+    let client_cpu_percent =
+        (process_cpu_percent - relay_cpu_percent - tun_harness_cpu_percent).max(0.0);
+    println!(
+        "CSQTT_E2E_72 sent_mbit={sent_mbit:.2} received_mbit={received_mbit:.2} packets={} min_stream_up={min_stream_up:.2} min_stream_down={min_stream_down:.2} client_path_cpu_percent={client_cpu_percent:.2} relay_cpu_percent={relay_cpu_percent:.2} tun_harness_cpu_percent={tun_harness_cpu_percent:.2}",
+        tun_result.received_packets,
     );
 }

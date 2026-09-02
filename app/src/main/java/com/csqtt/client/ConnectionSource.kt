@@ -27,13 +27,15 @@ suspend fun resolveConnectionSource(store: SettingsStore): ConnectionSource? {
         return ConnectionSource(
             peer = link.peerAddress(),
             password = link.password,
-            hashes = linkHashes.ifEmpty { store.vkHashes.first() },
+            hashes = linkHashes.ifEmpty { activeHashes(store.vkHashes.first()) },
             hashesFromLink = linkHashes.isNotEmpty(),
         )
     }
 
     val basePeer = store.peer.first()
-    val password = store.connectionPassword.first()
+    val passwordState = store.connectionPasswordState.first()
+    val password = passwordState.value
+    if (passwordState.state == StoredSecretState.Unreadable) return null
     if (basePeer.isBlank() || password.isBlank()) return null
     val serverPeerPort = if (store.manualPortsEnabled.first()) {
         store.serverPeerPort.first()

@@ -36,7 +36,7 @@ command -v rustup >/dev/null
 command -v zig >/dev/null
 cargo zigbuild --help >/dev/null
 rustup toolchain install 1.97.1 --profile minimal --component rustfmt --component clippy
-rustup target add x86_64-unknown-linux-musl --toolchain 1.97.1
+rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl armv7-unknown-linux-musleabihf --toolchain 1.97.1
 rustc +1.97.1 --version
 zig version
 WRAP="$ROOT/build/zig-wrappers"
@@ -44,13 +44,13 @@ mkdir -p "$WRAP"
 HOST="$(rustc +1.97.1 -vV | sed -n 's/^host: //p')"
 if [[ "$HOST" == *windows* ]]; then
 cat > "$WRAP/zigcc.ps1" <<'PS1'
-$filtered = @($args | Where-Object { $_ -ne "--target=x86_64-unknown-linux-musl" })
-& zig cc -target x86_64-linux-musl @filtered
+$filtered = @($args | Where-Object { $_ -notlike "--target=*" })
+& zig cc -target $env:CSQTT_ZIG_TARGET @filtered
 exit $LASTEXITCODE
 PS1
 cat > "$WRAP/zigcxx.ps1" <<'PS1'
-$filtered = @($args | Where-Object { $_ -ne "--target=x86_64-unknown-linux-musl" })
-& zig c++ -target x86_64-linux-musl @filtered
+$filtered = @($args | Where-Object { $_ -notlike "--target=*" })
+& zig c++ -target $env:CSQTT_ZIG_TARGET @filtered
 exit $LASTEXITCODE
 PS1
 cat > "$WRAP/zigcc.cmd" <<'CMD'
@@ -73,17 +73,17 @@ cat > "$WRAP/zigcc" <<'SH'
 #!/usr/bin/env bash
 args=()
 for arg in "$@"; do
-  [[ "$arg" == "--target=x86_64-unknown-linux-musl" ]] || args+=("$arg")
+  [[ "$arg" == --target=* ]] || args+=("$arg")
 done
-exec zig cc -target x86_64-linux-musl "${args[@]}"
+exec zig cc -target "$CSQTT_ZIG_TARGET" "${args[@]}"
 SH
 cat > "$WRAP/zigcxx" <<'SH'
 #!/usr/bin/env bash
 args=()
 for arg in "$@"; do
-  [[ "$arg" == "--target=x86_64-unknown-linux-musl" ]] || args+=("$arg")
+  [[ "$arg" == --target=* ]] || args+=("$arg")
 done
-exec zig c++ -target x86_64-linux-musl "${args[@]}"
+exec zig c++ -target "$CSQTT_ZIG_TARGET" "${args[@]}"
 SH
 cat > "$WRAP/zigar" <<'SH'
 #!/usr/bin/env bash
@@ -98,6 +98,15 @@ export CC_x86_64_unknown_linux_musl="$CC_WRAPPER"
 export CXX_x86_64_unknown_linux_musl="$CXX_WRAPPER"
 export AR_x86_64_unknown_linux_musl="$AR_WRAPPER"
 export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER="$CC_WRAPPER"
+export CC_aarch64_unknown_linux_musl="$CC_WRAPPER"
+export CXX_aarch64_unknown_linux_musl="$CXX_WRAPPER"
+export AR_aarch64_unknown_linux_musl="$AR_WRAPPER"
+export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="$CC_WRAPPER"
+export CC_armv7_unknown_linux_musleabihf="$CC_WRAPPER"
+export CXX_armv7_unknown_linux_musleabihf="$CXX_WRAPPER"
+export AR_armv7_unknown_linux_musleabihf="$AR_WRAPPER"
+export CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_LINKER="$CC_WRAPPER"
+export CSQTT_ZIG_TARGET=x86_64-linux-musl
 if [[ "$RUN_CHECKS" == 1 ]]; then
   cargo +1.97.1 fmt --all -- --check
   cargo +1.97.1 zigbuild --all-targets --target x86_64-unknown-linux-musl "${FEATURE_ARGS[@]}"
@@ -110,7 +119,29 @@ if [[ "$RUN_CHECKS" == 1 ]]; then
     CARGO_TARGET_DIR="$ROOT/build/linux-musl-tests" cargo +1.97.1 zigbuild --target x86_64-unknown-linux-musl "${FEATURE_ARGS[@]}" --tests
   fi
 fi
-CARGO_TARGET_DIR="$ROOT/build/linux-musl" cargo +1.97.1 zigbuild --release --target x86_64-unknown-linux-musl "${FEATURE_ARGS[@]}"
-mkdir -p "$ROOT/dist"
-cp "$ROOT/build/linux-musl/x86_64-unknown-linux-musl/release/csqtt" "$ROOT/dist/csqtt"
-ls -lh "$ROOT/dist/csqtt"
+build_variant() {
+  local target="$1" zig_target="$2" asset="$3"
+  CSQTT_ZIG_TARGET="$zig_target" \
+    ZIG_GLOBAL_CACHE_DIR="$ROOT/build/zig-cache/$asset/global" \
+    ZIG_LOCAL_CACHE_DIR="$ROOT/build/zig-cache/$asset/local" \
+    CARGO_TARGET_DIR="$ROOT/build/linux-musl" \
+    cargo +1.97.1 zigbuild --release --target "$target" "${FEATURE_ARGS[@]}"
+  mkdir -p "$ROOT/dist" "$ROOT/../app/src/main/assets"
+  cp "$ROOT/build/linux-musl/$target/release/csqtt" "$ROOT/dist/$asset"
+  cp "$ROOT/build/linux-musl/$target/release/csqtt" "$ROOT/../app/src/main/assets/$asset"
+  ls -lh "$ROOT/dist/$asset"
+}
+build_variant x86_64-unknown-linux-musl x86_64-linux-musl csqtt-linux-amd64
+build_variant aarch64-unknown-linux-musl aarch64-linux-musl csqtt-linux-arm64
+build_variant armv7-unknown-linux-musleabihf armv7-linux-musleabihf csqtt-linux-armv7
+rm -f "$ROOT/../app/src/main/assets/csqtt"
+if command -v pwsh >/dev/null; then
+  pwsh -NoProfile -File "$ROOT/../scripts/server_asset_provenance.ps1" -Mode Write
+  pwsh -NoProfile -File "$ROOT/../scripts/server_asset_provenance.ps1" -Mode Verify
+elif command -v powershell.exe >/dev/null; then
+  powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$(wslpath -w "$ROOT/../scripts/server_asset_provenance.ps1")" -Mode Write
+  powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$(wslpath -w "$ROOT/../scripts/server_asset_provenance.ps1")" -Mode Verify
+else
+  echo "Server assets built. Run scripts/server_asset_provenance.ps1 -Mode Write and -Mode Verify before packaging an APK." >&2
+  exit 1
+fi

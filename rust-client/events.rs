@@ -69,6 +69,13 @@ impl Events {
         self.emit("CONFIG", &serde_json::json!({"config": config}));
     }
 
+    pub fn error(&self, code: &str, message: &str, fatal: bool) {
+        self.emit(
+            "ERROR",
+            &serde_json::json!({"code": code, "message": message, "fatal": fatal}),
+        );
+    }
+
     pub fn stats(&self, active: i32, bytes_up: i64, bytes_down: i64) {
         self.emit(
             "STATS",
@@ -162,6 +169,24 @@ mod tests {
         assert_eq!(
             encode_event("ACTIVE_ZERO", &serde_json::json!({})).as_deref(),
             Some("__CSQTT_EVENT__|ACTIVE_ZERO|{}")
+        );
+    }
+
+    #[test]
+    fn fatal_error_event_keeps_the_code_and_message() {
+        assert_eq!(
+            encode_event(
+                "ERROR",
+                &serde_json::json!({
+                    "code": "handshake_timeout",
+                    "message": "FATAL_HANDSHAKE: no response",
+                    "fatal": true
+                }),
+            )
+            .as_deref(),
+            Some(
+                "__CSQTT_EVENT__|ERROR|{\"code\":\"handshake_timeout\",\"fatal\":true,\"message\":\"FATAL_HANDSHAKE: no response\"}"
+            )
         );
     }
 

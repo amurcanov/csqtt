@@ -4,6 +4,7 @@
 
 <resources>
     <color name="ic_launcher_background">#1E1E1E</color>
+    <color name="tv_banner_background">#101927</color>
     <color name="app_background">#FBF8FF</color>
 
     <!-- Google Pixel / Material You Widget Styling - Light Theme fallbacks -->

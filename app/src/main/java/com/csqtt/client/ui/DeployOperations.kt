@@ -19,6 +19,7 @@ import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
 import java.security.Security
+import java.util.Locale
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -41,9 +42,6 @@ internal fun sanitizeSshPassword(value: String): String =
 
 internal fun isSuccessfulDeployResult(exitStatus: Int, output: String): Boolean =
     exitStatus == 0 && output.lineSequence().any { it.trim() == "CSQTT_DEPLOY_OK" }
-
-internal fun isSuccessfulPrepareResult(exitStatus: Int, output: String): Boolean =
-    exitStatus == 0 && output.lineSequence().any { it.trim() == "CSQTT_DEPLOY_READY_FOR_UPLOAD" }
 
 private fun deployFailureDetail(output: String): String? =
     output.lineSequence()
@@ -167,11 +165,36 @@ private fun publishDeployOutput(rawLine: String) {
     }
 }
 
+internal enum class ServerArchitecture(
+    val assetName: String,
+    val displayName: String,
+) {
+    AMD64("csqtt-linux-amd64", "amd64"),
+    ARM64("csqtt-linux-arm64", "ARM64"),
+    ARMV7("csqtt-linux-armv7", "ARM32"),
+}
+
+internal fun serverArchitectureForMachine(output: String): ServerArchitecture {
+    val machine = output.lineSequence().map(String::trim).firstOrNull { it.isNotEmpty() }
+        ?.lowercase(Locale.ROOT)
+        ?: throw IOException("VPS не вернул архитектуру через uname -m")
+    return when (machine) {
+        "x86_64", "amd64" -> ServerArchitecture.AMD64
+        "aarch64", "arm64" -> ServerArchitecture.ARM64
+        "armv7l", "armv7", "armhf" -> ServerArchitecture.ARMV7
+        else -> throw IOException(
+            "Архитектура VPS $machine пока не поддерживается. Поддерживаются: x86_64, aarch64, armv7l",
+        )
+    }
+}
+
 private fun deployAssetLabel(fileName: String): String = when (fileName) {
     "deploy.sh" -> "скрипт установки"
-    "csqtt" -> "сервер CSQTT"
+    "csqtt-linux-amd64" -> "сервер CSQTT (amd64)"
+    "csqtt-linux-arm64" -> "сервер CSQTT (ARM64)"
+    "csqtt-linux-armv7" -> "сервер CSQTT (ARM32)"
     "csqtt.env" -> "настройки веб-панели"
-    "csqtt-deploy.json" -> "настройки DNS и доступа"
+    "csqtt-deploy.json" -> "настройки доступа"
     "hev-socks5-tunnel" -> "C-движок туннеля"
     else -> fileName
 }
@@ -534,7 +557,7 @@ internal suspend fun performDeploy(
     context: Context,
     host: String, user: String, pass: String, port: Int,
     mainPass: String, webLogin: String, webPass: String,
-    peerPort: Int, webPort: Int, dns1: String, dns2: String,
+    peerPort: Int, webPort: Int,
     onProgress: (Float, String) -> Unit,
     privateKey: String = "",
     keyPassphrase: String = "",
@@ -560,9 +583,15 @@ internal suspend fun performDeploy(
         }
         TunnelManager.addDeploySuccessLog("SSH-соединение установлено")
 
+        val architectureResult = sshClient.execResult("uname -m", timeout = 10000L)
+        if (architectureResult.exitStatus != 0) {
+            throw IOException("Не удалось определить архитектуру VPS: ${architectureResult.output.trim().take(160)}")
+        }
+        val serverArchitecture = serverArchitectureForMachine(architectureResult.output)
+        TunnelManager.addDeployInfoLog("Архитектура VPS: ${serverArchitecture.displayName}")
+
         onProgress(0.05f, "Подготовка файлов...")
         TunnelManager.addDeployInfoLog("Подготовка файлов установки")
-        val dnsValue = listOf(dns1, dns2).map { it.trim() }.filter { it.isNotEmpty() }.joinToString(",")
         val deviceId = TunnelManager.readDeviceId(context)
 
         val workingDir = File(context.cacheDir, "deploy-${System.nanoTime()}")
@@ -582,7 +611,7 @@ internal suspend fun performDeploy(
         }
 
         val scriptFile = extractAsset("deploy.sh")
-        val serverFile = extractAsset("csqtt")
+        val serverFile = extractAsset(serverArchitecture.assetName)
         val environmentFile = File(workingDir, "csqtt.env").apply {
             writeText(
                 buildString {
@@ -596,7 +625,6 @@ internal suspend fun performDeploy(
                 JSONObject()
                     .put("main_password", mainPass)
                     .put("device_id", deviceId)
-                    .put("dns", dnsValue)
                     .toString()
             )
         }
@@ -605,26 +633,10 @@ internal suspend fun performDeploy(
         onProgress(0.06f, "Подготовка сервера...")
         sshClient.upload(scriptFile, "/tmp/deploy.sh")
 
-        TunnelManager.addDeployInfoLog("Остановка старого CSQTT и очистка runtime с сохранением SQLite")
         val deployEnvironment =
             "env CSQTT_PEER_PORT=$peerPort CSQTT_SSH_PORT=$port CSQTT_WEB_PORT=$webPort " +
                 "CSQTT_DEPLOY_MODE=${deployMode(installInDocker)}"
-        val prepareResult = sshClient.execResult(
-            rootCommand("$deployEnvironment bash /tmp/deploy.sh prepare"),
-            timeout = CMD_TIMEOUT,
-        )
-        if (!isSuccessfulPrepareResult(prepareResult.exitStatus, prepareResult.output)) {
-            DeployManager.writeError(
-                "Deploy prepare failed: exit=${prepareResult.exitStatus}" +
-                    "\n${prepareResult.output.takeLast(1200)}"
-            )
-            val failureMessage = deployFailureMessage(prepareResult.exitStatus, prepareResult.output)
-            TunnelManager.addDeployErrorLog(failureMessage)
-            DeployManager.stopDeploy(failureMessage)
-            return@withContext false
-        }
-
-        onProgress(0.14f, "Загрузка нового сервера...")
+        onProgress(0.10f, "Загрузка нового сервера...")
         sshClient.upload(serverFile, "/tmp/.csqtt-upload-server")
         sshClient.upload(environmentFile, "/tmp/.csqtt-upload-web.env")
         sshClient.upload(overridesFile, "/tmp/.csqtt-upload-overrides.json")
@@ -688,6 +700,7 @@ internal suspend fun performUninstall(
     certificate: String = "",
 ): Boolean = withContext(Dispatchers.IO) {
     var ssh: SshjClient? = null
+    var uninstallScript: File? = null
     try {
         TunnelManager.beginDeployLog("Начало удаления с $host:$port")
         onProgress(0.05f, "Подключение...")
@@ -698,65 +711,23 @@ internal suspend fun performUninstall(
         val sshClient = DeploySSHClient(ssh, pass)
         TunnelManager.addDeploySuccessLog("SSH-соединение установлено")
 
-        onProgress(0.15f, "Остановка сервиса...")
-        TunnelManager.addDeployInfoLog("Остановка CSQTT")
-        sshClient.exec(
-            rootCommand(
-                "if command -v docker >/dev/null 2>&1; then " +
-                    "docker rm -f csqtt >/dev/null 2>&1 || true; " +
-                    "docker image rm csqtt:2.0.6 >/dev/null 2>&1 || true; fi; " +
-                    "systemctl unmask csqtt 2>/dev/null || true; " +
-                "systemctl stop csqtt 2>/dev/null || true; " +
-                    "systemctl disable csqtt 2>/dev/null || true; " +
-                    "rm -f /etc/systemd/system/csqtt.service; " +
-                    "rm -rf /etc/systemd/system/csqtt.service.d; " +
-                    "systemctl daemon-reload 2>/dev/null || true"
-            ),
-            timeout = 15000L
-        )
+        onProgress(0.15f, "Подготовка штатного удаления...")
+        TunnelManager.addDeployInfoLog("Загрузка штатного установщика CSQTT")
+        uninstallScript = File(context.cacheDir, "csqtt-uninstall-${System.nanoTime()}.sh")
+        context.assets.open("deploy.sh").use { input ->
+            FileOutputStream(uninstallScript).use { output -> input.copyTo(output) }
+        }
+        if (!uninstallScript.isFile || uninstallScript.length() == 0L) {
+            throw IOException("Не удалось подготовить штатный установщик CSQTT")
+        }
+        sshClient.upload(uninstallScript, "/tmp/deploy.sh")
 
         onProgress(0.30f, "Удаление через deploy.sh...")
         TunnelManager.addDeployInfoLog("Запуск серверного удаления")
-        sshClient.exec(rootCommand("[ -f /tmp/deploy.sh ] && env CSQTT_PEER_PORT=$peerPort CSQTT_SSH_PORT=$port bash /tmp/deploy.sh uninstall 2>/dev/null || true"), timeout = 30000L)
-
-        onProgress(0.45f, "Удаление бинарника...")
-        TunnelManager.addDeployInfoLog("Удаление серверного бинарника")
-        sshClient.exec(rootCommand("pkill -x csqtt 2>/dev/null || true; rm -f /usr/local/bin/csqtt"), timeout = 10000L)
-
-        onProgress(0.60f, "Очистка firewall...")
-        TunnelManager.addDeployInfoLog("Очистка правил firewall")
         sshClient.exec(
-            rootCommand(
-                "if command -v iptables >/dev/null 2>&1; then " +
-                    "for table in filter nat mangle; do " +
-                    "for chain in INPUT FORWARD POSTROUTING; do " +
-                    "while rule=\$(iptables -t \$table -L \$chain --line-numbers -n 2>/dev/null | awk '/CSQTT_MANAGED/ { n=\$1 } END { print n }') && [ -n \"\$rule\" ]; do " +
-                    "iptables -t \$table -D \$chain \$rule 2>/dev/null || break; " +
-                    "done; done; done; fi; " +
-                    "if command -v nft >/dev/null 2>&1; then " +
-                    "nft delete table ip csqtt 2>/dev/null || true; " +
-                    "nft delete table inet csqtt 2>/dev/null || true; " +
-                    "nft delete table inet csqtt_mangle 2>/dev/null || true; " +
-                    "fi"
-            ),
-            timeout = 15000L
+            rootCommand("env CSQTT_PEER_PORT=$peerPort CSQTT_SSH_PORT=$port bash /tmp/deploy.sh uninstall"),
+            timeout = 30000L,
         )
-
-        onProgress(0.75f, "Удаление интерфейса...")
-        TunnelManager.addDeployInfoLog("Удаление сетевого интерфейса и временной конфигурации")
-        sshClient.exec(
-            rootCommand(
-                "ip link show csqtt1 >/dev/null 2>&1 && ip link del csqtt1 2>/dev/null || true; " +
-                    "if [ -d /etc/csqtt ]; then chmod 700 /etc/csqtt 2>/dev/null || true; " +
-                    "for f in csqtt.db csqtt.db-wal csqtt.db-shm; do [ -f /etc/csqtt/\$f ] && chmod 600 /etc/csqtt/\$f 2>/dev/null || true; done; " +
-                    "fi"
-            ),
-            timeout = 10000L
-        )
-
-        onProgress(0.90f, "Очистка sysctl...")
-        TunnelManager.addDeployInfoLog("Очистка сетевых параметров sysctl")
-        sshClient.exec(rootCommand("rm -f /etc/sysctl.d/99-csqtt.conf /etc/sysctl.d/99-csqtt-udp-buffers.conf; sysctl --system >/dev/null 2>&1 || true"), timeout = 15000L)
 
         onProgress(1.0f, "Готово!")
         TunnelManager.addDeploySuccessLog("Удаление CSQTT завершено")
@@ -777,5 +748,6 @@ internal suspend fun performUninstall(
     } finally {
         try { ssh?.disconnect() } catch (_: Exception) {}
         DeployManager.activeSession = null
+        uninstallScript?.delete()
     }
 }

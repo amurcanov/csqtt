@@ -1474,6 +1474,7 @@ mod linux {
     pub(super) fn parse_orig_dst(mut control: &[u8]) -> Option<SocketAddrV4> {
         while control.len() >= mem::size_of::<libc::cmsghdr>() {
             let header: &libc::cmsghdr = unsafe { &*(control.as_ptr() as *const libc::cmsghdr) };
+            #[allow(clippy::unnecessary_cast)]
             let length = header.cmsg_len as usize;
             if length < mem::size_of::<libc::cmsghdr>() || length > control.len() {
                 break;

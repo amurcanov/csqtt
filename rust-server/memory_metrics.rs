@@ -403,7 +403,7 @@ fn fixed_buffer_memory() -> FixedBufferMemory {
     let packet_capacity = PACKET_CAPACITY as u64;
     let udp_tx_slots = UDP_TX_SLOTS as u64;
     let tun_tx_slots = TUN_TX_SLOTS as u64;
-    let udp_rx_mode = "recvmmsg/batch".to_owned();
+    let udp_rx_mode = io.udp_datagram_mode.label().to_owned();
     let udp_rx_slots = MAX_DATAGRAMS as u64;
     let udp_rx_slot_bytes = PACKET_CAPACITY as u64;
     let udp_tx_payload_bytes = udp_tx_slots.saturating_mul(packet_capacity);
@@ -780,5 +780,316 @@ mod tests {
         let mut inodes = BTreeSet::new();
         inodes.insert(12_345);
         assert_eq!(parse_socket_table(table, &inodes), (1, 10, 11));
+    }
+
+    macro_rules! proc_kib_case {
+        ($name:ident, $text:expr, $field:expr, $expected:expr) => {
+            #[test]
+            fn $name() {
+                assert_eq!(proc_kib($text, $field), $expected);
+            }
+        };
+    }
+
+    proc_kib_case!(
+        proc_kib_reads_standard_kib,
+        "VmRSS: 4096 kB\n",
+        "VmRSS:",
+        Some(4096)
+    );
+    proc_kib_case!(
+        proc_kib_reads_whitespace_delimited_value,
+        "Threads:\t12\n",
+        "Threads:",
+        Some(12)
+    );
+    proc_kib_case!(
+        proc_kib_ignores_similar_field_names,
+        "VmRSSPeak: 9 kB\n",
+        "VmRSS:",
+        None
+    );
+    proc_kib_case!(
+        proc_kib_rejects_non_numeric_value,
+        "VmRSS: unknown kB\n",
+        "VmRSS:",
+        None
+    );
+    proc_kib_case!(proc_kib_rejects_missing_value, "VmRSS:\n", "VmRSS:", None);
+    proc_kib_case!(
+        proc_kib_finds_later_matching_line,
+        "Name: csqtt\nVmSwap: 55 kB\n",
+        "VmSwap:",
+        Some(55)
+    );
+    proc_kib_case!(
+        proc_kib_recovers_after_invalid_duplicate,
+        "VmRSS: bad kB\nVmRSS: 99 kB\n",
+        "VmRSS:",
+        Some(99)
+    );
+    proc_kib_case!(proc_kib_is_case_sensitive, "vmrss: 77 kB\n", "VmRSS:", None);
+
+    macro_rules! process_memory_case {
+        ($name:ident, $field:ident, $line:expr, $expected:expr) => {
+            #[test]
+            fn $name() {
+                let snapshot = parse_process_memory($line);
+                assert!(snapshot.available);
+                assert_eq!(snapshot.$field, $expected);
+            }
+        };
+    }
+
+    process_memory_case!(process_memory_reads_rss, rss_kib, "VmRSS: 101 kB\n", 101);
+    process_memory_case!(
+        process_memory_reads_peak_rss,
+        peak_rss_kib,
+        "VmHWM: 102 kB\n",
+        102
+    );
+    process_memory_case!(
+        process_memory_reads_anonymous,
+        anonymous_kib,
+        "RssAnon: 103 kB\n",
+        103
+    );
+    process_memory_case!(
+        process_memory_reads_file_backed,
+        file_kib,
+        "RssFile: 104 kB\n",
+        104
+    );
+    process_memory_case!(
+        process_memory_reads_shared_memory,
+        shmem_kib,
+        "RssShmem: 105 kB\n",
+        105
+    );
+    process_memory_case!(
+        process_memory_reads_thread_count,
+        threads,
+        "Threads: 106\n",
+        106
+    );
+
+    macro_rules! smaps_case {
+        ($name:ident, $field:ident, $line:expr, $expected:expr) => {
+            #[test]
+            fn $name() {
+                let snapshot = parse_smaps_rollup($line);
+                assert!(snapshot.available);
+                assert_eq!(snapshot.$field, $expected);
+            }
+        };
+    }
+
+    smaps_case!(smaps_reads_rss, rss_kib, "Rss: 201 kB\n", 201);
+    smaps_case!(smaps_reads_pss, pss_kib, "Pss: 202 kB\n", 202);
+    smaps_case!(
+        smaps_reads_anonymous_pss,
+        pss_anon_kib,
+        "Pss_Anon: 203 kB\n",
+        203
+    );
+    smaps_case!(
+        smaps_reads_file_pss,
+        pss_file_kib,
+        "Pss_File: 204 kB\n",
+        204
+    );
+    smaps_case!(smaps_reads_swap, swap_kib, "Swap: 205 kB\n", 205);
+    smaps_case!(smaps_reads_swap_pss, swap_pss_kib, "SwapPss: 206 kB\n", 206);
+
+    #[test]
+    fn mapping_snapshot_sorts_larger_file_mapping_first() {
+        let snapshot = mapping_memory_snapshot(
+            &ProcessMemory {
+                file_kib: 90,
+                anonymous_kib: 40,
+                ..ProcessMemory::default()
+            },
+            &SmapsRollup {
+                pss_file_kib: 80,
+                pss_anon_kib: 30,
+                private_kib: 50,
+                anonymous_kib: 40,
+                shared_kib: 7,
+                ..SmapsRollup::default()
+            },
+        );
+        assert_eq!(snapshot.categories.len(), 2);
+        assert_eq!(snapshot.categories[0].category, "file-backed-mappings");
+        assert_eq!(snapshot.categories[1].category, "anonymous-mappings");
+    }
+
+    #[test]
+    fn mapping_snapshot_sorts_larger_anonymous_mapping_first() {
+        let snapshot = mapping_memory_snapshot(
+            &ProcessMemory {
+                file_kib: 2,
+                anonymous_kib: 99,
+                ..ProcessMemory::default()
+            },
+            &SmapsRollup {
+                pss_file_kib: 1,
+                pss_anon_kib: 88,
+                ..SmapsRollup::default()
+            },
+        );
+        assert_eq!(snapshot.categories[0].category, "anonymous-mappings");
+    }
+
+    #[test]
+    fn mapping_snapshot_skips_empty_categories() {
+        let snapshot = mapping_memory_snapshot(&ProcessMemory::default(), &SmapsRollup::default());
+        assert!(snapshot.available);
+        assert!(snapshot.categories.is_empty());
+    }
+
+    #[test]
+    fn mapping_snapshot_keeps_file_shared_and_private_values() {
+        let snapshot = mapping_memory_snapshot(
+            &ProcessMemory {
+                file_kib: 7,
+                ..ProcessMemory::default()
+            },
+            &SmapsRollup {
+                pss_file_kib: 5,
+                private_kib: 11,
+                shared_kib: 13,
+                ..SmapsRollup::default()
+            },
+        );
+        let file = &snapshot.categories[0];
+        assert_eq!(file.private_kib, 11);
+        assert_eq!(file.shared_kib, 13);
+    }
+
+    #[test]
+    fn mapping_snapshot_caps_anonymous_private_at_private_total() {
+        let snapshot = mapping_memory_snapshot(
+            &ProcessMemory {
+                anonymous_kib: 20,
+                ..ProcessMemory::default()
+            },
+            &SmapsRollup {
+                pss_anon_kib: 10,
+                anonymous_kib: 20,
+                private_kib: 12,
+                ..SmapsRollup::default()
+            },
+        );
+        assert_eq!(snapshot.categories[0].private_kib, 12);
+    }
+
+    #[test]
+    fn mapping_snapshot_uses_saturating_file_private_subtraction() {
+        let snapshot = mapping_memory_snapshot(
+            &ProcessMemory {
+                file_kib: 20,
+                ..ProcessMemory::default()
+            },
+            &SmapsRollup {
+                pss_file_kib: 20,
+                anonymous_kib: 99,
+                private_kib: 3,
+                ..SmapsRollup::default()
+            },
+        );
+        assert_eq!(snapshot.categories[0].private_kib, 0);
+    }
+
+    macro_rules! hex_pair_case {
+        ($name:ident, $value:expr, $expected:expr) => {
+            #[test]
+            fn $name() {
+                assert_eq!(parse_hex_pair($value), $expected);
+            }
+        };
+    }
+
+    hex_pair_case!(
+        hex_pair_reads_zero_values,
+        "00000000:00000000",
+        Some((0, 0))
+    );
+    hex_pair_case!(
+        hex_pair_reads_max_values,
+        "FFFFFFFFFFFFFFFF:10",
+        Some((u64::MAX, 16))
+    );
+    hex_pair_case!(hex_pair_rejects_missing_separator, "00000001", None);
+    hex_pair_case!(hex_pair_rejects_invalid_hex, "00000001:not-hex", None);
+
+    fn socket_table_row(queue: &str, inode: u64) -> String {
+        format!(
+            "sl local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode\n  0: 0100007F:0001 00000000:0000 07 {queue} 00:00000000 00000000 0 0 {inode}\n"
+        )
+    }
+
+    #[test]
+    fn socket_table_ignores_foreign_inode() {
+        let inodes = BTreeSet::from([1]);
+        assert_eq!(
+            parse_socket_table(&socket_table_row("0000000A:0000000B", 2), &inodes),
+            (0, 0, 0)
+        );
+    }
+
+    #[test]
+    fn socket_table_accumulates_multiple_owned_rows() {
+        let mut inodes = BTreeSet::from([11, 22]);
+        let table = format!(
+            "{}  1: 0100007F:0002 00000000:0000 07 00000003:00000004 00:00000000 00000000 0 0 22\n",
+            socket_table_row("00000001:00000002", 11)
+        );
+        assert_eq!(parse_socket_table(&table, &inodes), (2, 4, 6));
+        inodes.clear();
+    }
+
+    #[test]
+    fn socket_table_rejects_malformed_queue_for_owned_inode() {
+        let inodes = BTreeSet::from([9]);
+        assert_eq!(
+            parse_socket_table(&socket_table_row("not-a-queue", 9), &inodes),
+            (0, 0, 0)
+        );
+    }
+
+    #[test]
+    fn socket_table_accepts_inode_at_compatibility_column() {
+        let table = "sl local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode\n  0: 0100007F:0001 00000000:0000 07 0000000A:0000000B 00:00000000 00000000 0 0 ignored 77\n";
+        let inodes = BTreeSet::from([77]);
+        assert_eq!(parse_socket_table(table, &inodes), (1, 10, 11));
+    }
+
+    #[test]
+    fn cgroup_directory_joins_absolute_style_relative_path() {
+        assert_eq!(
+            cgroup_directory(Path::new("/sys/fs/cgroup"), "/system.slice/csqtt.service"),
+            Some(PathBuf::from("/sys/fs/cgroup/system.slice/csqtt.service"))
+        );
+    }
+
+    #[test]
+    fn cgroup_directory_joins_empty_relative_path() {
+        assert_eq!(
+            cgroup_directory(Path::new("/sys/fs/cgroup"), ""),
+            Some(PathBuf::from("/sys/fs/cgroup"))
+        );
+    }
+
+    #[test]
+    fn cgroup_directory_rejects_parent_traversal() {
+        assert_eq!(
+            cgroup_directory(Path::new("/sys/fs/cgroup"), "a/../b"),
+            None
+        );
+    }
+
+    #[test]
+    fn cgroup_directory_rejects_current_directory_component() {
+        assert_eq!(cgroup_directory(Path::new("/sys/fs/cgroup"), "a/./b"), None);
     }
 }

@@ -207,7 +207,7 @@ class TunVpnService : VpnService() {
             }
             Log.d(TAG, "VPN interface established: IP=$clientIp DNS=$dns fd=$tunFd")
 
-            sendTunFd(pfd)
+            sendTunFd(pfd, dns)
         } catch (e: Exception) {
             Log.e(TAG, "Failed to start VPN: ${e.message}", e)
             failVpn(e.message ?: e.javaClass.simpleName)
@@ -215,7 +215,7 @@ class TunVpnService : VpnService() {
         }
     }
 
-    private fun sendTunFd(pfd: ParcelFileDescriptor) {
+    private fun sendTunFd(pfd: ParcelFileDescriptor, dns: String? = null) {
         sendJob?.cancel()
         sendJob = serviceScope.launch {
             var success = false
@@ -225,10 +225,15 @@ class TunVpnService : VpnService() {
                     socket.connect(android.net.LocalSocketAddress("csqtt_tun_uds", android.net.LocalSocketAddress.Namespace.ABSTRACT))
                     socket.setFileDescriptorsForSend(arrayOf(pfd.fileDescriptor))
                     socket.outputStream.write(1)
+                    socket.outputStream.flush()
+                    socket.soTimeout = 3_000
+                    if (socket.inputStream.read() != 1) {
+                        throw IllegalStateException("Rust-клиент не подтвердил TUN-интерфейс")
+                    }
                     Log.d(TAG, "Sent TUN fd to Rust client successfully")
                     success = true
                     recoveryAttempts = 0
-                    TunnelManager.onVpnInterfaceReady()
+                    TunnelManager.onVpnInterfaceReady(dns)
                     break
                 } catch (e: Exception) {
                     Log.d(TAG, "Failed to connect to Rust client UDS, retrying: ${e.message}")
@@ -239,6 +244,14 @@ class TunVpnService : VpnService() {
             }
             if (!success) {
                 Log.e(TAG, "Could not send TUN fd to Rust client after 20 retries")
+                if (!dns.isNullOrBlank()) {
+                    TunnelManager.updateLog(
+                        "vpn_dns_delivery_error_$dns",
+                        "[SERVER] DNS не применён: ${dnsProfileName(dns)} — Rust-клиент не принял TUN-интерфейс",
+                        99,
+                        true,
+                    )
+                }
                 recoverAfterFdFailure(pfd)
             }
         }

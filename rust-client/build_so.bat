@@ -11,6 +11,7 @@ set "PROVENANCE_SCRIPT=%PROJECT_ROOT%scripts\native_client_provenance.ps1"
 set "PARALLEL_BUILD_SCRIPT=%RUST_CLIENT_DIR%build_android_abis.ps1"
 set "ARM64_TARGET_DIR=%PROJECT_ROOT%build\rust-client-android-arm64"
 set "ARMV7_TARGET_DIR=%PROJECT_ROOT%build\rust-client-android-armv7"
+set "X86_64_TARGET_DIR=%PROJECT_ROOT%build\rust-client-android-x86_64"
 set "RUN_TESTS="
 
 if /I "%~1"=="--tests" set "RUN_TESTS=1"
@@ -92,12 +93,16 @@ if "%RUN_TESTS%"=="1" (
 
 if not exist "%ANDROID_JNILIBS%\arm64-v8a" mkdir "%ANDROID_JNILIBS%\arm64-v8a"
 if not exist "%ANDROID_JNILIBS%\armeabi-v7a" mkdir "%ANDROID_JNILIBS%\armeabi-v7a"
-powershell -NoProfile -ExecutionPolicy Bypass -File "%PARALLEL_BUILD_SCRIPT%" -ClientDir "%RUST_CLIENT_DIR:~0,-1%" -Arm64TargetDir "%ARM64_TARGET_DIR%" -Armv7TargetDir "%ARMV7_TARGET_DIR%"
+if not exist "%ANDROID_JNILIBS%\x86_64" mkdir "%ANDROID_JNILIBS%\x86_64"
+if exist "%ANDROID_JNILIBS%\x86\libclient.so" del /Q "%ANDROID_JNILIBS%\x86\libclient.so"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%PARALLEL_BUILD_SCRIPT%" -ClientDir "%RUST_CLIENT_DIR:~0,-1%" -Arm64TargetDir "%ARM64_TARGET_DIR%" -Armv7TargetDir "%ARMV7_TARGET_DIR%" -X8664TargetDir "%X86_64_TARGET_DIR%"
 if %errorlevel% neq 0 goto fail
 
 copy /Y "%ARM64_TARGET_DIR%\aarch64-linux-android\release\client" "%ANDROID_JNILIBS%\arm64-v8a\libclient.so" >nul
 if %errorlevel% neq 0 goto fail
 copy /Y "%ARMV7_TARGET_DIR%\armv7-linux-androideabi\release\client" "%ANDROID_JNILIBS%\armeabi-v7a\libclient.so" >nul
+if %errorlevel% neq 0 goto fail
+copy /Y "%X86_64_TARGET_DIR%\x86_64-linux-android\release\client" "%ANDROID_JNILIBS%\x86_64\libclient.so" >nul
 if %errorlevel% neq 0 goto fail
 
 powershell -NoProfile -ExecutionPolicy Bypass -File "%PROVENANCE_SCRIPT%" -Mode Write
@@ -107,6 +112,7 @@ if %errorlevel% neq 0 goto fail
 
 for %%F in ("%ANDROID_JNILIBS%\arm64-v8a\libclient.so") do echo arm64-v8a: %%~zF bytes
 for %%F in ("%ANDROID_JNILIBS%\armeabi-v7a\libclient.so") do echo armeabi-v7a: %%~zF bytes
+for %%F in ("%ANDROID_JNILIBS%\x86_64\libclient.so") do echo x86_64: %%~zF bytes
 
 :end
 echo Build completed successfully.

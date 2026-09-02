@@ -42,6 +42,16 @@ class TunnelLogPolicyTest {
                 "GETCONF: FATAL_AUTH: неверный пароль подключения"
             )
         )
+        assertFalse(
+            TunnelLogPolicy.isInternalRecovery(
+                "GETCONF: FATAL_PROTOCOL: клиент и сервер используют разные версии протокола"
+            )
+        )
+        assertFalse(
+            TunnelLogPolicy.isInternalRecovery(
+                "GETCONF: FATAL_HANDSHAKE: сервер не подтвердил конфигурацию"
+            )
+        )
     }
 
     @Test

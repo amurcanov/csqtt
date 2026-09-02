@@ -23,8 +23,8 @@ use turn_tokio_rustls::TlsConnector;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 4096;
 const MAX_DATA_FRAME_BYTES: usize = PACKET_CAPACITY - PACKET_HEADROOM;
 const CONTROL_QUEUE_CAPACITY: usize = 16;
-const DATA_QUEUE_CAPACITY: usize = 8;
-const TCP_SEND_BUFFER_BYTES: usize = 32 * 1024;
+const DATA_QUEUE_CAPACITY: usize = 32;
+const TCP_SEND_BUFFER_BYTES: usize = 128 * 1024;
 const STREAM_READ_BUFFER_BYTES: usize = MAX_CONTROL_FRAME_BYTES;
 
 trait AsyncTurnStream: AsyncRead + AsyncWrite + Send + Unpin {}
@@ -105,14 +105,11 @@ impl TurnStreamWriter {
             .context("TURN stream control queue closed")
     }
 
-    pub fn try_write_data(&self, packet: PacketBuf) -> Result<bool> {
-        match self.data.try_send(packet) {
-            Ok(()) => Ok(true),
-            Err(mpsc::error::TrySendError::Full(_)) => Ok(false),
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                bail!("TURN stream data queue closed")
-            }
-        }
+    pub async fn write_data(&self, packet: PacketBuf) -> Result<()> {
+        self.data
+            .send(packet)
+            .await
+            .context("TURN stream data queue closed")
     }
 }
 
@@ -290,6 +287,32 @@ fn tls_config() -> Arc<ClientConfig> {
 mod tests {
     use super::*;
     use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn stream_data_backpressure_keeps_the_packet_until_the_writer_accepts_it() {
+        let (control, _control_rx) = mpsc::channel(1);
+        let (data, mut data_rx) = mpsc::channel(1);
+        let writer = Arc::new(TurnStreamWriter { control, data });
+        let pool = PacketPool::new(2);
+        writer.write_data(pool.acquire()).await.unwrap();
+
+        let pending_writer = writer.clone();
+        let pending_packet = pool.acquire();
+        let pending = tokio::spawn(async move { pending_writer.write_data(pending_packet).await });
+        tokio::task::yield_now().await;
+        assert!(!pending.is_finished());
+
+        drop(data_rx.recv().await);
+        pending.await.unwrap().unwrap();
+        assert!(data_rx.recv().await.is_some());
+        assert_eq!(pool.available(), pool.capacity());
+    }
+
+    #[test]
+    fn stream_send_buffers_cover_a_two_megabit_worker_with_rtt_headroom() {
+        assert_eq!(DATA_QUEUE_CAPACITY, 32);
+        assert_eq!(TCP_SEND_BUFFER_BYTES, 128 * 1024);
+    }
 
     #[tokio::test]
     async fn stream_reader_parses_control_and_padded_channel_data() {

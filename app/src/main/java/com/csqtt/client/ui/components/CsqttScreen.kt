@@ -78,8 +78,8 @@ fun CsqttScreen(
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
                     Icon(
-                        painter = painterResource(id = R.drawable.ic_v205_by_amurcanov),
-                        contentDescription = "v2.1.5 by amurcanov",
+                        painter = painterResource(id = R.drawable.ic_v219_by_amurcanov),
+                        contentDescription = "v2.1.9 by amurcanov",
                         tint = Color.Unspecified,
                         modifier = Modifier.height(19.dp)
                     )

@@ -65,8 +65,6 @@ internal data class DeployUiState(
     val host: String = "",
     val sshLogin: String = "",
     val sshPassword: String = "",
-    val primaryDns: String = "8.8.8.8",
-    val secondaryDns: String = "8.8.4.4",
     val manualPorts: Boolean = false,
     val sshPort: String = CsqttConstants.Network.DEFAULT_SSH_PORT.toString(),
     val peerPort: String = CsqttConstants.Network.DEFAULT_SERVER_PEER_PORT.toString(),
@@ -101,8 +99,6 @@ internal sealed interface DeployAction {
     data class HostChanged(val value: String) : DeployAction
     data class LoginChanged(val value: String) : DeployAction
     data class PasswordChanged(val value: String) : DeployAction
-    data class PrimaryDnsChanged(val value: String) : DeployAction
-    data class SecondaryDnsChanged(val value: String) : DeployAction
     data class ManualPortsChanged(val enabled: Boolean) : DeployAction
     data class SshKeysModeChanged(val enabled: Boolean) : DeployAction
     data class DockerInstallChanged(val enabled: Boolean) : DeployAction
@@ -117,6 +113,9 @@ internal sealed interface DeployAction {
     data object OpenControlPanel : DeployAction
     data object PanelInfo : DeployAction
 }
+
+internal fun passwordToSynchronizeAfterDeploy(deploySucceeded: Boolean, mainPassword: String): String? =
+    mainPassword.takeIf { deploySucceeded && it.isNotBlank() }
 
 internal fun isValidPort(value: String): Boolean = value.toIntOrNull() in 1..65535
 
@@ -177,8 +176,6 @@ internal fun DeployTab(
     val savedPassword = savedSettings.sshPassword
     val savedWebLogin = savedSettings.webLogin
     val savedWebPassword = savedSettings.webPassword
-    val savedDns1 = savedSettings.primaryDns
-    val savedDns2 = savedSettings.secondaryDns
     val savedMainPass = savedSettings.mainPassword
     val savedSshPort = savedSettings.sshPort
     val savedManualPorts = savedSettings.manualPortsEnabled
@@ -196,8 +193,6 @@ internal fun DeployTab(
     var host by rememberSaveable(savedSettings.profile) { mutableStateOf(savedIp) }
     var sshLogin by rememberSaveable(savedSettings.profile) { mutableStateOf(savedLogin) }
     var sshPassword by rememberSaveable(savedSettings.profile) { mutableStateOf(savedPassword) }
-    var primaryDns by rememberSaveable(savedSettings.profile) { mutableStateOf(savedDns1) }
-    var secondaryDns by rememberSaveable(savedSettings.profile) { mutableStateOf(savedDns2) }
     var sshPort by rememberSaveable(savedSettings.profile) {
         mutableStateOf(savedSshPort.ifBlank { CsqttConstants.Network.DEFAULT_SSH_PORT.toString() })
     }
@@ -214,11 +209,9 @@ internal fun DeployTab(
     var showSshKeysDialog by rememberSaveable(savedSettings.profile) { mutableStateOf(false) }
     var showDockerInfoDialog by rememberSaveable(savedSettings.profile) { mutableStateOf(false) }
 
-    LaunchedEffect(savedSettings.profile, savedIp, savedDns1, savedDns2) {
+    LaunchedEffect(savedSettings.profile, savedIp) {
         if (!generalEdited) {
             host = savedIp
-            primaryDns = savedDns1
-            secondaryDns = savedDns2
         }
     }
     LaunchedEffect(savedSettings.profile, savedLogin, savedPassword) {
@@ -238,10 +231,10 @@ internal fun DeployTab(
         dockerInstall = savedDockerInstall
     }
 
-    LaunchedEffect(savedSettings.profile, host, primaryDns, secondaryDns, generalEdited) {
+    LaunchedEffect(savedSettings.profile, host, generalEdited) {
         if (!generalEdited) return@LaunchedEffect
         kotlinx.coroutines.delay(450)
-        settingsStore.saveDeploy(host, primaryDns, secondaryDns)
+        settingsStore.saveDeploy(host)
     }
     LaunchedEffect(savedSettings.profile, sshLogin, sshPassword, credentialsEdited, savedMainPass, savedWebLogin, savedWebPassword) {
         if (!credentialsEdited) return@LaunchedEffect
@@ -263,8 +256,6 @@ internal fun DeployTab(
         host = host,
         sshLogin = sshLogin,
         sshPassword = sshPassword,
-        primaryDns = primaryDns,
-        secondaryDns = secondaryDns,
         manualPorts = savedManualPorts,
         sshPort = sshPort,
         peerPort = peerPort,
@@ -291,7 +282,7 @@ internal fun DeployTab(
         val deployCertificate = if (savedSshKeysMode) savedSshCertificate else ""
         val deployPassword = if (savedSshKeysMode) "" else sshPassword
         scope.launch {
-            settingsStore.saveDeploy(host, primaryDns, secondaryDns)
+            settingsStore.saveDeploy(host)
             settingsStore.saveDeploySecrets(savedMainPass, sshLogin, sshPassword, savedWebLogin, savedWebPassword)
             settingsStore.savePorts(effectivePeerPort, effectiveWebPort, effectiveSshPort.toString())
         }
@@ -310,8 +301,6 @@ internal fun DeployTab(
                     webPass = savedWebPassword,
                     peerPort = effectivePeerPort,
                     webPort = effectiveWebPort,
-                    dns1 = primaryDns,
-                    dns2 = secondaryDns,
                     onProgress = DeployManager::updateProgress,
                     privateKey = deployPrivateKey,
                     keyPassphrase = deployKeyPassphrase,
@@ -319,6 +308,10 @@ internal fun DeployTab(
                     installInDocker = dockerInstall,
                 )
                 if (success) {
+                    passwordToSynchronizeAfterDeploy(success, savedMainPass)?.let { mainPassword ->
+                        settingsStore.saveConnectionPassword(mainPassword)
+                        TunnelManager.addDeployInfoLog("Пароль подключения синхронизирован с паролем сервера")
+                    }
                     showDeployToast(context, "Установка успешно завершена")
                 } else {
                     val message = DeployManager.lastResult.value.ifBlank { "Ошибка установки" }
@@ -411,14 +404,6 @@ internal fun DeployTab(
                 is DeployAction.PasswordChanged -> {
                     sshPassword = sanitizeSshPassword(action.value)
                     credentialsEdited = true
-                }
-                is DeployAction.PrimaryDnsChanged -> {
-                    primaryDns = action.value.filterNot(Char::isWhitespace)
-                    generalEdited = true
-                }
-                is DeployAction.SecondaryDnsChanged -> {
-                    secondaryDns = action.value.filterNot(Char::isWhitespace)
-                    generalEdited = true
                 }
                 is DeployAction.ManualPortsChanged -> {
                     if (!action.enabled) {

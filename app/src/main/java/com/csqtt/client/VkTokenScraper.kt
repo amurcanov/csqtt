@@ -3,7 +3,7 @@
 
 package com.csqtt.client
 
-import android.net.Uri
+import androidx.core.net.toUri
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.net.HttpURLConnection
@@ -73,7 +73,7 @@ internal object VkTokenScraper {
         if (!urlStr.contains("access_token=")) return null
         
         val fragmentPart = try {
-            Uri.parse(urlStr).encodedFragment ?: urlStr.substringAfter("#", "").ifEmpty { urlStr.substringAfter("?", "") }
+            urlStr.toUri().encodedFragment ?: urlStr.substringAfter("#", "").ifEmpty { urlStr.substringAfter("?", "") }
         } catch (e: Exception) {
             urlStr.substringAfter("#", "").ifEmpty { urlStr.substringAfter("?", "") }
         }

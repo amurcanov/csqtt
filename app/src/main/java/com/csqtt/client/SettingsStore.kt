@@ -33,8 +33,6 @@ internal data class DeploySettingsSnapshot(
     val sshPassword: String = "",
     val webLogin: String = "",
     val webPassword: String = "",
-    val primaryDns: String = "8.8.8.8",
-    val secondaryDns: String = "8.8.4.4",
     val mainPassword: String = "",
     val sshPort: String = CsqttConstants.Network.DEFAULT_SSH_PORT.toString(),
     val manualPortsEnabled: Boolean = false,
@@ -53,6 +51,7 @@ internal data class DeploySettingsSnapshot(
 internal data class TunnelAuthSnapshot(
     val profile: Int = -1,
     val connectionPassword: String = "",
+    val connectionPasswordState: StoredSecretState = StoredSecretState.Missing,
 ) {
     val isLoaded: Boolean
         get() = profile >= 0
@@ -96,14 +95,13 @@ class SettingsStore(context: Context) {
         private val SSH_KEY_PASSPHRASE_ENCRYPTED = stringPreferencesKey("ssh_key_passphrase_encrypted")
         private val SSH_CERTIFICATE = stringPreferencesKey("ssh_certificate")
         private val SSH_CERTIFICATE_ENCRYPTED = stringPreferencesKey("ssh_certificate_encrypted")
-        private val DEPLOY_DNS1 = stringPreferencesKey("deploy_dns1")
-        private val DEPLOY_DNS2 = stringPreferencesKey("deploy_dns2")
         private val EXCLUDED_APPS = stringPreferencesKey("excluded_apps")
 
         private val DETAILED_LOGS = booleanPreferencesKey("detailed_logs")
 
         private val CONNECTION_PASSWORD = stringPreferencesKey("connection_password")
         private val CONNECTION_PASSWORD_ENCRYPTED = stringPreferencesKey("connection_password_encrypted")
+        private val CONNECTION_PASSWORD_LOCAL = stringPreferencesKey("connection_password_local")
         private val DEPLOY_MAIN_PASSWORD = stringPreferencesKey("deploy_main_password")
         private val DEPLOY_MAIN_PASSWORD_ENCRYPTED = stringPreferencesKey("deploy_main_password_encrypted")
         private val DEPLOY_WEB_LOGIN = stringPreferencesKey("deploy_web_login")
@@ -192,7 +190,7 @@ class SettingsStore(context: Context) {
             val newName = "${baseKey.name}_$profile"
             @Suppress("UNCHECKED_CAST")
             return when (baseKey) {
-                PEER, VK_HASHES, SECONDARY_VK_HASH, PROTOCOL, SNI, USER_AGENT, DEPLOY_IP, DEPLOY_LOGIN, DEPLOY_PASSWORD, DEPLOY_PASSWORD_ENCRYPTED, DEPLOY_SSH_PORT, DEPLOY_DNS1, DEPLOY_DNS2, EXCLUDED_APPS, CONNECTION_PASSWORD, CONNECTION_PASSWORD_ENCRYPTED, DEPLOY_MAIN_PASSWORD, DEPLOY_MAIN_PASSWORD_ENCRYPTED, DEPLOY_WEB_LOGIN, DEPLOY_WEB_PASSWORD, DEPLOY_WEB_PASSWORD_ENCRYPTED, PROXY_MODE, PROXY_HOST, VK_AUTH_MODE, OBFS_MODE, TURN_TRANSPORT, CAPTCHA_MODE, CAPTCHA_SOLVE_METHOD, CAPTCHA_WBV_SOLVE_METHOD, CSQTT_LINK, SELECTED_FINGERPRINT, ACTIVE_CLIENT_IDS, VK_HASH_MODE, VK_ACCESS_TOKEN, VK_ACCESS_TOKEN_ENCRYPTED, VK_ACCESS_TOKEN_USER_ID, SSH_PRIVATE_KEY, SSH_PRIVATE_KEY_ENCRYPTED, SSH_KEY_PASSPHRASE, SSH_KEY_PASSPHRASE_ENCRYPTED, SSH_CERTIFICATE, SSH_CERTIFICATE_ENCRYPTED, VK_HASH_CHECK_RESULTS, CLIENT_ID_CHECK_RESULTS -> stringPreferencesKey(newName) as Preferences.Key<T>
+                PEER, VK_HASHES, SECONDARY_VK_HASH, PROTOCOL, SNI, USER_AGENT, DEPLOY_IP, DEPLOY_LOGIN, DEPLOY_PASSWORD, DEPLOY_PASSWORD_ENCRYPTED, DEPLOY_SSH_PORT, EXCLUDED_APPS, CONNECTION_PASSWORD, CONNECTION_PASSWORD_ENCRYPTED, CONNECTION_PASSWORD_LOCAL, DEPLOY_MAIN_PASSWORD, DEPLOY_MAIN_PASSWORD_ENCRYPTED, DEPLOY_WEB_LOGIN, DEPLOY_WEB_PASSWORD, DEPLOY_WEB_PASSWORD_ENCRYPTED, PROXY_MODE, PROXY_HOST, VK_AUTH_MODE, OBFS_MODE, TURN_TRANSPORT, CAPTCHA_MODE, CAPTCHA_SOLVE_METHOD, CAPTCHA_WBV_SOLVE_METHOD, CSQTT_LINK, SELECTED_FINGERPRINT, ACTIVE_CLIENT_IDS, VK_HASH_MODE, VK_ACCESS_TOKEN, VK_ACCESS_TOKEN_ENCRYPTED, VK_ACCESS_TOKEN_USER_ID, SSH_PRIVATE_KEY, SSH_PRIVATE_KEY_ENCRYPTED, SSH_KEY_PASSPHRASE, SSH_KEY_PASSPHRASE_ENCRYPTED, SSH_CERTIFICATE, SSH_CERTIFICATE_ENCRYPTED, VK_HASH_CHECK_RESULTS, CLIENT_ID_CHECK_RESULTS -> stringPreferencesKey(newName) as Preferences.Key<T>
                 WORKERS_PER_HASH, LISTEN_PORT, SERVER_PEER_PORT, PROXY_PORT, SERVER_WEB_PORT -> intPreferencesKey(newName) as Preferences.Key<T>
                 MANUAL_PORTS_ENABLED, NO_DNS, IS_WHITELIST, CSQTT_LINK_MODE, DETAILED_LOGS, SSH_KEYS_MODE, DOCKER_INSTALL, EXTRA_WORKERS, SPLIT_TUNNEL_WHITELIST_MIGRATED -> booleanPreferencesKey(newName) as Preferences.Key<T>
                 CONNECTION_GENERATION -> longPreferencesKey(newName) as Preferences.Key<T>
@@ -209,6 +207,7 @@ class SettingsStore(context: Context) {
         // would spam DataStore edits on each construction of the store.
         if (migrationsStarted.compareAndSet(false, true)) {
             CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
+                migrateConnectionPasswordsToLocalStorage()
                 migrateSecretsToKeystore()
                 migrateLegacyWhitelistMode()
             }
@@ -301,14 +300,6 @@ class SettingsStore(context: Context) {
         val profile = prefs[ACTIVE_PROFILE] ?: 0
         prefs[getProfileKey(DEPLOY_SSH_PORT, profile)] ?: ""
     }
-    val deployDns1: Flow<String> = dataStore.data.map { prefs ->
-        val profile = prefs[ACTIVE_PROFILE] ?: 0
-        prefs[getProfileKey(DEPLOY_DNS1, profile)] ?: "8.8.8.8"
-    }
-    val deployDns2: Flow<String> = dataStore.data.map { prefs ->
-        val profile = prefs[ACTIVE_PROFILE] ?: 0
-        prefs[getProfileKey(DEPLOY_DNS2, profile)] ?: "8.8.4.4"
-    }
     internal val deploySettingsSnapshot: Flow<DeploySettingsSnapshot> = dataStore.data.map { prefs ->
         val profile = prefs[ACTIVE_PROFILE] ?: 0
         DeploySettingsSnapshot(
@@ -318,8 +309,6 @@ class SettingsStore(context: Context) {
             sshPassword = readSecret(prefs, DEPLOY_PASSWORD_ENCRYPTED, DEPLOY_PASSWORD, profile),
             webLogin = prefs[getProfileKey(DEPLOY_WEB_LOGIN, profile)] ?: "",
             webPassword = readSecret(prefs, DEPLOY_WEB_PASSWORD_ENCRYPTED, DEPLOY_WEB_PASSWORD, profile),
-            primaryDns = prefs[getProfileKey(DEPLOY_DNS1, profile)] ?: "8.8.8.8",
-            secondaryDns = prefs[getProfileKey(DEPLOY_DNS2, profile)] ?: "8.8.4.4",
             mainPassword = readSecret(prefs, DEPLOY_MAIN_PASSWORD_ENCRYPTED, DEPLOY_MAIN_PASSWORD, profile),
             sshPort = prefs[getProfileKey(DEPLOY_SSH_PORT, profile)]
                 ?.ifBlank { CsqttConstants.Network.DEFAULT_SSH_PORT.toString() }
@@ -338,14 +327,11 @@ class SettingsStore(context: Context) {
     }.onIo()
     internal val tunnelAuthSnapshot: Flow<TunnelAuthSnapshot> = dataStore.data.map { prefs ->
         val profile = prefs[ACTIVE_PROFILE] ?: 0
+        val connectionPassword = readConnectionPasswordState(prefs, profile)
         TunnelAuthSnapshot(
             profile = profile,
-            connectionPassword = readSecret(
-                prefs,
-                CONNECTION_PASSWORD_ENCRYPTED,
-                CONNECTION_PASSWORD,
-                profile,
-            ),
+            connectionPassword = connectionPassword.value,
+            connectionPasswordState = connectionPassword.state,
         )
     }.onIo()
     val excludedApps: Flow<String> = dataStore.data.map { prefs ->
@@ -353,10 +339,11 @@ class SettingsStore(context: Context) {
         prefs[getProfileKey(EXCLUDED_APPS, profile)] ?: ""
     }
 
-    val connectionPassword: Flow<String> = dataStore.data.map { prefs ->
+    internal val connectionPasswordState: Flow<StoredSecret> = dataStore.data.map { prefs ->
         val profile = prefs[ACTIVE_PROFILE] ?: 0
-        readSecret(prefs, CONNECTION_PASSWORD_ENCRYPTED, CONNECTION_PASSWORD, profile)
+        readConnectionPasswordState(prefs, profile)
     }.onIo()
+    val connectionPassword: Flow<String> = connectionPasswordState.map { it.value }
     val deployMainPassword: Flow<String> = dataStore.data.map { prefs ->
         val profile = prefs[ACTIVE_PROFILE] ?: 0
         readSecret(prefs, DEPLOY_MAIN_PASSWORD_ENCRYPTED, DEPLOY_MAIN_PASSWORD, profile)
@@ -667,6 +654,17 @@ class SettingsStore(context: Context) {
         }
     }
 
+    suspend fun saveParticipantTunnelSettings(vkHashes: String, workersPerHash: Int) {
+        dataStore.edit { prefs ->
+            val profile = prefs[ACTIVE_PROFILE] ?: 0
+            val isExtra = prefs[getProfileKey(EXTRA_WORKERS, profile)] ?: false
+            val max = WorkerCountPolicy.defaultMaximum(isExtra)
+            prefs[getProfileKey(VK_HASHES, profile)] = vkHashes
+            prefs[getProfileKey(WORKERS_PER_HASH, profile)] =
+                WorkerCountPolicy.normalize(workersPerHash, maximum = max)
+        }
+    }
+
     suspend fun save(
         peer: String,
         vkHashes: String,
@@ -744,12 +742,10 @@ class SettingsStore(context: Context) {
         }
     }
 
-    suspend fun saveDeploy(ip: String, dns1: String, dns2: String) {
+    suspend fun saveDeploy(ip: String) {
         val profile = activeProfile.first()
         dataStore.edit { prefs ->
             prefs[getProfileKey(DEPLOY_IP, profile)] = ip
-            prefs[getProfileKey(DEPLOY_DNS1, profile)] = dns1
-            prefs[getProfileKey(DEPLOY_DNS2, profile)] = dns2
         }
     }
 
@@ -764,8 +760,41 @@ class SettingsStore(context: Context) {
     suspend fun saveConnectionPassword(password: String) {
         dataStore.edit { prefs ->
             val profile = prefs[ACTIVE_PROFILE] ?: 0
-            prefs.putSecret(CONNECTION_PASSWORD_ENCRYPTED, CONNECTION_PASSWORD, password, profile)
+            val localKey = getProfileKey(CONNECTION_PASSWORD_LOCAL, profile)
+            val legacyKey = getProfileKey(CONNECTION_PASSWORD, profile)
+            val encryptedKey = getProfileKey(CONNECTION_PASSWORD_ENCRYPTED, profile)
+            if (password.isBlank()) {
+                prefs.remove(localKey)
+            } else {
+                prefs[localKey] = password
+            }
+            prefs.remove(legacyKey)
+            prefs.remove(encryptedKey)
         }
+    }
+
+    suspend fun resetUnreadableConnectionPassword(): Boolean {
+        var reset = false
+        dataStore.edit { prefs ->
+            val profile = prefs[ACTIVE_PROFILE] ?: 0
+            val localKey = getProfileKey(CONNECTION_PASSWORD_LOCAL, profile)
+            val legacyKey = getProfileKey(CONNECTION_PASSWORD, profile)
+            val encryptedKey = getProfileKey(CONNECTION_PASSWORD_ENCRYPTED, profile)
+            if (
+                shouldResetUnreadableTunnelPassword(
+                    prefs[localKey],
+                    prefs[legacyKey],
+                    prefs[encryptedKey],
+                    secureStore::decrypt,
+                )
+            ) {
+                prefs.remove(localKey)
+                prefs.remove(legacyKey)
+                prefs.remove(encryptedKey)
+                reset = true
+            }
+        }
+        return reset
     }
 
     suspend fun saveDeploySecrets(mainPass: String, sshLogin: String, sshPass: String, webLogin: String, webPass: String) {
@@ -928,9 +957,33 @@ class SettingsStore(context: Context) {
         dataStore.edit { prefs ->
             for (profile in CsqttConstants.Profiles.MIN_INDEX..CsqttConstants.Profiles.MAX_INDEX) {
                 prefs.migrateSecret(getProfileKey(DEPLOY_PASSWORD_ENCRYPTED, profile), getProfileKey(DEPLOY_PASSWORD, profile))
-                prefs.migrateSecret(getProfileKey(CONNECTION_PASSWORD_ENCRYPTED, profile), getProfileKey(CONNECTION_PASSWORD, profile))
                 prefs.migrateSecret(getProfileKey(DEPLOY_MAIN_PASSWORD_ENCRYPTED, profile), getProfileKey(DEPLOY_MAIN_PASSWORD, profile))
                 prefs.migrateSecret(getProfileKey(DEPLOY_WEB_PASSWORD_ENCRYPTED, profile), getProfileKey(DEPLOY_WEB_PASSWORD, profile))
+            }
+        }
+    }
+
+    private suspend fun migrateConnectionPasswordsToLocalStorage() {
+        dataStore.edit { prefs ->
+            for (profile in CsqttConstants.Profiles.MIN_INDEX..CsqttConstants.Profiles.MAX_INDEX) {
+                val localKey = getProfileKey(CONNECTION_PASSWORD_LOCAL, profile)
+                val legacyKey = getProfileKey(CONNECTION_PASSWORD, profile)
+                val encryptedKey = getProfileKey(CONNECTION_PASSWORD_ENCRYPTED, profile)
+                val password = resolveTunnelPasswordStorage(
+                    prefs[localKey],
+                    prefs[legacyKey],
+                    prefs[encryptedKey],
+                    secureStore::decrypt,
+                )
+                if (password.state == StoredSecretState.Readable) {
+                    if (password.value.isBlank()) {
+                        prefs.remove(localKey)
+                    } else {
+                        prefs[localKey] = password.value
+                    }
+                    prefs.remove(legacyKey)
+                    prefs.remove(encryptedKey)
+                }
             }
         }
     }
@@ -983,11 +1036,32 @@ class SettingsStore(context: Context) {
         encryptedKey: Preferences.Key<String>,
         legacyKey: Preferences.Key<String>,
         profile: Int
-    ): String {
+    ): String = readSecretState(prefs, encryptedKey, legacyKey, profile).value
+
+    private fun readSecretState(
+        prefs: Preferences,
+        encryptedKey: Preferences.Key<String>,
+        legacyKey: Preferences.Key<String>,
+        profile: Int
+    ): StoredSecret {
         val profEncryptedKey = getProfileKey(encryptedKey, profile)
         val profLegacyKey = getProfileKey(legacyKey, profile)
-        return secureStore.decrypt(prefs[profEncryptedKey]) ?: prefs[profLegacyKey] ?: ""
+        return resolveStoredSecret(
+            prefs[profEncryptedKey],
+            prefs[profLegacyKey],
+            secureStore::decrypt,
+        )
     }
+
+    private fun readConnectionPasswordState(
+        prefs: Preferences,
+        profile: Int,
+    ): StoredSecret = resolveTunnelPasswordStorage(
+        prefs[getProfileKey(CONNECTION_PASSWORD_LOCAL, profile)],
+        prefs[getProfileKey(CONNECTION_PASSWORD, profile)],
+        prefs[getProfileKey(CONNECTION_PASSWORD_ENCRYPTED, profile)],
+        secureStore::decrypt,
+    )
 
     private fun MutablePreferences.putSecret(
         encryptedKey: Preferences.Key<String>,

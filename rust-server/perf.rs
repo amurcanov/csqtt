@@ -350,8 +350,9 @@ fn parse_proc_stat(stat: &str) -> Option<(&str, u64, u64)> {
 }
 
 fn ticks_to_ns(user_ticks: u64, system_ticks: u64) -> Option<(u64, u64)> {
+    #[allow(clippy::useless_conversion)]
     static TICKS_PER_SECOND: LazyLock<i64> =
-        LazyLock::new(|| unsafe { libc::sysconf(libc::_SC_CLK_TCK) });
+        LazyLock::new(|| unsafe { libc::sysconf(libc::_SC_CLK_TCK).into() });
     let ticks_per_second = *TICKS_PER_SECOND;
     if ticks_per_second <= 0 {
         return None;
@@ -376,4 +377,273 @@ fn clock_time_ns(clock: libc::clockid_t) -> u64 {
     (value.tv_sec as u64)
         .saturating_mul(1_000_000_000)
         .saturating_add(value.tv_nsec as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    macro_rules! counter_delta_case {
+        ($name:ident, $field:ident, $current:expr, $previous:expr, $expected:expr) => {
+            #[test]
+            fn $name() {
+                let current = Counters {
+                    $field: $current,
+                    ..Counters::default()
+                };
+                let previous = Counters {
+                    $field: $previous,
+                    ..Counters::default()
+                };
+                assert_eq!(current.delta(previous).$field, $expected);
+            }
+        };
+    }
+
+    counter_delta_case!(counter_delta_operations_increase, operations, 9, 4, 5);
+    counter_delta_case!(
+        counter_delta_operations_rolls_back_to_zero,
+        operations,
+        4,
+        9,
+        0
+    );
+    counter_delta_case!(counter_delta_bytes_increase, bytes, 4096, 1024, 3072);
+    counter_delta_case!(counter_delta_bytes_rolls_back_to_zero, bytes, 7, 8, 0);
+    counter_delta_case!(counter_delta_samples_increase, samples, 72, 64, 8);
+    counter_delta_case!(counter_delta_samples_rolls_back_to_zero, samples, 63, 64, 0);
+    counter_delta_case!(counter_delta_cpu_increase, sampled_ns, 901, 900, 1);
+    counter_delta_case!(counter_delta_cpu_rolls_back_to_zero, sampled_ns, 0, 1, 0);
+    counter_delta_case!(counter_delta_wall_increase, sampled_wall_ns, 128, 32, 96);
+    counter_delta_case!(
+        counter_delta_wall_rolls_back_to_zero,
+        sampled_wall_ns,
+        1,
+        2,
+        0
+    );
+
+    macro_rules! counter_merge_case {
+        ($name:ident, $field:ident, $left:expr, $right:expr, $expected:expr) => {
+            #[test]
+            fn $name() {
+                let left = Counters {
+                    $field: $left,
+                    ..Counters::default()
+                };
+                let right = Counters {
+                    $field: $right,
+                    ..Counters::default()
+                };
+                assert_eq!(left.add(right).$field, $expected);
+            }
+        };
+    }
+
+    counter_merge_case!(counter_merge_operations_adds, operations, 19, 23, 42);
+    counter_merge_case!(
+        counter_merge_operations_saturates,
+        operations,
+        u64::MAX,
+        1,
+        u64::MAX
+    );
+    counter_merge_case!(counter_merge_bytes_adds, bytes, 12_000, 34_000, 46_000);
+    counter_merge_case!(
+        counter_merge_bytes_saturates,
+        bytes,
+        u64::MAX - 1,
+        2,
+        u64::MAX
+    );
+    counter_merge_case!(counter_merge_samples_adds, samples, 63, 1, 64);
+    counter_merge_case!(
+        counter_merge_samples_saturates,
+        samples,
+        u64::MAX,
+        64,
+        u64::MAX
+    );
+    counter_merge_case!(counter_merge_cpu_adds, sampled_ns, 55, 89, 144);
+    counter_merge_case!(
+        counter_merge_cpu_saturates,
+        sampled_ns,
+        u64::MAX - 7,
+        8,
+        u64::MAX
+    );
+    counter_merge_case!(counter_merge_wall_adds, sampled_wall_ns, 250, 750, 1000);
+    counter_merge_case!(
+        counter_merge_wall_saturates,
+        sampled_wall_ns,
+        u64::MAX,
+        1,
+        u64::MAX
+    );
+
+    macro_rules! snapshot_delta_case {
+        ($name:ident, $field:ident) => {
+            #[test]
+            fn $name() {
+                let current = Snapshot {
+                    $field: Counters {
+                        operations: 21,
+                        bytes: 2100,
+                        samples: 21,
+                        sampled_ns: 210,
+                        sampled_wall_ns: 420,
+                    },
+                    ..Snapshot::default()
+                };
+                let previous = Snapshot {
+                    $field: Counters {
+                        operations: 13,
+                        bytes: 1300,
+                        samples: 13,
+                        sampled_ns: 130,
+                        sampled_wall_ns: 260,
+                    },
+                    ..Snapshot::default()
+                };
+                let delta = current.delta(previous).$field;
+                assert_eq!(delta.operations, 8);
+                assert_eq!(delta.bytes, 800);
+                assert_eq!(delta.samples, 8);
+                assert_eq!(delta.sampled_ns, 80);
+                assert_eq!(delta.sampled_wall_ns, 160);
+            }
+        };
+    }
+
+    snapshot_delta_case!(snapshot_delta_dispatch, dispatch);
+    snapshot_delta_case!(snapshot_delta_udp_rx, udp_rx);
+    snapshot_delta_case!(snapshot_delta_tun_rx, tun_rx);
+    snapshot_delta_case!(snapshot_delta_route_replay, route_replay);
+    snapshot_delta_case!(snapshot_delta_tun_write, tun_write);
+    snapshot_delta_case!(snapshot_delta_udp_queue, udp_queue);
+    snapshot_delta_case!(snapshot_delta_flush, flush);
+    snapshot_delta_case!(snapshot_delta_bookkeeping, bookkeeping);
+
+    macro_rules! snapshot_merge_case {
+        ($name:ident, $field:ident) => {
+            #[test]
+            fn $name() {
+                let left = Snapshot {
+                    $field: Counters {
+                        operations: 3,
+                        bytes: 30,
+                        samples: 3,
+                        sampled_ns: 300,
+                        sampled_wall_ns: 3000,
+                    },
+                    ..Snapshot::default()
+                };
+                let right = Snapshot {
+                    $field: Counters {
+                        operations: 4,
+                        bytes: 40,
+                        samples: 4,
+                        sampled_ns: 400,
+                        sampled_wall_ns: 4000,
+                    },
+                    ..Snapshot::default()
+                };
+                let merged = left.merge(right).$field;
+                assert_eq!(merged.operations, 7);
+                assert_eq!(merged.bytes, 70);
+                assert_eq!(merged.samples, 7);
+                assert_eq!(merged.sampled_ns, 700);
+                assert_eq!(merged.sampled_wall_ns, 7000);
+            }
+        };
+    }
+
+    snapshot_merge_case!(snapshot_merge_dispatch, dispatch);
+    snapshot_merge_case!(snapshot_merge_udp_rx, udp_rx);
+    snapshot_merge_case!(snapshot_merge_tun_rx, tun_rx);
+    snapshot_merge_case!(snapshot_merge_route_replay, route_replay);
+    snapshot_merge_case!(snapshot_merge_tun_write, tun_write);
+    snapshot_merge_case!(snapshot_merge_udp_queue, udp_queue);
+    snapshot_merge_case!(snapshot_merge_flush, flush);
+    snapshot_merge_case!(snapshot_merge_bookkeeping, bookkeeping);
+
+    fn proc_stat(name: &str, user_ticks: u64, system_ticks: u64) -> String {
+        let mut stat = format!("42 ({name}) S");
+        for _ in 0..10 {
+            stat.push_str(" 0");
+        }
+        format!("{stat} {user_ticks} {system_ticks} 0 0")
+    }
+
+    macro_rules! proc_stat_case {
+        ($name:ident, $thread_name:expr, $user:expr, $system:expr) => {
+            #[test]
+            fn $name() {
+                let stat = proc_stat($thread_name, $user, $system);
+                assert_eq!(parse_proc_stat(&stat), Some(($thread_name, $user, $system)));
+            }
+        };
+    }
+
+    proc_stat_case!(proc_stat_parses_server_thread, "csqtt", 41, 9);
+    proc_stat_case!(
+        proc_stat_parses_dataplane_thread,
+        "dataplane fast path",
+        87,
+        12
+    );
+    proc_stat_case!(
+        proc_stat_parses_parenthesis_in_thread_name,
+        "worker) 7",
+        5,
+        6
+    );
+    proc_stat_case!(
+        proc_stat_parses_unicode_thread_name,
+        "поток-обработчик",
+        11,
+        13
+    );
+
+    #[test]
+    fn profiler_fast_path_has_an_explicit_mode_contract() {
+        let mut profiler = Profiler::default();
+        #[cfg(feature = "diagnostics")]
+        {
+            let previous = ALL_CLIENTS.swap(1, Ordering::AcqRel);
+            profiler.refresh_enabled();
+            assert!(profiler.enabled());
+            let started = profiler.begin(Stage::Dispatch, 120);
+            assert!(started.is_some());
+            profiler.finish(Stage::Dispatch, started);
+            let snapshot = profiler.snapshot();
+            assert_eq!(snapshot.dispatch.operations, 1);
+            assert_eq!(snapshot.dispatch.bytes, 120);
+            assert_eq!(snapshot.dispatch.samples, 1);
+            ALL_CLIENTS.store(previous, Ordering::Release);
+        }
+        #[cfg(not(feature = "diagnostics"))]
+        {
+            profiler.refresh_enabled();
+            assert!(!profiler.enabled());
+            let started = profiler.begin(Stage::Dispatch, 120);
+            assert!(started.is_none());
+            profiler.finish(Stage::Dispatch, started);
+        }
+    }
+
+    #[test]
+    fn tick_conversion_preserves_cpu_ordering() {
+        let (small_user, small_system) = ticks_to_ns(12, 7).unwrap();
+        let (large_user, large_system) = ticks_to_ns(13, 8).unwrap();
+        assert!(large_user >= small_user);
+        assert!(large_system >= small_system);
+    }
+
+    #[test]
+    fn tick_conversion_saturates_at_u64_limit() {
+        let (user, system) = ticks_to_ns(u64::MAX, u64::MAX).unwrap();
+        assert_eq!(user, u64::MAX);
+        assert_eq!(system, u64::MAX);
+    }
 }

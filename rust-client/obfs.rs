@@ -391,6 +391,80 @@ mod tests {
         assert_eq!(packet.as_slice(), payload);
     }
 
+    fn roundtrip_sized_payload(mode: ObfsMode, length: usize, marker: u8) {
+        let pool = PacketPool::new(1);
+        let mut packet = pool.acquire();
+        let payload = vec![marker; length];
+        packet.read_area()[..payload.len()].copy_from_slice(&payload);
+        packet.set_read_len(payload.len()).unwrap();
+        let cipher = ObfsCipher::new(derive_wrap_key("sized-roundtrip-password").unwrap()).unwrap();
+        let mut state = ObfsState::new();
+        cipher
+            .wrap(&mut packet, &ObfsConfig::new(mode), &mut state)
+            .unwrap();
+        assert!(is_rtp_packet(packet.as_slice()));
+        cipher.unwrap(&mut packet, mode).unwrap();
+        assert_eq!(packet.as_slice(), payload);
+    }
+
+    macro_rules! sized_roundtrip_case {
+        ($name:ident, $mode:expr, $length:expr, $marker:expr) => {
+            #[test]
+            fn $name() {
+                roundtrip_sized_payload($mode, $length, $marker);
+            }
+        };
+    }
+
+    sized_roundtrip_case!(audio_roundtrip_one_byte, ObfsMode::Audio, 1, 0x01);
+    sized_roundtrip_case!(audio_roundtrip_fifteen_bytes, ObfsMode::Audio, 15, 0x0f);
+    sized_roundtrip_case!(audio_roundtrip_sixty_four_bytes, ObfsMode::Audio, 64, 0x40);
+    sized_roundtrip_case!(audio_roundtrip_255_bytes, ObfsMode::Audio, 255, 0xff);
+    sized_roundtrip_case!(audio_roundtrip_512_bytes, ObfsMode::Audio, 512, 0x5a);
+    sized_roundtrip_case!(audio_roundtrip_1024_bytes, ObfsMode::Audio, 1024, 0xa5);
+    sized_roundtrip_case!(audio_roundtrip_1536_bytes, ObfsMode::Audio, 1536, 0x33);
+    sized_roundtrip_case!(audio_roundtrip_2048_bytes, ObfsMode::Audio, 2048, 0xcc);
+    sized_roundtrip_case!(video_roundtrip_one_byte, ObfsMode::Video, 1, 0x02);
+    sized_roundtrip_case!(video_roundtrip_fifteen_bytes, ObfsMode::Video, 15, 0x10);
+    sized_roundtrip_case!(video_roundtrip_sixty_four_bytes, ObfsMode::Video, 64, 0x41);
+    sized_roundtrip_case!(video_roundtrip_255_bytes, ObfsMode::Video, 255, 0xfe);
+    sized_roundtrip_case!(video_roundtrip_512_bytes, ObfsMode::Video, 512, 0x6b);
+    sized_roundtrip_case!(video_roundtrip_1024_bytes, ObfsMode::Video, 1024, 0xb6);
+    sized_roundtrip_case!(video_roundtrip_1536_bytes, ObfsMode::Video, 1536, 0x44);
+    sized_roundtrip_case!(video_roundtrip_2048_bytes, ObfsMode::Video, 2048, 0xdd);
+
+    #[test]
+    fn stable_getconf_audio_fixture_matches_server_contract() {
+        let payload = b"GETCONF:46000|wire-device|wire-password|7|wire-salt|1|27|CSQTT-WIRE-2";
+        let pool = PacketPool::new(1);
+        let mut packet = pool.acquire();
+        packet.read_area()[..payload.len()].copy_from_slice(payload);
+        packet.set_read_len(payload.len()).unwrap();
+        let config = ObfsConfig {
+            padding_max: 0,
+            ssrc: 0x1020_3040,
+            payload_type: 111,
+            mode: ObfsMode::Audio,
+        };
+        let mut state = ObfsState {
+            count: 0,
+            initial_timestamp: 0x1122_3344,
+            initial_abs_send_time: 0x0055_6677,
+            initial_sequence: 0x7788,
+            transport_sequence: 0x99aa,
+            started: Instant::now() + Duration::from_secs(1),
+            rng: StdRng::seed_from_u64(1),
+        };
+        ObfsCipher::new(derive_wrap_key("wire-password").unwrap())
+            .unwrap()
+            .wrap(&mut packet, &config, &mut state)
+            .unwrap();
+        assert_eq!(
+            hex::encode(packet.as_slice()),
+            crate::wire_protocol::CLIENT_GETCONF_AUDIO_FIXTURE,
+        );
+    }
+
     #[test]
     fn audio_roundtrip() {
         roundtrip(ObfsMode::Audio);

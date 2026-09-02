@@ -48,6 +48,7 @@ impl Default for Budget {
 
 #[inline(always)]
 pub fn should_duplicate(packet: &[u8]) -> bool {
+    let packet = crate::flow_frame::payload(packet);
     if is_control(packet) {
         return true;
     }

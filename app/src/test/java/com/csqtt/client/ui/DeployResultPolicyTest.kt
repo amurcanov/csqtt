@@ -19,14 +19,6 @@ class DeployResultPolicyTest {
     }
 
     @Test
-    fun prepareRequiresItsOwnExactMarkerAndZeroExit() {
-        assertTrue(isSuccessfulPrepareResult(0, "done\nCSQTT_DEPLOY_READY_FOR_UPLOAD\n"))
-        assertFalse(isSuccessfulPrepareResult(1, "CSQTT_DEPLOY_READY_FOR_UPLOAD"))
-        assertFalse(isSuccessfulPrepareResult(0, "CSQTT_DEPLOY_OK"))
-        assertFalse(isSuccessfulPrepareResult(0, "prefix CSQTT_DEPLOY_READY_FOR_UPLOAD suffix"))
-    }
-
-    @Test
     fun deployRollbackExitIsExplainedWithoutPretendingSuccess() {
         assertEquals(
             "Новый релиз не прошёл проверку; предыдущая установка восстановлена",
@@ -132,6 +124,21 @@ class DeployResultPolicyTest {
         assertEquals("systemd", deployMode(false))
         assertEquals("a b#$\"\\c  d", deployEnvironmentValue("a b#$\"\\c\r\nd", true))
         assertEquals("\"a b#$\\\"\\\\c  d\"", deployEnvironmentValue("a b#$\"\\c\r\nd", false))
+    }
+
+    @Test
+    fun serverAssetMatchesTheRemoteVpsArchitecture() {
+        assertEquals(ServerArchitecture.AMD64, serverArchitectureForMachine("x86_64\n"))
+        assertEquals(ServerArchitecture.AMD64, serverArchitectureForMachine("amd64\n"))
+        assertEquals(ServerArchitecture.ARM64, serverArchitectureForMachine("aarch64\n"))
+        assertEquals(ServerArchitecture.ARM64, serverArchitectureForMachine("arm64\n"))
+        assertEquals(ServerArchitecture.ARMV7, serverArchitectureForMachine("armv7l\n"))
+        assertEquals(ServerArchitecture.ARMV7, serverArchitectureForMachine("armhf\n"))
+    }
+
+    @Test(expected = java.io.IOException::class)
+    fun unsupportedRemoteVpsArchitectureStopsBeforeUpload() {
+        serverArchitectureForMachine("riscv64\n")
     }
 
     @Test

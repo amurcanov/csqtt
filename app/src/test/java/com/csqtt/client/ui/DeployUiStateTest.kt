@@ -75,4 +75,12 @@ class DeployUiStateTest {
         assertTrue(ports.peer == 47000)
         assertTrue(ports.web == 47002)
     }
+
+    @Test
+    fun `successful deploy synchronizes a nonempty server password`() {
+        assertTrue(passwordToSynchronizeAfterDeploy(true, "server-password") == "server-password")
+        assertTrue(passwordToSynchronizeAfterDeploy(false, "server-password") == null)
+        assertTrue(passwordToSynchronizeAfterDeploy(true, "") == null)
+        assertTrue(passwordToSynchronizeAfterDeploy(true, "   ") == null)
+    }
 }

@@ -26,10 +26,7 @@
     <string name="exceptions_search_placeholder">Название или package name</string>
     <string name="exceptions_mode_exclude">Чёрный список</string>
     <string name="exceptions_mode_include">Белый список</string>
-    <string name="exceptions_mode_description_black">Выбранные приложения идут мимо туннеля.</string>
-    <string name="exceptions_mode_description_white">Только выбранные приложения идут через туннель.</string>
     <string name="exceptions_system_apps">Системные приложения</string>
-    <string name="exceptions_system_apps_description">Показывать системные пакеты в результатах</string>
     <string name="exceptions_loading">Загружаем список приложений…</string>
     <string name="exceptions_empty_title">Ничего не найдено</string>
     <string name="exceptions_empty_description">Измените запрос или включите системные приложения.</string>

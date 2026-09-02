@@ -29,18 +29,17 @@ pub const fn packet_pool_size(workers: usize) -> usize {
 pub struct PacketPool {
     queue: ArrayQueue<BytesMut>,
     allocated: AtomicUsize,
-    retained: AtomicUsize,
-    retained_limit: usize,
+    allocation_limit: usize,
 }
 
 impl PacketPool {
     pub fn new(buffers: usize) -> Arc<Self> {
         let capacity = buffers.max(1);
+        let retained_limit = capacity.min(PACKET_POOL_RETAINED_MAX);
         Arc::new(Self {
-            queue: ArrayQueue::new(capacity),
+            queue: ArrayQueue::new(retained_limit),
             allocated: AtomicUsize::new(0),
-            retained: AtomicUsize::new(0),
-            retained_limit: capacity.min(PACKET_POOL_RETAINED_MAX),
+            allocation_limit: capacity,
         })
     }
 
@@ -50,12 +49,11 @@ impl PacketPool {
 
     fn try_acquire_inner(self: &Arc<Self>) -> Option<PacketBuf> {
         let storage = if let Some(storage) = self.queue.pop() {
-            self.retained.fetch_sub(1, Ordering::AcqRel);
             storage
         } else {
             self.allocated
                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |allocated| {
-                    (allocated < self.queue.capacity()).then_some(allocated + 1)
+                    (allocated < self.allocation_limit).then_some(allocated + 1)
                 })
                 .ok()?;
             BytesMut::zeroed(PACKET_CAPACITY)
@@ -74,13 +72,12 @@ impl PacketPool {
 
     #[cfg(test)]
     pub fn capacity(&self) -> usize {
-        self.queue.capacity()
+        self.allocation_limit
     }
 
     #[cfg(test)]
     pub fn available(&self) -> usize {
-        self.queue
-            .capacity()
+        self.allocation_limit
             .saturating_sub(self.allocated.load(Ordering::Acquire))
             .saturating_add(self.queue.len())
     }
@@ -104,18 +101,7 @@ impl PacketPool {
             self.allocated.fetch_sub(1, Ordering::AcqRel);
             return;
         }
-        if self
-            .retained
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |retained| {
-                (retained < self.retained_limit).then_some(retained + 1)
-            })
-            .is_err()
-        {
-            self.allocated.fetch_sub(1, Ordering::AcqRel);
-            return;
-        }
         if self.queue.push(storage).is_err() {
-            self.retained.fetch_sub(1, Ordering::AcqRel);
             self.allocated.fetch_sub(1, Ordering::AcqRel);
         }
     }

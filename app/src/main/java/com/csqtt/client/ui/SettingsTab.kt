@@ -94,8 +94,11 @@ internal fun SettingsTabContent(
     validationRequest: Int,
     onVkAuthRequested: () -> Unit,
 ) {
-    val savedWorkersPerHash by settingsStore.workersPerHash
+    val workersPerHash = remember(settingsStore) {
+        settingsStore.workersPerHash
         .map<Int, Int?> { it }
+    }
+    val savedWorkersPerHash by workersPerHash
         .collectAsStateWithLifecycle(initialValue = SettingsStore.cachedWorkersPerHash)
 
     val activeProfile = tunnelAuthSettings.profile
@@ -187,8 +190,11 @@ internal fun SettingsTabContent(
     val combinedHashes = remember(vkHash1, vkHash2, vkHash3, vkHash4, vkHash5, vkHash6) {
         allHashes.filter { it.isNotBlank() && it.length >= 16 }.distinct().joinToString(",")
     }
-    val extraWorkersEnabled by settingsStore.extraWorkers
+    val extraWorkers = remember(settingsStore) {
+        settingsStore.extraWorkers
         .map<Boolean, Boolean?> { it }
+    }
+    val extraWorkersEnabled by extraWorkers
         .collectAsStateWithLifecycle(initialValue = SettingsStore.cachedExtraWorkers)
     val effectiveExtraWorkersEnabled = extraWorkersEnabled == true && !accountAutoJsMode
 
@@ -346,7 +352,7 @@ internal fun SettingsTabContent(
         saveJob?.cancel()
         scope.launch {
             if (participantMode) {
-                settingsStore.saveWorkersPerHash(currentWorkers.toInt())
+                settingsStore.saveParticipantTunnelSettings(hashes, currentWorkers.toInt())
             } else {
                 settingsStore.save(
                     peerInput, hashes, "",
@@ -364,7 +370,7 @@ internal fun SettingsTabContent(
             // not one per keystroke or slider frame.
             delay(300)
             if (participantMode) {
-                settingsStore.saveWorkersPerHash(currentWorkers.toInt())
+                settingsStore.saveParticipantTunnelSettings(combinedHashes, currentWorkers.toInt())
             } else {
                 settingsStore.save(
                     peerInput, combinedHashes, "",

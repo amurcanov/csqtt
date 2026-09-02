@@ -54,6 +54,8 @@ private const val NETWORK_SWAP_SETTLE_MS = 4_000L
 // PAUSE: recheck the complete physical-network set after a short grace period.
 private const val NETWORK_LOSS_GRACE_MS = 2_000L
 private const val AUTO_PAUSE_WIFI_RECONCILE_MS = 1_000L
+private const val WAKE_LOCK_TIMEOUT_MS = 10 * 60 * 1_000L
+private const val WAKE_LOCK_RENEWAL_WINDOW_MS = 60 * 1_000L
 private const val VK_PROBE_CONNECT_TIMEOUT_MS = 3_000
 private const val VK_PROBE_READ_TIMEOUT_MS = 3_000
 private val VK_PROBE_URLS = listOf(
@@ -74,6 +76,7 @@ class TunnelService : Service() {
     private val serviceScope = CoroutineScope(serviceJob + Dispatchers.Default)
 
     private var wakeLock: PowerManager.WakeLock? = null
+    private var wakeLockExpiresAtElapsedMs = 0L
     private var wifiLock: WifiManager.WifiLock? = null
     private var updateJob: Job? = null
     private var lastNotificationText: String? = null
@@ -144,7 +147,7 @@ class TunnelService : Service() {
                         val salt = if (intentSalt.isNotBlank() && genId == intentGenId) {
                             intentSalt
                         } else {
-                            java.util.UUID.randomUUID().toString().replace("-", "")
+                            newTunnelSessionId()
                         }
 
                         val requestedWorkers = intent.getIntExtra("workers_per_hash", 18)
@@ -318,8 +321,22 @@ class TunnelService : Service() {
                 if (reconcileWifiAutoPause()) return@launch
 
                 val source = resolveConnectionSource(store)
+                if (
+                    source == null &&
+                    !store.csqttLinkMode.first() &&
+                    store.connectionPasswordState.first().state == StoredSecretState.Unreadable
+                ) {
+                    TunnelManager.updateLog(
+                        "connection_secret_unreadable",
+                        "[ПОДКЛЮЧЕНИЕ] Не удалось прочитать сохранённый пароль подключения. Откройте настройки и введите его заново.",
+                        99,
+                        true,
+                    )
+                    launch(Dispatchers.Main) { stopTunnel() }
+                    return@launch
+                }
                 val genId = store.reserveConnectionGeneration()
-                val salt = java.util.UUID.randomUUID().toString().replace("-", "")
+                val salt = newTunnelSessionId()
                 val vkAuthMode = sanitizeVkAuthMode(store.vkAuthMode.first())
                 val workersPerHash = WorkerCountPolicy.normalize(store.workersPerHash.first())
                 TunnelManager.isLoggingEnabled = store.loggingEnabled.first()
@@ -466,7 +483,7 @@ class TunnelService : Service() {
                     workersPerHash = workers,
                     connectionPassword = source.password,
                     generationId = nextGeneration,
-                    sessionSalt = java.util.UUID.randomUUID().toString().replace("-", ""),
+                    sessionSalt = newTunnelSessionId(),
                     allowHashRedistribution = resolved.allowWorkerRedistribution,
                     vkHashMode = resolved.mode,
                     vkAccessToken = resolved.accessToken,
@@ -1002,15 +1019,18 @@ class TunnelService : Service() {
     }
 
     private fun acquireWakeLock() {
-        if (wakeLock?.isHeld == true) return
+        val now = SystemClock.elapsedRealtime()
+        if (wakeLock?.isHeld == true && now < wakeLockExpiresAtElapsedMs - WAKE_LOCK_RENEWAL_WINDOW_MS) return
+        if (wakeLock?.isHeld == true) wakeLock?.release()
         val pm = getSystemService(POWER_SERVICE) as PowerManager
         wakeLock = pm.newWakeLock(
             PowerManager.PARTIAL_WAKE_LOCK,
             "csqtt:tunnel_cpu"
         ).apply {
             setReferenceCounted(false)
-            acquire()
+            acquire(WAKE_LOCK_TIMEOUT_MS)
         }
+        wakeLockExpiresAtElapsedMs = now + WAKE_LOCK_TIMEOUT_MS
     }
 
     @Suppress("DEPRECATION")
@@ -1031,6 +1051,7 @@ class TunnelService : Service() {
             wakeLock?.release()
         }
         wakeLock = null
+        wakeLockExpiresAtElapsedMs = 0L
     }
 
     private fun releaseWifiLock() {

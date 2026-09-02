@@ -21,10 +21,8 @@ use tokio::io::{Interest, unix::AsyncFd};
 use tokio::net::UdpSocket;
 
 pub const TICK_INTERVAL_MS: u64 = 100;
-pub const MAX_DATAGRAMS: usize = 100;
-const MIN_DATAGRAMS: usize = 16;
-const PRIORITY_DATAGRAMS: usize = MIN_DATAGRAMS;
-pub const MAX_RX_PER_PASS: usize = 100;
+pub const MAX_DATAGRAMS: usize = 128;
+pub const MAX_RX_PER_PASS: usize = MAX_DATAGRAMS;
 pub const TUN_RX_DRAIN_BATCH: usize = 128;
 const FEC_TX_SLOT_RESERVE: usize = 32;
 const UDP_CONTROL_BYTES: usize = 128;
@@ -32,8 +30,52 @@ const URGENCY_FLUSH_SYSCALLS: usize = 1;
 pub const UDP_RECV_BUFFER_BYTES: usize = 16 * 1024 * 1024;
 pub const UDP_SEND_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 
+#[cfg(target_env = "musl")]
+type MmsgFlags = libc::c_uint;
+#[cfg(not(target_env = "musl"))]
+type MmsgFlags = libc::c_int;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum UdpDatagramMode {
+    #[default]
+    Batch,
+    Compat,
+}
+
+impl UdpDatagramMode {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Batch => "recvmmsg/sendmmsg",
+            Self::Compat => "recvmsg/sendmsg",
+        }
+    }
+}
+
+fn configured_udp_datagram_mode() -> UdpDatagramMode {
+    let configured = std::env::var("CSQTT_DATAGRAM_IO").ok();
+    match configured.as_deref().map(str::trim) {
+        Some("compat") => UdpDatagramMode::Compat,
+        None | Some("") | Some("auto") | Some("batch") => UdpDatagramMode::Batch,
+        Some(value) => {
+            eprintln!(
+                "[DATAPLANE] Unknown CSQTT_DATAGRAM_IO={value:?}; using automatic batch fallback"
+            );
+            UdpDatagramMode::Batch
+        }
+    }
+}
+
+fn batch_syscall_unavailable(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::ENOSYS | libc::EPERM | libc::EACCES | libc::EOPNOTSUPP | libc::EINVAL)
+    )
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct IoCounters {
+    pub udp_datagram_mode: UdpDatagramMode,
+    pub udp_datagram_mode_switches: u64,
     pub udp_rx_packets: u64,
     pub udp_rx_bytes: u64,
     pub udp_rx_errors: u64,
@@ -151,6 +193,7 @@ pub struct TokioIo {
     rx_msgs: [libc::mmsghdr; MAX_DATAGRAMS],
     tx_iovecs: [libc::iovec; MAX_DATAGRAMS],
     tx_msgs: [libc::mmsghdr; MAX_DATAGRAMS],
+    udp_datagram_mode: UdpDatagramMode,
     udp_rx_batch_limit: usize,
     counters: IoCounters,
     tun_fatal: bool,
@@ -172,6 +215,25 @@ pub struct PacketSink<'a> {
     counters: &'a mut IoCounters,
     tun_fatal: &'a mut bool,
     urgent_udp_flush: &'a mut bool,
+}
+
+pub trait PacketOutput {
+    fn has_udp_tx_slot(&self) -> bool;
+
+    fn send_udp_with_duplicate_priority<F>(
+        &mut self,
+        peer: SocketAddr,
+        source_ip: Option<IpAddr>,
+        duplicate: bool,
+        class: PacketClass,
+        build: F,
+    ) -> bool
+    where
+        F: FnOnce(&mut PacketBuf) -> bool;
+
+    fn request_udp_flush(&mut self);
+
+    fn write_tun_priority(&mut self, payload: &[u8], class: PacketClass) -> bool;
 }
 
 impl PacketSink<'_> {
@@ -243,39 +305,11 @@ impl PacketSink<'_> {
         *self.urgent_udp_flush = true;
     }
 
-    #[inline]
-    pub fn send_udp(
-        &mut self,
-        peer: SocketAddr,
-        source_ip: Option<IpAddr>,
-        payload: &[u8],
-    ) -> bool {
-        let Some(slot_id) = self.free_udp_tx.pop_front() else {
-            self.counters.udp_tx_drops = self.counters.udp_tx_drops.saturating_add(1);
-            return false;
-        };
-        let Some(mut buffer) = self.packet_pool.try_acquire() else {
-            self.free_udp_tx.push_front(slot_id);
-            self.counters.udp_tx_drops = self.counters.udp_tx_drops.saturating_add(1);
-            return false;
-        };
-        if !buffer.copy_from(payload) {
-            self.free_udp_tx.push_front(slot_id);
-            self.counters.udp_tx_drops = self.counters.udp_tx_drops.saturating_add(1);
-            return false;
-        }
-        let slot = &mut self.udp_tx[slot_id];
-        slot.buffer = Some(buffer);
-        slot.prepare_current(peer, source_ip);
-        self.pending_udp_bulk_tx.push_back(slot_id);
-        true
-    }
-
     #[inline(always)]
     fn enqueue_udp(&mut self, slot_id: usize, class: PacketClass) {
         match class {
-            PacketClass::Latency => self.pending_udp_latency_tx.push_back(slot_id),
-            PacketClass::Priority => self.pending_udp_priority_tx.push_back(slot_id),
+            PacketClass::Small => self.pending_udp_latency_tx.push_back(slot_id),
+            PacketClass::Medium => self.pending_udp_priority_tx.push_back(slot_id),
             PacketClass::Bulk => self.pending_udp_bulk_tx.push_back(slot_id),
         }
     }
@@ -320,11 +354,99 @@ impl PacketSink<'_> {
         }
         self.tun_tx[slot_id].buffer = Some(buffer);
         match class {
-            PacketClass::Latency => self.pending_tun_latency_tx.push_back(slot_id),
-            PacketClass::Priority => self.pending_tun_priority_tx.push_back(slot_id),
+            PacketClass::Small => self.pending_tun_latency_tx.push_back(slot_id),
+            PacketClass::Medium => self.pending_tun_priority_tx.push_back(slot_id),
             PacketClass::Bulk => self.pending_tun_bulk_tx.push_back(slot_id),
         }
         true
+    }
+
+    #[inline]
+    pub fn send_prebuilt_udp(
+        &mut self,
+        peer: SocketAddr,
+        source_ip: Option<IpAddr>,
+        buffer: PacketBuf,
+        class: PacketClass,
+    ) -> bool {
+        let Some(slot_id) = self.free_udp_tx.pop_front() else {
+            self.counters.udp_tx_drops = self.counters.udp_tx_drops.saturating_add(1);
+            return false;
+        };
+        let slot = &mut self.udp_tx[slot_id];
+        slot.buffer = Some(buffer);
+        slot.prepare_current(peer, source_ip);
+        self.enqueue_udp(slot_id, class);
+        true
+    }
+
+    #[inline]
+    pub fn write_prebuilt_tun(&mut self, buffer: PacketBuf, class: PacketClass) -> bool {
+        if self.pending_tun_latency_tx.is_empty()
+            && self.pending_tun_priority_tx.is_empty()
+            && self.pending_tun_bulk_tx.is_empty()
+        {
+            match write_tun_packet(self.tun_fd, buffer.as_slice()) {
+                Ok(true) => {
+                    self.counters.tun_tx_packets = self.counters.tun_tx_packets.saturating_add(1);
+                    self.counters.tun_tx_bytes = self
+                        .counters
+                        .tun_tx_bytes
+                        .saturating_add(buffer.len() as u64);
+                    return true;
+                }
+                Ok(false) => {}
+                Err(_) => {
+                    self.counters.tun_tx_errors = self.counters.tun_tx_errors.saturating_add(1);
+                    self.counters.tun_tx_drops = self.counters.tun_tx_drops.saturating_add(1);
+                    *self.tun_fatal = true;
+                    return false;
+                }
+            }
+        }
+        let Some(slot_id) = self.free_tun_tx.pop_front() else {
+            self.counters.tun_tx_drops = self.counters.tun_tx_drops.saturating_add(1);
+            return false;
+        };
+        self.tun_tx[slot_id].buffer = Some(buffer);
+        match class {
+            PacketClass::Small => self.pending_tun_latency_tx.push_back(slot_id),
+            PacketClass::Medium => self.pending_tun_priority_tx.push_back(slot_id),
+            PacketClass::Bulk => self.pending_tun_bulk_tx.push_back(slot_id),
+        }
+        true
+    }
+}
+
+impl PacketOutput for PacketSink<'_> {
+    #[inline(always)]
+    fn has_udp_tx_slot(&self) -> bool {
+        PacketSink::has_udp_tx_slot(self)
+    }
+
+    #[inline]
+    fn send_udp_with_duplicate_priority<F>(
+        &mut self,
+        peer: SocketAddr,
+        source_ip: Option<IpAddr>,
+        duplicate: bool,
+        class: PacketClass,
+        build: F,
+    ) -> bool
+    where
+        F: FnOnce(&mut PacketBuf) -> bool,
+    {
+        PacketSink::send_udp_with_duplicate_priority(self, peer, source_ip, duplicate, class, build)
+    }
+
+    #[inline(always)]
+    fn request_udp_flush(&mut self) {
+        PacketSink::request_udp_flush(self)
+    }
+
+    #[inline]
+    fn write_tun_priority(&mut self, payload: &[u8], class: PacketClass) -> bool {
+        PacketSink::write_tun_priority(self, payload, class)
     }
 }
 
@@ -336,6 +458,8 @@ pub enum RxOutcome {
 
 impl TokioIo {
     pub async fn new(listen: SocketAddr, tun_iface: &str, tun_addr: &str) -> Result<Self> {
+        let udp_datagram_mode = configured_udp_datagram_mode();
+        eprintln!("[DATAPLANE] UDP I/O mode: {}", udp_datagram_mode.label());
         let domain = if listen.is_ipv4() {
             Domain::IPV4
         } else {
@@ -408,8 +532,12 @@ impl TokioIo {
                 iov_len: 0,
             }; MAX_DATAGRAMS],
             tx_msgs: std::array::from_fn(|_| unsafe { std::mem::zeroed() }),
-            udp_rx_batch_limit: MIN_DATAGRAMS,
-            counters: IoCounters::default(),
+            udp_datagram_mode,
+            udp_rx_batch_limit: MAX_DATAGRAMS,
+            counters: IoCounters {
+                udp_datagram_mode,
+                ..IoCounters::default()
+            },
             tun_fatal: false,
         })
     }
@@ -463,7 +591,10 @@ impl TokioIo {
     where
         L: FnMut(SocketAddr, Option<IpAddr>, &mut [u8], &mut PacketSink<'_>),
     {
-        let receive_limit = self.udp_rx_batch_limit.min(budget.max(1));
+        let receive_limit = match self.udp_datagram_mode {
+            UdpDatagramMode::Batch => self.udp_rx_batch_limit.min(budget.max(1)),
+            UdpDatagramMode::Compat => 1,
+        };
         let udp_fd = self.udp.as_raw_fd();
         let tun_fd = self.tun.as_raw_fd();
         for index in 0..receive_limit {
@@ -482,33 +613,59 @@ impl TokioIo {
             msg.msg_hdr.msg_control = self.rx_controls[index].as_mut_ptr().cast();
             msg.msg_hdr.msg_controllen = UDP_CONTROL_BYTES as _;
         }
-        let received = self.udp.try_io(Interest::READABLE, || {
-            loop {
-                let result = unsafe {
-                    libc::recvmmsg(
-                        udp_fd,
-                        self.rx_msgs.as_mut_ptr(),
-                        receive_limit as libc::c_uint,
-                        (libc::MSG_DONTWAIT | libc::MSG_WAITFORONE) as libc::c_uint,
-                        std::ptr::null_mut(),
-                    )
-                };
-                if result < 0 {
-                    let error = io::Error::last_os_error();
-                    if error.kind() == io::ErrorKind::Interrupted {
-                        continue;
+        let received = match self.udp_datagram_mode {
+            UdpDatagramMode::Batch => self.udp.try_io(Interest::READABLE, || {
+                loop {
+                    let result = unsafe {
+                        libc::recvmmsg(
+                            udp_fd,
+                            self.rx_msgs.as_mut_ptr(),
+                            receive_limit as libc::c_uint,
+                            (libc::MSG_DONTWAIT | libc::MSG_WAITFORONE) as MmsgFlags,
+                            std::ptr::null_mut(),
+                        )
+                    };
+                    if result < 0 {
+                        let error = io::Error::last_os_error();
+                        if error.kind() == io::ErrorKind::Interrupted {
+                            continue;
+                        }
+                        return Err(error);
                     }
-                    return Err(error);
+                    return Ok(result as usize);
                 }
-                return Ok(result as usize);
-            }
-        });
+            }),
+            UdpDatagramMode::Compat => self.udp.try_io(Interest::READABLE, || {
+                loop {
+                    let result = unsafe {
+                        libc::recvmsg(
+                            udp_fd,
+                            &mut self.rx_msgs[0].msg_hdr,
+                            libc::MSG_DONTWAIT as libc::c_int,
+                        )
+                    };
+                    if result < 0 {
+                        let error = io::Error::last_os_error();
+                        if error.kind() == io::ErrorKind::Interrupted {
+                            continue;
+                        }
+                        return Err(error);
+                    }
+                    self.rx_msgs[0].msg_len = result as libc::c_uint;
+                    return Ok(1);
+                }
+            }),
+        };
         let batch = match received {
+            Err(error)
+                if self.udp_datagram_mode == UdpDatagramMode::Batch
+                    && batch_syscall_unavailable(&error) =>
+            {
+                self.switch_to_compat_udp_io("recvmmsg", &error);
+                return self.dispatch_udp_rx(budget, logic);
+            }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 self.counters.udp_rx_eagain = self.counters.udp_rx_eagain.saturating_add(1);
-                if receive_limit == self.udp_rx_batch_limit {
-                    self.adapt_udp_rx_batch(0);
-                }
                 return RxOutcome::Drained;
             }
             Err(error) => {
@@ -522,9 +679,6 @@ impl TokioIo {
             Ok(batch) => batch,
         };
         self.counters.udp_recv_syscalls = self.counters.udp_recv_syscalls.saturating_add(1);
-        if receive_limit == self.udp_rx_batch_limit {
-            self.adapt_udp_rx_batch(batch);
-        }
         if batch as u64 > self.counters.udp_recv_batch_max {
             self.counters.udp_recv_batch_max = batch as u64;
         }
@@ -544,6 +698,7 @@ impl TokioIo {
             else {
                 continue;
             };
+            #[allow(clippy::unnecessary_cast)]
             let control_len =
                 (msg.msg_hdr.msg_controllen as usize).min(self.rx_controls[index].len());
             let local_ip = parse_ipv4_pktinfo_destination(unsafe {
@@ -693,12 +848,17 @@ impl TokioIo {
         let udp_fd = self.udp.as_raw_fd();
         let mut syscalls = 0usize;
         while self.pending_udp_tx_len() != 0 && syscalls < max_syscalls {
-            let batch_limit = if !self.pending_udp_latency_tx.is_empty() {
-                1
-            } else if !self.pending_udp_priority_tx.is_empty() {
-                PRIORITY_DATAGRAMS
-            } else {
-                MAX_DATAGRAMS
+            let batch_limit = match self.udp_datagram_mode {
+                UdpDatagramMode::Compat => 1,
+                UdpDatagramMode::Batch => {
+                    if !self.pending_udp_latency_tx.is_empty() {
+                        PacketClass::Small.datagram_batch()
+                    } else if !self.pending_udp_priority_tx.is_empty() {
+                        PacketClass::Medium.datagram_batch()
+                    } else {
+                        PacketClass::Bulk.datagram_batch()
+                    }
+                }
             };
             let batch_len = self.pending_udp_tx_batch_len(batch_limit);
             if batch_len == 0 {
@@ -736,31 +896,64 @@ impl TokioIo {
             }
             syscalls += 1;
             let mut tx_enobufs = false;
-            let sent = self.udp.try_io(Interest::WRITABLE, || {
-                loop {
-                    let result = unsafe {
-                        libc::sendmmsg(
-                            udp_fd,
-                            self.tx_msgs.as_mut_ptr(),
-                            batch_len as libc::c_uint,
-                            libc::MSG_DONTWAIT as libc::c_uint,
-                        )
-                    };
-                    if result < 0 {
-                        let error = io::Error::last_os_error();
-                        if error.kind() == io::ErrorKind::Interrupted {
-                            continue;
+            let sent = match self.udp_datagram_mode {
+                UdpDatagramMode::Batch => self.udp.try_io(Interest::WRITABLE, || {
+                    loop {
+                        let result = unsafe {
+                            libc::sendmmsg(
+                                udp_fd,
+                                self.tx_msgs.as_mut_ptr(),
+                                batch_len as libc::c_uint,
+                                libc::MSG_DONTWAIT as MmsgFlags,
+                            )
+                        };
+                        if result < 0 {
+                            let error = io::Error::last_os_error();
+                            if error.kind() == io::ErrorKind::Interrupted {
+                                continue;
+                            }
+                            if error.raw_os_error() == Some(libc::ENOBUFS) {
+                                tx_enobufs = true;
+                                return Err(io::Error::from(io::ErrorKind::WouldBlock));
+                            }
+                            return Err(error);
                         }
-                        if error.raw_os_error() == Some(libc::ENOBUFS) {
-                            tx_enobufs = true;
-                            return Err(io::Error::from(io::ErrorKind::WouldBlock));
-                        }
-                        return Err(error);
+                        return Ok(result as usize);
                     }
-                    return Ok(result as usize);
-                }
-            });
+                }),
+                UdpDatagramMode::Compat => self.udp.try_io(Interest::WRITABLE, || {
+                    loop {
+                        let result = unsafe {
+                            libc::sendmsg(
+                                udp_fd,
+                                &self.tx_msgs[0].msg_hdr,
+                                libc::MSG_DONTWAIT as libc::c_int,
+                            )
+                        };
+                        if result < 0 {
+                            let error = io::Error::last_os_error();
+                            if error.kind() == io::ErrorKind::Interrupted {
+                                continue;
+                            }
+                            if error.raw_os_error() == Some(libc::ENOBUFS) {
+                                tx_enobufs = true;
+                                return Err(io::Error::from(io::ErrorKind::WouldBlock));
+                            }
+                            return Err(error);
+                        }
+                        self.tx_msgs[0].msg_len = result as libc::c_uint;
+                        return Ok(1);
+                    }
+                }),
+            };
             match sent {
+                Err(error)
+                    if self.udp_datagram_mode == UdpDatagramMode::Batch
+                        && batch_syscall_unavailable(&error) =>
+                {
+                    self.switch_to_compat_udp_io("sendmmsg", &error);
+                    continue;
+                }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     if tx_enobufs {
                         self.counters.udp_tx_enobufs =
@@ -783,6 +976,8 @@ impl TokioIo {
                     return;
                 }
                 Ok(sent) => {
+                    self.counters.udp_send_syscalls =
+                        self.counters.udp_send_syscalls.saturating_add(1);
                     if sent < batch_len {
                         self.counters.partial_sendmmsg =
                             self.counters.partial_sendmmsg.saturating_add(1);
@@ -941,6 +1136,7 @@ impl TokioIo {
 
     pub fn counters_snapshot(&self) -> IoCounters {
         let mut snapshot = self.counters;
+        snapshot.udp_datagram_mode = self.udp_datagram_mode;
         snapshot.free_udp_tx_slots = self.free_udp_tx.len() as u64;
         snapshot.free_tun_tx_slots = self.free_tun_tx.len() as u64;
         let pool = self.packet_pool.snapshot();
@@ -950,20 +1146,18 @@ impl TokioIo {
         snapshot
     }
 
-    fn adapt_udp_rx_batch(&mut self, batch: usize) {
-        if batch >= self.udp_rx_batch_limit && self.udp_rx_batch_limit < MAX_DATAGRAMS {
-            self.udp_rx_batch_limit = match self.udp_rx_batch_limit {
-                ..=MIN_DATAGRAMS => 32,
-                17..=32 => 64,
-                _ => MAX_DATAGRAMS,
-            };
-        } else if batch == 0 || batch.saturating_mul(4) <= self.udp_rx_batch_limit {
-            self.udp_rx_batch_limit = match self.udp_rx_batch_limit {
-                65.. => 64,
-                33..=64 => 32,
-                _ => MIN_DATAGRAMS,
-            };
+    fn switch_to_compat_udp_io(&mut self, operation: &str, error: &io::Error) {
+        if self.udp_datagram_mode == UdpDatagramMode::Compat {
+            return;
         }
+        self.udp_datagram_mode = UdpDatagramMode::Compat;
+        self.counters.udp_datagram_mode = UdpDatagramMode::Compat;
+        self.counters.udp_datagram_mode_switches =
+            self.counters.udp_datagram_mode_switches.saturating_add(1);
+        eprintln!(
+            "[DATAPLANE] {operation} unavailable ({error}); switched UDP I/O to {}",
+            UdpDatagramMode::Compat.label()
+        );
     }
 }
 
@@ -1037,6 +1231,7 @@ fn cmsg_align(length: usize) -> usize {
 fn parse_ipv4_pktinfo_destination(mut control: &[u8]) -> Option<Ipv4Addr> {
     while control.len() >= std::mem::size_of::<libc::cmsghdr>() {
         let header = unsafe { &*(control.as_ptr().cast::<libc::cmsghdr>()) };
+        #[allow(clippy::unnecessary_cast)]
         let length = header.cmsg_len as usize;
         if length < std::mem::size_of::<libc::cmsghdr>() || length > control.len() {
             break;
@@ -1128,3 +1323,81 @@ const _: () = {
     assert!(UDP_TX_SLOTS <= 4096);
     assert!(TUN_TX_SLOTS <= 4096);
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn batch_syscall_errors_select_compatibility_mode() {
+        for errno in [
+            libc::ENOSYS,
+            libc::EPERM,
+            libc::EACCES,
+            libc::EOPNOTSUPP,
+            libc::EINVAL,
+        ] {
+            assert!(batch_syscall_unavailable(&io::Error::from_raw_os_error(
+                errno
+            )));
+        }
+        assert!(!batch_syscall_unavailable(&io::Error::from_raw_os_error(
+            libc::ENOBUFS
+        )));
+    }
+
+    #[test]
+    fn datagram_mode_labels_identify_active_syscalls() {
+        assert_eq!(UdpDatagramMode::Batch.label(), "recvmmsg/sendmmsg");
+        assert_eq!(UdpDatagramMode::Compat.label(), "recvmsg/sendmsg");
+    }
+
+    #[tokio::test]
+    async fn recvmsg_preserves_udp_payload_and_peer_address() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let peer = sender.local_addr().unwrap();
+        sender
+            .send_to(b"csqtt-udp-receive", receiver.local_addr().unwrap())
+            .unwrap();
+        receiver.readable().await.unwrap();
+
+        let mut packet = PacketBuffer::new();
+        let mut address: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+        let mut control = ControlBuffer::new();
+        let mut iovec = libc::iovec {
+            iov_base: packet.as_mut_ptr().cast(),
+            iov_len: PACKET_CAPACITY,
+        };
+        let mut header: libc::msghdr = unsafe { std::mem::zeroed() };
+        header.msg_name = (&mut address as *mut libc::sockaddr_storage).cast();
+        header.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+        header.msg_iov = &mut iovec;
+        header.msg_iovlen = 1;
+        header.msg_control = control.as_mut_ptr().cast();
+        header.msg_controllen = control.len() as _;
+
+        let received = receiver
+            .try_io(Interest::READABLE, || {
+                let value = unsafe {
+                    libc::recvmsg(
+                        receiver.as_raw_fd(),
+                        &mut header,
+                        libc::MSG_DONTWAIT as libc::c_int,
+                    )
+                };
+                if value < 0 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(value as usize)
+                }
+            })
+            .unwrap();
+        assert!(packet.set_len(received));
+        assert_eq!(packet.as_slice(), b"csqtt-udp-receive");
+        assert_eq!(
+            storage_to_socket_addr(&address, header.msg_namelen),
+            Some(peer)
+        );
+    }
+}

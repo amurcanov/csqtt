@@ -46,6 +46,15 @@ $specs = @(
         CargoPath = Join-Path $projectRoot "build\rust-client-android-armv7\armv7-linux-androideabi\release\client"
         ElfClass = 1
         ElfMachine = 40
+    },
+    [pscustomobject]@{
+        Abi = "x86_64"
+        Target = "x86_64-linux-android"
+        RelativePath = "app/src/main/jniLibs/x86_64/libclient.so"
+        ProductionPath = Join-Path $projectRoot "app\src\main\jniLibs\x86_64\libclient.so"
+        CargoPath = Join-Path $projectRoot "build\rust-client-android-x86_64\x86_64-linux-android\release\client"
+        ElfClass = 2
+        ElfMachine = 62
     }
 )
 
@@ -86,6 +95,7 @@ function Get-BuildInputHash {
         (Join-Path $projectRoot "rust-client\vendor\primp"),
         (Join-Path $projectRoot "scripts\find_android_sdk_ndk.bat"),
         (Join-Path $projectRoot "scripts\native_client_provenance.ps1"),
+        (Join-Path $projectRoot "shared\wire_protocol.rs"),
         (Join-Path $projectRoot "shared\striped_scheduler.rs")
     )
     $files = @()
