@@ -634,10 +634,26 @@ class TunnelService : Service() {
     }
 
     private fun probeVkThrough(network: Network): Boolean = VK_PROBE_URLS.any { address ->
-        val connection = runCatching {
-            network.openConnection(URL(address)) as HttpURLConnection
-        }.getOrNull() ?: return@any false
-        try {
+        val url = URL(address)
+        probeVkRequest { network.openConnection(url) as HttpURLConnection }
+            ?: probeVkUnboundFallback(network, url)
+    }
+
+    // Some head units (e.g. Geely/Flyme Auto on Android 9) report the cellular
+    // network under a netId that netd does not know, so a socket bound to that
+    // Network gets ENETUNREACH while unbound traffic works. The app is excluded
+    // from its own VPN, so an unbound request still leaves via the default
+    // physical network. Only use it when the probed network is that default.
+    private fun probeVkUnboundFallback(network: Network, url: URL): Boolean {
+        val active = runCatching { connectivityManager.activeNetwork }.getOrNull()
+        if (active != null && active != network) return false
+        return probeVkRequest { url.openConnection() as HttpURLConnection } ?: false
+    }
+
+    /** Returns the probe verdict, or null when the request failed at the network level. */
+    private fun probeVkRequest(open: () -> HttpURLConnection): Boolean? {
+        val connection = runCatching(open).getOrNull() ?: return null
+        return try {
             connection.instanceFollowRedirects = false
             connection.connectTimeout = VK_PROBE_CONNECT_TIMEOUT_MS
             connection.readTimeout = VK_PROBE_READ_TIMEOUT_MS
@@ -649,7 +665,7 @@ class TunnelService : Service() {
             connection.setRequestProperty("User-Agent", "Mozilla/5.0")
             isVkProbeHttpResponse(connection.responseCode)
         } catch (_: Exception) {
-            false
+            null
         } finally {
             connection.disconnect()
         }
