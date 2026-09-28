@@ -52,7 +52,9 @@ enum TunWriteState {
     Backoff,
     Yield,
     Closed,
-    Failed,
+    /// [FOCSQ] Пакет отвергнут ядром (например, не является IP-пакетом) —
+    /// он отбрасывается, задача записи TUN продолжает работать.
+    Dropped,
 }
 
 struct ReturnReorder {
@@ -856,6 +858,8 @@ impl Dispatcher {
     ) {
         let mut reorder = ReturnReorder::new();
         let mut pending: Option<(PacketBuf, usize)> = None;
+        // [FOCSQ] Счётчик отброшенных пакетов для троттлинга лога.
+        let mut dropped = 0u64;
         loop {
             if pending.is_none() {
                 let Some(packet) = recv_ordered_return_packet(
@@ -887,7 +891,7 @@ impl Dispatcher {
             let state = loop {
                 let state = {
                     let (packet, written) = pending.as_mut().expect("TUN packet is pending");
-                    self.try_write_tun_packet(&mut guard, &stats, packet, written)
+                    self.try_write_tun_packet(&mut guard, &stats, packet, written, &mut dropped)
                 };
                 match state {
                     TunWriteState::Complete => {
@@ -921,7 +925,12 @@ impl Dispatcher {
                     }
                 }
                 TunWriteState::Yield => tokio::task::yield_now().await,
-                TunWriteState::Closed | TunWriteState::Failed => return,
+                // [FOCSQ] Неудачная запись одного пакета больше не убивает
+                // задачу записи: пакет отбрасываем и берём следующий.
+                TunWriteState::Dropped => {
+                    pending = None;
+                }
+                TunWriteState::Closed => return,
                 TunWriteState::Continue => unreachable!(),
             }
         }
@@ -934,6 +943,7 @@ impl Dispatcher {
         stats: &Stats,
         packet: &PacketBuf,
         written: &mut usize,
+        dropped: &mut u64,
     ) -> TunWriteState {
         use std::os::fd::AsRawFd;
 
@@ -956,10 +966,13 @@ impl Dispatcher {
         });
         match result {
             Ok(Ok(0)) => {
-                crate::log_error!("[ОШИБКА] Запись TUN вернула 0 байт");
-                TunWriteState::Failed
+                // [FOCSQ] Запись ничего не записала: пакет отбрасываем,
+                // задача записи продолжает работать (раньше — смерть writer'а).
+                log_dropped_packet(dropped, "запись вернула 0 байт");
+                TunWriteState::Dropped
             }
             Ok(Ok(length)) => {
+                *dropped = 0;
                 *written += length;
                 if *written == packet.len() {
                     stats
@@ -984,9 +997,11 @@ impl Dispatcher {
                 crate::log_error!("[TUN] Интерфейс закрыт, ожидаем новый FD");
                 TunWriteState::Closed
             }
+            // [FOCSQ] Ядро отвергло конкретный пакет (EINVAL/EMSGSIZE/...):
+            // раньше это убивало запись TUN навсегда, туннель «зависал».
             Ok(Err(error)) => {
-                crate::log_error!("[ОШИБКА] Запись TUN завершена: {error}");
-                TunWriteState::Failed
+                log_dropped_packet(dropped, &error.to_string());
+                TunWriteState::Dropped
             }
             Err(_) => TunWriteState::Wait,
         }
@@ -1189,6 +1204,17 @@ fn is_closed_tun_error(error: &std::io::Error) -> bool {
         error.raw_os_error(),
         Some(code) if code == libc::EIO || code == libc::EBADF || code == libc::ENODEV
     )
+}
+
+/// [FOCSQ] Лог отброшенных в TUN пакетов с троттлингом: первые 8 сообщений
+/// и далее каждое 1000-е, чтобы мусорный поток не забивал журнал.
+fn log_dropped_packet(counter: &mut u64, reason: &str) {
+    *counter += 1;
+    if *counter <= 8 || counter.is_multiple_of(1000) {
+        crate::log_error!(
+            "[ОШИБКА] Запись TUN: пакет #{counter} отброшен ({reason})"
+        );
+    }
 }
 
 #[cfg(unix)]

@@ -1113,6 +1113,9 @@ async fn reader_loop(
         shutdown,
         config_tx,
     } = runtime;
+    // [FOCSQ] Счётчик отброшенных не-IP пакетов: сервер иногда присылает
+    // служебный однобайтовый ответ (0xFF), его запись в TUN ядро отвергает.
+    let mut dropped_non_ip = 0u64;
     loop {
         let packet = tokio::select! {
             biased;
@@ -1151,12 +1154,49 @@ async fn reader_loop(
         if is_control_response(packet.as_slice()) {
             continue;
         }
+        // [FOCSQ] В TUN можно писать только IP-пакеты. Служебные ответы
+        // сервера (например, однобайтовый 0xFF) не распознаны выше и
+        // ядро отвергло бы их записью EINVAL, что раньше убивало задачу
+        // записи TUN навсегда — туннель «зависал» без трафика.
+        if !is_ip_packet(packet.as_slice()) {
+            dropped_non_ip += 1;
+            if dropped_non_ip <= 8 || dropped_non_ip.is_multiple_of(1000) {
+                crate::log_error!(
+                    "[СЕССИЯ] Отброшен не-IP пакет от пира #{}: {} байт, \
+                     первый байт 0x{:02X}",
+                    dropped_non_ip,
+                    packet.len(),
+                    packet.as_slice().first().copied().unwrap_or_default()
+                );
+            }
+            continue;
+        }
         deliver_inbound_packet(&dispatcher, packet);
     }
 }
 
 fn deliver_inbound_packet(dispatcher: &Dispatcher, packet: PacketBuf) {
     dispatcher.return_packet(packet);
+}
+
+/// [FOCSQ] Пакет из канала данных пригоден для записи в TUN-интерфейс.
+///
+/// Ядро Linux принимает в TUN только валидные пакеты IPv4/IPv6; всё прочее
+/// (служебные однобайтовые ответы сервера, усечённые или мусорные датаграммы)
+/// запись отвергает с `EINVAL`. Раньше такая запись убивала задачу записи TUN
+/// навсегда, поэтому непригодные пакеты отбрасываются ещё в reader_loop.
+fn is_ip_packet(packet: &[u8]) -> bool {
+    match packet.first().map(|byte| byte >> 4) {
+        Some(4) => {
+            if packet.len() < 20 {
+                return false;
+            }
+            let header_len = usize::from(packet[0] & 0x0f) * 4;
+            (20..=packet.len()).contains(&header_len)
+        }
+        Some(6) => packet.len() >= 40,
+        _ => false,
+    }
 }
 
 fn turn_endpoint_index(id: usize, cursor: usize, endpoint_count: usize) -> usize {
@@ -1973,5 +2013,50 @@ mod tests {
         .complete(false);
         assert!(!sent.load(Ordering::Acquire));
         assert!(!in_flight.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn ip_filter_accepts_valid_packets() {
+        // IPv4 с IHL=5 (20 байт заголовка)
+        let mut ipv4 = vec![0u8; 60];
+        ipv4[0] = 0x45;
+        assert!(is_ip_packet(&ipv4));
+        // IPv4 с IHL=15 (60 байт заголовка) — ровно в размер пакета
+        ipv4[0] = 0x4f;
+        assert!(is_ip_packet(&ipv4));
+        // IPv6: минимум 40 байт
+        let mut ipv6 = vec![0u8; 40];
+        ipv6[0] = 0x60;
+        assert!(is_ip_packet(&ipv6));
+    }
+
+    #[test]
+    fn ip_filter_rejects_server_control_bytes() {
+        // Служебный однобайтовый ответ сервера — главный убийца записи TUN
+        assert!(!is_ip_packet(&[0xff]));
+        assert!(!is_ip_packet(&[0xff, 0x00, 0x00, 0x00]));
+        // Совсем пустой пакет
+        assert!(!is_ip_packet(&[]));
+        // Мусорная версия IP (не 4 и не 6)
+        assert!(!is_ip_packet(&[0x55; 60]));
+        assert!(!is_ip_packet(&[0x00; 60]));
+    }
+
+    #[test]
+    fn ip_filter_rejects_truncated_headers() {
+        // IPv4, но заголовок короче минимальных 20 байт
+        assert!(!is_ip_packet(&[0x45, 0x00, 0x00, 0x14]));
+        // IPv4 с IHL, указывающим за границу пакета
+        let mut ipv4 = vec![0u8; 24];
+        ipv4[0] = 0x4f; // IHL=15 → 60 байт > 24
+        assert!(!is_ip_packet(&ipv4));
+        // IHL=0 → 0 байт заголовка, меньше минимума
+        let mut ipv4 = vec![0u8; 40];
+        ipv4[0] = 0x40;
+        assert!(!is_ip_packet(&ipv4));
+        // IPv6 короче 40 байт
+        let mut ipv6 = vec![0u8; 39];
+        ipv6[0] = 0x60;
+        assert!(!is_ip_packet(&ipv6));
     }
 }
