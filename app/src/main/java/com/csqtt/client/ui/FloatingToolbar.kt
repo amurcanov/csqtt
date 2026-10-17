@@ -13,12 +13,14 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import com.csqtt.client.SettingsStore
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.csqtt.client.R
+import com.csqtt.client.proxy.HotspotIpDetector
 
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
@@ -57,9 +59,17 @@ fun FloatingToolbar(
     val vkAuthMode by settingsStore.vkAuthMode.collectAsStateWithLifecycle(
         initialValue = CsqttConstants.VkAuth.MODE_CALLS,
     )
+    val context = LocalContext.current
     val tunnelRunning by TunnelManager.running.collectAsStateWithLifecycle()
+    val bypassLan by settingsStore.bypassLan.collectAsStateWithLifecycle(initialValue = false)
+    val hotspotProxyEnabled by settingsStore.hotspotProxyEnabled.collectAsStateWithLifecycle(initialValue = false)
+    val hotspotDetector = remember(context) { HotspotIpDetector(context) }
+    val hotspotEndpoints by hotspotDetector.observeHotspotEndpoints().collectAsStateWithLifecycle(initialValue = emptyList())
+    val primaryHotspotIp = remember(hotspotEndpoints) { hotspotEndpoints.firstOrNull()?.ipAddress }
     var isExpanded by rememberSaveable { mutableStateOf(false) }
     var showAutoPauseInfo by rememberSaveable { mutableStateOf(false) }
+    var showBypassLanInfo by rememberSaveable { mutableStateOf(false) }
+    var showHotspotProxyInfo by rememberSaveable { mutableStateOf(false) }
     var showExtraWorkersInfo by rememberSaveable { mutableStateOf(false) }
 
     IconButton(
@@ -195,6 +205,36 @@ fun FloatingToolbar(
                         infoContentDescription = "Как работает автопауза при Wi-Fi",
                     )
 
+                    CsqttSettingRow(
+                        title = "Обход локальной сети (LAN)",
+                        description = "Прямой доступ к хотспоту и домашней сети",
+                        checked = bypassLan,
+                        enabled = !tunnelRunning,
+                        onCheckedChange = { enabled ->
+                            scope.launch { settingsStore.saveBypassLan(enabled) }
+                        },
+                        onInfoClick = { showBypassLanInfo = true },
+                        infoContentDescription = "Как работает обход локальной сети",
+                    )
+
+                    CsqttSettingRow(
+                        title = "Раздача по Wi-Fi (Proxy)",
+                        description = if (hotspotProxyEnabled && primaryHotspotIp != null) {
+                            "Прокси: $primaryHotspotIp:1080 (SOCKS5 / HTTP)"
+                        } else if (hotspotProxyEnabled) {
+                            "Прокси активен на порту 1080 (включите точку доступа)"
+                        } else {
+                            "Локальный SOCKS5/HTTP прокси для хотспота (порт 1080)"
+                        },
+                        checked = hotspotProxyEnabled,
+                        enabled = true,
+                        onCheckedChange = { enabled ->
+                            scope.launch { settingsStore.saveHotspotProxyEnabled(enabled) }
+                        },
+                        onInfoClick = { showHotspotProxyInfo = true },
+                        infoContentDescription = "Информация о раздаче по Wi-Fi",
+                    )
+
                     if (vkAuthMode != CsqttConstants.VkAuth.MODE_AUTO_JS) {
                         CsqttSettingRow(
                             title = "Экстра потоки",
@@ -214,6 +254,12 @@ fun FloatingToolbar(
 
     if (showAutoPauseInfo) {
         WifiAutoPauseInfoDialog(onDismiss = { showAutoPauseInfo = false })
+    }
+    if (showBypassLanInfo) {
+        BypassLanInfoDialog(onDismiss = { showBypassLanInfo = false })
+    }
+    if (showHotspotProxyInfo) {
+        HotspotProxyInfoDialog(onDismiss = { showHotspotProxyInfo = false })
     }
     if (showExtraWorkersInfo) {
         ExtraWorkersInfoDialog(onDismiss = { showExtraWorkersInfo = false })

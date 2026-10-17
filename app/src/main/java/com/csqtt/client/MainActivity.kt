@@ -88,7 +88,6 @@ import kotlin.math.abs
 
 class MainActivity : ComponentActivity() {
     private val appSettingsStore by lazy { SettingsStore(applicationContext) }
-    private var renderUi by mutableStateOf(false)
     private var showVkAuthDialog by mutableStateOf(false)
     private var batteryPromptInFlight = false
 
@@ -113,12 +112,10 @@ class MainActivity : ComponentActivity() {
     override fun onStart() {
         super.onStart()
         activeActivities++
-        renderUi = true
         ManlCaptchaWebViewManager.checkAndShowPendingCaptcha(this)
     }
 
     override fun onStop() {
-        renderUi = false
         activeActivities = (activeActivities - 1).coerceAtLeast(0)
         super.onStop()
     }
@@ -138,9 +135,6 @@ class MainActivity : ComponentActivity() {
         setContent {
             val authContext = LocalContext.current.applicationContext
             val authScope = rememberCoroutineScope()
-            val uiStateHolder = rememberSaveableStateHolder()
-            if (renderUi) {
-                uiStateHolder.SaveableStateProvider("main_ui") {
             val settingsStore = remember { appSettingsStore }
             val themeMode by settingsStore.themeMode.collectAsStateWithLifecycle(initialValue = CsqttConstants.Theme.MODE_SYSTEM)
             val activeFingerprint by settingsStore.selectedFingerprint.collectAsStateWithLifecycle(initialValue = CsqttConstants.Tunnel.DEFAULT_FINGERPRINT)
@@ -150,28 +144,26 @@ class MainActivity : ComponentActivity() {
             val fixedDensity = remember(baseDensity.density) { Density(baseDensity.density, 1f) }
 
             CompositionLocalProvider(LocalDensity provides fixedDensity) {
-            CSQTTTheme(themeMode = themeMode) {
-                Surface(
-                    modifier = Modifier.fillMaxSize(),
-                    color = MaterialTheme.colorScheme.background,
-                ) {
-                    MainScreen(
-                        settingsStore = settingsStore,
-                        themeMode = themeMode,
-                        onThemeChange = { mode ->
-                            scope.launch {
-                                settingsStore.saveThemeMode(mode)
-                            }
-                        },
-                        activeFingerprint = activeFingerprint,
-                        onFingerprintChange = { fp ->
-                            scope.launch { settingsStore.saveFingerprint(fp) }
-                        },
-                        onVkAuthRequested = { showVkAuthDialog = true },
-                    )
-                }
-            }
-            }
+                CSQTTTheme(themeMode = themeMode) {
+                    Surface(
+                        modifier = Modifier.fillMaxSize(),
+                        color = MaterialTheme.colorScheme.background,
+                    ) {
+                        MainScreen(
+                            settingsStore = settingsStore,
+                            themeMode = themeMode,
+                            onThemeChange = { mode ->
+                                scope.launch {
+                                    settingsStore.saveThemeMode(mode)
+                                }
+                            },
+                            activeFingerprint = activeFingerprint,
+                            onFingerprintChange = { fp ->
+                                scope.launch { settingsStore.saveFingerprint(fp) }
+                            },
+                            onVkAuthRequested = { showVkAuthDialog = true },
+                        )
+                    }
                 }
             }
             if (showVkAuthDialog) {
@@ -290,10 +282,10 @@ fun MainScreen(
     val scope = rememberCoroutineScope()
     val activeProfile by settingsStore.activeProfile.collectAsStateWithLifecycle(initialValue = 0)
     val deploySettings by settingsStore.deploySettingsSnapshot.collectAsStateWithLifecycle(
-        initialValue = DeploySettingsSnapshot()
+        initialValue = SettingsStore.cachedDeploySettingsSnapshot ?: DeploySettingsSnapshot(profile = activeProfile)
     )
     val tunnelAuthSettings by settingsStore.tunnelAuthSnapshot.collectAsStateWithLifecycle(
-        initialValue = TunnelAuthSnapshot()
+        initialValue = SettingsStore.cachedTunnelAuthSnapshot ?: TunnelAuthSnapshot(profile = activeProfile)
     )
     val csqttLinkMode by settingsStore.csqttLinkMode.collectAsStateWithLifecycle(initialValue = false)
     val autoPauseOnWifi by settingsStore.autoPauseOnWifi.collectAsStateWithLifecycle(initialValue = false)
@@ -478,38 +470,40 @@ fun MainScreen(
                     ) {
                         key(selectedTab) {
                             val tab = selectedTab
+                            val effectiveTunnelSettings = if (tunnelAuthSettings.isLoaded) {
+                                tunnelAuthSettings
+                            } else {
+                                SettingsStore.cachedTunnelAuthSnapshot ?: TunnelAuthSnapshot(profile = activeProfile)
+                            }
+                            val effectiveDeploySettings = if (deploySettings.isLoaded) {
+                                deploySettings
+                            } else {
+                                SettingsStore.cachedDeploySettingsSnapshot ?: DeploySettingsSnapshot(profile = activeProfile)
+                            }
                             val tabStateKey: Any = when (tab) {
-                                0 -> "connection:${tunnelAuthSettings.profile}"
-                                1 -> "tunnel:${tunnelAuthSettings.profile}"
-                                2 -> "deploy:${deploySettings.profile}"
+                                0 -> "connection:${effectiveTunnelSettings.profile}"
+                                1 -> "tunnel:${effectiveTunnelSettings.profile}"
+                                2 -> "deploy:${effectiveDeploySettings.profile}"
                                 else -> tab
                             }
                             tabStateHolder.SaveableStateProvider(tabStateKey) {
                                 when (tab) {
-                                0 -> if (tunnelAuthSettings.isLoaded) {
-                                    ConnectionTab(
-                                        settingsStore = settingsStore,
-                                        tunnelAuthSettings = tunnelAuthSettings,
-                                        onInvalidConfiguration = {
-                                            selectedTab = 1
-                                            tunnelValidationRequest += 1
-                                        },
-                                    )
-                                } else {
-                                    Spacer(modifier = Modifier.fillMaxSize())
-                                }
-                                1 -> if (tunnelAuthSettings.isLoaded) {
-                                    SettingsTab(
-                                        settingsStore = settingsStore,
-                                        tunnelAuthSettings = tunnelAuthSettings,
-                                        validationRequest = tunnelValidationRequest,
-                                        onVkAuthRequested = onVkAuthRequested,
-                                    )
-                                } else {
-                                    Spacer(modifier = Modifier.fillMaxSize())
-                                }
+                                0 -> ConnectionTab(
+                                    settingsStore = settingsStore,
+                                    tunnelAuthSettings = effectiveTunnelSettings,
+                                    onInvalidConfiguration = {
+                                        selectedTab = 1
+                                        tunnelValidationRequest += 1
+                                    },
+                                )
+                                1 -> SettingsTab(
+                                    settingsStore = settingsStore,
+                                    tunnelAuthSettings = effectiveTunnelSettings,
+                                    validationRequest = tunnelValidationRequest,
+                                    onVkAuthRequested = onVkAuthRequested,
+                                )
                                 2 -> if (!csqttLinkMode) {
-                                    DeployTab(settingsStore, deploySettings)
+                                    DeployTab(settingsStore, effectiveDeploySettings)
                                 } else {
                                     Spacer(modifier = Modifier.fillMaxSize())
                                 }

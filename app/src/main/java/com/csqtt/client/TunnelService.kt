@@ -531,6 +531,15 @@ class TunnelService : Service() {
             runCatching { SettingsStore(applicationContext).saveTunnelWasRunning(true) }
         }
 
+        try {
+            val vpnInitIntent = Intent(applicationContext, TunVpnService::class.java).apply {
+                action = "INIT_PROTECT"
+            }
+            applicationContext.startService(vpnInitIntent)
+        } catch (e: Exception) {
+            Log.w("TunnelService", "Failed to send INIT_PROTECT to TunVpnService", e)
+        }
+
         TunnelManager.start(this, params)
         if (!physicalNetworks.hasUsableNetwork()) {
             TunnelManager.suspendForNoNetwork(physicalNetworkPauseReason(isAirplaneModeOn()))

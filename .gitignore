@@ -1,0 +1,44 @@
+# Gradle & Build cache
+.gradle/
+build/
+*/build/
+app/build/
+gradle/gradle-daemon-jvm.properties
+
+# Android Studio & IntelliJ IDEA
+.idea/
+*.iml
+*.ipr
+*.iws
+out/
+.vscode/
+
+# Local Android SDK configuration
+local.properties
+
+# C / C++ / NDK build artifacts
+.cxx/
+app/.cxx/
+.externalNativeBuild/
+cmake-build-*/
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Android Profiler & Captures
+captures/
+*.hprof
+
+# Rust build directories
+target/
+rust-client/target/
+rust-server/target/
+
+# Local server binary assets
+app/src/main/assets/csqtt-linux-*
+app/src/main/assets/csqtt.server-provenance.json
+
+# Prebuilt / compiled native libraries
+app/src/main/jniLibs/
+*.so

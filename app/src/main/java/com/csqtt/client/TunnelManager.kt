@@ -8,6 +8,7 @@ import android.content.Context
 import android.content.Intent
 import android.os.SystemClock
 import android.util.Base64
+import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -961,12 +962,28 @@ object TunnelManager {
         cmd.add("-captcha-mode")
         cmd.add(params.captchaMode)
 
+        try {
+            val vpnInitIntent = Intent(context, TunVpnService::class.java).apply {
+                action = "INIT_PROTECT"
+            }
+            context.startService(vpnInitIntent)
+        } catch (_: Exception) {}
+
         val pb = ProcessBuilder(cmd)
         pb.directory(context.filesDir)
         pb.redirectErrorStream(true)
-        pb.environment()["LD_LIBRARY_PATH"] = context.applicationInfo.nativeLibraryDir
-        pb.environment()[CsqttConstants.Tunnel.PROCESS_ENV_EVENTS] = "1"
-        pb.environment()["RAYON_NUM_THREADS"] = "2"
+        val env = pb.environment()
+        env["LD_LIBRARY_PATH"] = context.applicationInfo.nativeLibraryDir
+        env[CsqttConstants.Tunnel.PROCESS_ENV_EVENTS] = "1"
+        env["RAYON_NUM_THREADS"] = "2"
+
+        val shimFile = File(context.applicationInfo.nativeLibraryDir, "libprotect_shim.so")
+        val protectSock = File(context.noBackupFilesDir, "protect_sock")
+        if (shimFile.exists()) {
+            env["LD_PRELOAD"] = shimFile.absolutePath
+            env["VPN_PROTECT_SOCK_PATH"] = protectSock.absolutePath
+            Log.i("TunnelManager", "Injected LD_PRELOAD=${shimFile.absolutePath} and VPN_PROTECT_SOCK_PATH=${protectSock.absolutePath}")
+        }
 
         val ticket = lifecycleState.reserveProcess(epoch, process == null) ?: return
         val startedProcess = try {

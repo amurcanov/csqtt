@@ -5,10 +5,12 @@ package com.csqtt.client
 
 import android.content.Context
 import android.content.pm.PackageManager
+import android.util.Log
 import androidx.datastore.preferences.core.MutablePreferences
 import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.emptyPreferences
 import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
@@ -17,6 +19,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
@@ -133,6 +136,8 @@ class SettingsStore(context: Context) {
         private val BATTERY_OPTIMIZATION_PROMPT_HANDLED =
             booleanPreferencesKey("battery_optimization_prompt_handled")
         private val AUTO_PAUSE_ON_WIFI = booleanPreferencesKey("auto_pause_on_wifi")
+        private val BYPASS_LAN = booleanPreferencesKey("bypass_lan")
+        private val HOTSPOT_PROXY_ENABLED = booleanPreferencesKey("hotspot_proxy_enabled")
 
         private val THEME_MODE = stringPreferencesKey("theme_mode") 
         private val IS_DYNAMIC_COLOR = booleanPreferencesKey("is_dynamic_color")
@@ -182,6 +187,12 @@ class SettingsStore(context: Context) {
         @Volatile
         internal var cachedExtraWorkers: Boolean? = null
 
+        @Volatile
+        internal var cachedTunnelAuthSnapshot: TunnelAuthSnapshot? = null
+
+        @Volatile
+        internal var cachedDeploySettingsSnapshot: DeploySettingsSnapshot? = null
+
         private val uiCacheStarted = java.util.concurrent.atomic.AtomicBoolean(false)
         private val migrationsStarted = java.util.concurrent.atomic.AtomicBoolean(false)
 
@@ -210,17 +221,6 @@ class SettingsStore(context: Context) {
                 migrateConnectionPasswordsToLocalStorage()
                 migrateSecretsToKeystore()
                 migrateLegacyWhitelistMode()
-            }
-        }
-        if (uiCacheStarted.compareAndSet(false, true)) {
-            CoroutineScope(SupervisorJob() + Dispatchers.Default).launch {
-                launch { vkHashMode.collect { cachedVkHashMode = it } }
-                launch { vkAccessToken.collect { cachedVkAccessToken = it } }
-                launch { obfsMode.collect { cachedObfsMode = it } }
-                launch { turnTransport.collect { cachedTurnTransport = it } }
-                launch { csqttLinkMode.collect { cachedCsqttLinkMode = it } }
-                launch { workersPerHash.collect { cachedWorkersPerHash = it } }
-                launch { extraWorkers.collect { cachedExtraWorkers = it } }
             }
         }
     }
@@ -300,40 +300,64 @@ class SettingsStore(context: Context) {
         val profile = prefs[ACTIVE_PROFILE] ?: 0
         prefs[getProfileKey(DEPLOY_SSH_PORT, profile)] ?: ""
     }
-    internal val deploySettingsSnapshot: Flow<DeploySettingsSnapshot> = dataStore.data.map { prefs ->
-        val profile = prefs[ACTIVE_PROFILE] ?: 0
-        DeploySettingsSnapshot(
-            profile = profile,
-            ip = prefs[getProfileKey(DEPLOY_IP, profile)] ?: "",
-            sshLogin = prefs[getProfileKey(DEPLOY_LOGIN, profile)] ?: "",
-            sshPassword = readSecret(prefs, DEPLOY_PASSWORD_ENCRYPTED, DEPLOY_PASSWORD, profile),
-            webLogin = prefs[getProfileKey(DEPLOY_WEB_LOGIN, profile)] ?: "",
-            webPassword = readSecret(prefs, DEPLOY_WEB_PASSWORD_ENCRYPTED, DEPLOY_WEB_PASSWORD, profile),
-            mainPassword = readSecret(prefs, DEPLOY_MAIN_PASSWORD_ENCRYPTED, DEPLOY_MAIN_PASSWORD, profile),
-            sshPort = prefs[getProfileKey(DEPLOY_SSH_PORT, profile)]
-                ?.ifBlank { CsqttConstants.Network.DEFAULT_SSH_PORT.toString() }
-                ?: CsqttConstants.Network.DEFAULT_SSH_PORT.toString(),
-            manualPortsEnabled = prefs[getProfileKey(MANUAL_PORTS_ENABLED, profile)] ?: false,
-            serverPeerPort = prefs[getProfileKey(SERVER_PEER_PORT, profile)]
-                ?: CsqttConstants.Network.DEFAULT_SERVER_PEER_PORT,
-            serverWebPort = prefs[getProfileKey(SERVER_WEB_PORT, profile)]
-                ?: CsqttConstants.Network.DEFAULT_SERVER_WEB_PORT,
-            sshKeysMode = prefs[getProfileKey(SSH_KEYS_MODE, profile)] ?: false,
-            dockerInstall = prefs[getProfileKey(DOCKER_INSTALL, profile)] ?: false,
-            sshPrivateKey = readSecret(prefs, SSH_PRIVATE_KEY_ENCRYPTED, SSH_PRIVATE_KEY, profile),
-            sshKeyPassphrase = readSecret(prefs, SSH_KEY_PASSPHRASE_ENCRYPTED, SSH_KEY_PASSPHRASE, profile),
-            sshCertificate = readSecret(prefs, SSH_CERTIFICATE_ENCRYPTED, SSH_CERTIFICATE, profile),
-        )
-    }.onIo()
-    internal val tunnelAuthSnapshot: Flow<TunnelAuthSnapshot> = dataStore.data.map { prefs ->
-        val profile = prefs[ACTIVE_PROFILE] ?: 0
-        val connectionPassword = readConnectionPasswordState(prefs, profile)
-        TunnelAuthSnapshot(
-            profile = profile,
-            connectionPassword = connectionPassword.value,
-            connectionPasswordState = connectionPassword.state,
-        )
-    }.onIo()
+    internal val deploySettingsSnapshot: Flow<DeploySettingsSnapshot> = dataStore.data
+        .catch { e ->
+            Log.e("SettingsStore", "DataStore error in deploySettingsSnapshot", e)
+            emit(emptyPreferences())
+        }
+        .map { prefs ->
+            val profile = prefs[ACTIVE_PROFILE] ?: 0
+            DeploySettingsSnapshot(
+                profile = profile,
+                ip = prefs[getProfileKey(DEPLOY_IP, profile)] ?: "",
+                sshLogin = prefs[getProfileKey(DEPLOY_LOGIN, profile)] ?: "",
+                sshPassword = runCatching { readSecret(prefs, DEPLOY_PASSWORD_ENCRYPTED, DEPLOY_PASSWORD, profile) }.getOrDefault(""),
+                webLogin = prefs[getProfileKey(DEPLOY_WEB_LOGIN, profile)] ?: "",
+                webPassword = runCatching { readSecret(prefs, DEPLOY_WEB_PASSWORD_ENCRYPTED, DEPLOY_WEB_PASSWORD, profile) }.getOrDefault(""),
+                mainPassword = runCatching { readSecret(prefs, DEPLOY_MAIN_PASSWORD_ENCRYPTED, DEPLOY_MAIN_PASSWORD, profile) }.getOrDefault(""),
+                sshPort = prefs[getProfileKey(DEPLOY_SSH_PORT, profile)]
+                    ?.ifBlank { CsqttConstants.Network.DEFAULT_SSH_PORT.toString() }
+                    ?: CsqttConstants.Network.DEFAULT_SSH_PORT.toString(),
+                manualPortsEnabled = prefs[getProfileKey(MANUAL_PORTS_ENABLED, profile)] ?: false,
+                serverPeerPort = prefs[getProfileKey(SERVER_PEER_PORT, profile)]
+                    ?: CsqttConstants.Network.DEFAULT_SERVER_PEER_PORT,
+                serverWebPort = prefs[getProfileKey(SERVER_WEB_PORT, profile)]
+                    ?: CsqttConstants.Network.DEFAULT_SERVER_WEB_PORT,
+                sshKeysMode = prefs[getProfileKey(SSH_KEYS_MODE, profile)] ?: false,
+                dockerInstall = prefs[getProfileKey(DOCKER_INSTALL, profile)] ?: false,
+                sshPrivateKey = runCatching { readSecret(prefs, SSH_PRIVATE_KEY_ENCRYPTED, SSH_PRIVATE_KEY, profile) }.getOrDefault(""),
+                sshKeyPassphrase = runCatching { readSecret(prefs, SSH_KEY_PASSPHRASE_ENCRYPTED, SSH_KEY_PASSPHRASE, profile) }.getOrDefault(""),
+                sshCertificate = runCatching { readSecret(prefs, SSH_CERTIFICATE_ENCRYPTED, SSH_CERTIFICATE, profile) }.getOrDefault(""),
+            )
+        }
+        .onIo()
+        .catch { e ->
+            Log.e("SettingsStore", "Unhandled error in deploySettingsSnapshot", e)
+            emit(cachedDeploySettingsSnapshot ?: DeploySettingsSnapshot(profile = 0))
+        }
+    internal val tunnelAuthSnapshot: Flow<TunnelAuthSnapshot> = dataStore.data
+        .catch { e ->
+            Log.e("SettingsStore", "DataStore error in tunnelAuthSnapshot", e)
+            emit(emptyPreferences())
+        }
+        .map { prefs ->
+            val profile = prefs[ACTIVE_PROFILE] ?: 0
+            val connectionPassword = runCatching {
+                readConnectionPasswordState(prefs, profile)
+            }.getOrElse {
+                StoredSecret("", StoredSecretState.Readable)
+            }
+            TunnelAuthSnapshot(
+                profile = profile,
+                connectionPassword = connectionPassword.value,
+                connectionPasswordState = connectionPassword.state,
+            )
+        }
+        .onIo()
+        .catch { e ->
+            Log.e("SettingsStore", "Unhandled error in tunnelAuthSnapshot", e)
+            emit(cachedTunnelAuthSnapshot ?: TunnelAuthSnapshot(profile = 0))
+        }
     val excludedApps: Flow<String> = dataStore.data.map { prefs ->
         val profile = prefs[ACTIVE_PROFILE] ?: 0
         prefs[getProfileKey(EXCLUDED_APPS, profile)] ?: ""
@@ -440,6 +464,12 @@ class SettingsStore(context: Context) {
     val autoPauseOnWifi: Flow<Boolean> = dataStore.data.map { prefs ->
         prefs[AUTO_PAUSE_ON_WIFI] ?: false
     }
+    val bypassLan: Flow<Boolean> = dataStore.data.map { prefs ->
+        prefs[BYPASS_LAN] ?: false
+    }
+    val hotspotProxyEnabled: Flow<Boolean> = dataStore.data.map { prefs ->
+        prefs[HOTSPOT_PROXY_ENABLED] ?: false
+    }
     suspend fun isBatteryOptimizationPromptHandled(): Boolean =
         dataStore.data.first()[BATTERY_OPTIMIZATION_PROMPT_HANDLED] ?: false
 
@@ -473,6 +503,31 @@ class SettingsStore(context: Context) {
     val updateCheckIntervalHours: Flow<Int> = dataStore.data.map { it[UPDATE_CHECK_INTERVAL_HOURS] ?: 24 }
     val updatePostponeUntil: Flow<Long> = dataStore.data.map { it[UPDATE_POSTPONE_UNTIL] ?: 0L }
     val updatePostponeVersion: Flow<String> = dataStore.data.map { it[UPDATE_POSTPONE_VERSION] ?: "" }
+
+    init {
+        if (uiCacheStarted.compareAndSet(false, true)) {
+            val hashModeFlow = vkHashMode
+            val tokenFlow = vkAccessToken
+            val obfsFlow = obfsMode
+            val turnFlow = turnTransport
+            val linkModeFlow = csqttLinkMode
+            val workersFlow = workersPerHash
+            val extraWorkersFlow = extraWorkers
+            val tunnelAuthFlow = tunnelAuthSnapshot
+            val deployFlow = deploySettingsSnapshot
+            CoroutineScope(SupervisorJob() + Dispatchers.Default).launch {
+                launch { hashModeFlow.collect { cachedVkHashMode = it } }
+                launch { tokenFlow.collect { cachedVkAccessToken = it } }
+                launch { obfsFlow.collect { cachedObfsMode = it } }
+                launch { turnFlow.collect { cachedTurnTransport = it } }
+                launch { linkModeFlow.collect { cachedCsqttLinkMode = it } }
+                launch { workersFlow.collect { cachedWorkersPerHash = it } }
+                launch { extraWorkersFlow.collect { cachedExtraWorkers = it } }
+                launch { tunnelAuthFlow.collect { cachedTunnelAuthSnapshot = it } }
+                launch { deployFlow.collect { cachedDeploySettingsSnapshot = it } }
+            }
+        }
+    }
 
     suspend fun saveTunnelWasRunning(running: Boolean) {
         dataStore.edit { prefs ->
@@ -871,6 +926,18 @@ class SettingsStore(context: Context) {
     suspend fun saveAutoPauseOnWifi(enabled: Boolean) {
         dataStore.edit { prefs ->
             prefs[AUTO_PAUSE_ON_WIFI] = enabled
+        }
+    }
+
+    suspend fun saveBypassLan(enabled: Boolean) {
+        dataStore.edit { prefs ->
+            prefs[BYPASS_LAN] = enabled
+        }
+    }
+
+    suspend fun saveHotspotProxyEnabled(enabled: Boolean) {
+        dataStore.edit { prefs ->
+            prefs[HOTSPOT_PROXY_ENABLED] = enabled
         }
     }
 
