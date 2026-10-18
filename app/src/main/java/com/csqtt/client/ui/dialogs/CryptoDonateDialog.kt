@@ -19,17 +19,14 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.selection.SelectionContainer
-import androidx.compose.foundation.verticalScroll
+import com.csqtt.client.ui.components.fadingVerticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.outlined.ContentCopy
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -37,7 +34,6 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
@@ -68,77 +64,68 @@ fun CryptoDonateDialog(onDismiss: () -> Unit) {
 
     Dialog(
         onDismissRequest = onDismiss,
-        properties = DialogProperties(usePlatformDefaultWidth = false)
+        properties = DialogProperties(usePlatformDefaultWidth = false),
     ) {
-        Surface(
-            modifier = Modifier
-                .fillMaxWidth(0.92f)
-                .padding(12.dp),
-            shape = CsqttShapes.Dialog,
-            color = MaterialTheme.colorScheme.surface,
-            contentColor = MaterialTheme.colorScheme.onSurface,
-            tonalElevation = 8.dp
-        ) {
+        AppDialogSurface(modifier = Modifier.fillMaxWidth(0.9f)) {
             Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(22.dp)
-                    .verticalScroll(rememberScrollState()),
-                verticalArrangement = Arrangement.spacedBy(16.dp)
+                modifier =
+                    Modifier.fillMaxWidth().padding(20.dp).fadingVerticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(16.dp),
             ) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(
-                        text = "Поддержать криптовалютой",
-                        style = MaterialTheme.typography.titleLarge,
-                        fontWeight = FontWeight.Bold
-                    )
-                    IconButton(onClick = onDismiss) {
-                        Icon(Icons.Default.Close, contentDescription = "Закрыть")
-                    }
-                }
+                AppDialogHeader(
+                    title = "Поддержать криптовалютой",
+                    onClose = onDismiss,
+                    icon = {
+                        Icon(
+                            painterResource(R.drawable.ic_crypto_logo),
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.size(20.dp),
+                        )
+                    },
+                )
 
                 CryptoAddressField(
                     title = "GRAM",
                     instruction = "Перевод Gram в сети TON на криптокошелек:",
                     address = GRAM_TON_WALLET,
-                    onCopy = { copyAddressToClipboard(context, "Gram Address", GRAM_TON_WALLET) }
+                    onCopy = { copyAddressToClipboard(context, "Gram Address", GRAM_TON_WALLET) },
                 )
 
                 CryptoAddressField(
                     title = "USDT TON",
                     instruction = "Перевод USDT в сети TON на криптокошелек:",
                     address = USDT_TON_WALLET,
-                    onCopy = { copyAddressToClipboard(context, "USDT TON Address", USDT_TON_WALLET) }
+                    onCopy = {
+                        copyAddressToClipboard(context, "USDT TON Address", USDT_TON_WALLET)
+                    },
                 )
 
                 CryptoAddressField(
                     title = "USDT TRC20",
                     instruction = "Перевод USDT в сети TRC20 на криптокошелек:",
                     address = USDT_TRC20_WALLET,
-                    onCopy = { copyAddressToClipboard(context, "USDT TRC20 Address", USDT_TRC20_WALLET) }
+                    onCopy = {
+                        copyAddressToClipboard(context, "USDT TRC20 Address", USDT_TRC20_WALLET)
+                    },
                 )
 
                 Spacer(modifier = Modifier.height(4.dp))
 
                 Button(
                     onClick = onDismiss,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(48.dp),
+                    modifier = Modifier.fillMaxWidth().height(48.dp),
                     shape = CsqttShapes.Pill,
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = MaterialTheme.colorScheme.primary,
-                        contentColor = MaterialTheme.colorScheme.onPrimary
-                    )
+                    colors =
+                        ButtonDefaults.buttonColors(
+                            containerColor = MaterialTheme.colorScheme.primary,
+                            contentColor = MaterialTheme.colorScheme.onPrimary,
+                        ),
                 ) {
                     Text(
                         text = "Хорошо",
                         fontWeight = FontWeight.SemiBold,
-                        fontSize = 15.sp
+                        fontSize = 15.sp,
                     )
                 }
             }
@@ -151,76 +138,74 @@ private fun CryptoAddressField(
     title: String,
     instruction: String,
     address: String,
-    onCopy: () -> Unit
+    onCopy: () -> Unit,
 ) {
     val colors = MaterialTheme.colorScheme
     val isDark = colors.background.luminance() < 0.22f
 
     Column(
         modifier = Modifier.fillMaxWidth(),
-        verticalArrangement = Arrangement.spacedBy(6.dp)
+        verticalArrangement = Arrangement.spacedBy(6.dp),
     ) {
         Text(
             text = title,
             style = MaterialTheme.typography.titleMedium,
             fontWeight = FontWeight.Bold,
-            color = MaterialTheme.colorScheme.primary
+            color = MaterialTheme.colorScheme.primary,
         )
         Text(
             text = instruction,
             style = MaterialTheme.typography.bodySmall,
             color = colors.onSurfaceVariant,
-            lineHeight = 18.sp
+            lineHeight = 18.sp,
         )
 
         Surface(
             shape = CsqttShapes.Control,
-            color = if (isDark) Color(0xFF13171F) else Color(0xFFF1F3F7),
-            border = BorderStroke(1.dp, colors.outlineVariant.copy(alpha = if (isDark) 0.35f else 0.5f)),
-            modifier = Modifier.fillMaxWidth()
+            color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f),
+            border =
+                BorderStroke(1.dp, colors.outlineVariant.copy(alpha = if (isDark) 0.35f else 0.5f)),
+            modifier = Modifier.fillMaxWidth(),
         ) {
             Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(start = 14.dp, end = 8.dp, top = 8.dp, bottom = 8.dp),
+                modifier =
+                    Modifier.fillMaxWidth()
+                        .padding(start = 14.dp, end = 8.dp, top = 8.dp, bottom = 8.dp),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
-                verticalAlignment = Alignment.CenterVertically
+                verticalAlignment = Alignment.CenterVertically,
             ) {
-                SelectionContainer(
-                    modifier = Modifier.weight(1f)
-                ) {
+                SelectionContainer(modifier = Modifier.weight(1f)) {
                     Text(
                         text = address,
-                        style = MaterialTheme.typography.bodySmall.copy(
-                            fontSize = 12.5.sp,
-                            lineHeight = 17.sp,
-                            fontWeight = FontWeight.Medium,
-                        ),
+                        style =
+                            MaterialTheme.typography.bodySmall.copy(
+                                fontSize = 12.5.sp,
+                                lineHeight = 17.sp,
+                                fontWeight = FontWeight.Medium,
+                            ),
                         fontFamily = FontFamily.Monospace,
                         color = colors.onSurface,
                         maxLines = 2,
-                        overflow = TextOverflow.Ellipsis
+                        overflow = TextOverflow.Ellipsis,
                     )
                 }
 
                 Surface(
                     shape = CsqttShapes.Pill,
-                    color = Color(0xFF121418),
-                    contentColor = Color.White,
-                    modifier = Modifier
-                        .size(42.dp)
-                        .clip(CsqttShapes.Pill)
-                        .clickable(onClick = onCopy)
+                    color = MaterialTheme.colorScheme.primary.copy(alpha = 0.12f),
+                    contentColor = MaterialTheme.colorScheme.primary,
+                    modifier =
+                        Modifier.size(42.dp).clip(CsqttShapes.Pill).clickable(onClick = onCopy),
                 ) {
                     Box(
                         contentAlignment = Alignment.Center,
-                        modifier = Modifier.fillMaxSize()
+                        modifier = Modifier.fillMaxSize(),
                     ) {
                         Icon(
                             imageVector = Icons.Outlined.ContentCopy,
                             contentDescription = "Скопировать",
-                            tint = Color.White,
-                            modifier = Modifier.size(20.dp)
+                            tint = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.size(20.dp),
                         )
                     }
                 }

@@ -23,23 +23,21 @@ fun UninstallConfirmDialog(onDismiss: () -> Unit, onConfirm: () -> Unit) {
     val isConfirmed = confirmText.trim().lowercase() == "да"
 
     Dialog(onDismissRequest = onDismiss) {
-        Surface(
-            shape = CsqttShapes.Dialog,
-            color = MaterialTheme.colorScheme.surface,
-            contentColor = MaterialTheme.colorScheme.onSurface,
-            tonalElevation = 8.dp
-        ) {
-            Column(modifier = Modifier.padding(24.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+        AppDialogSurface {
+            Column(
+                modifier = Modifier.padding(20.dp),
+                verticalArrangement = Arrangement.spacedBy(16.dp),
+            ) {
                 Text(
                     "Удаление CSQTT с сервера",
                     style = MaterialTheme.typography.titleLarge,
                     fontWeight = FontWeight.Bold,
-                    color = MaterialTheme.colorScheme.error
+                    color = MaterialTheme.colorScheme.error,
                 )
                 Text(
                     "Будут удалены: бинарник, systemd-сервис, бот, конфигурация CSQTT и только помеченные правила firewall/NAT для CSQTT.\n\nЭто действие необратимо.",
                     style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 OutlinedTextField(
                     value = confirmText,
@@ -55,24 +53,41 @@ fun UninstallConfirmDialog(onDismiss: () -> Unit, onConfirm: () -> Unit) {
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth(),
                     shape = CsqttShapes.Control,
-                    colors = OutlinedTextFieldDefaults.colors(
-                        focusedBorderColor = MaterialTheme.colorScheme.error,
-                        unfocusedBorderColor = MaterialTheme.colorScheme.outline.copy(alpha = 0.3f)
-                    )
+                    colors =
+                        OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = MaterialTheme.colorScheme.error,
+                            focusedLabelColor = MaterialTheme.colorScheme.error,
+                            unfocusedLabelColor = MaterialTheme.colorScheme.error,
+                            cursorColor = MaterialTheme.colorScheme.error,
+                            unfocusedBorderColor =
+                                MaterialTheme.colorScheme.error.copy(alpha = 0.6f),
+                        ),
                 )
-                Column(modifier = Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
                     OutlinedButton(
-                        onClick = onDismiss, modifier = Modifier.fillMaxWidth().heightIn(min = CsqttSizes.ControlHeight),
+                        onClick = onDismiss,
+                        modifier = Modifier.weight(1f).heightIn(min = CsqttSizes.ControlHeight),
                         shape = CsqttShapes.Control,
-                        colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.onSurface)
-                    ) { Text("Отмена") }
+                        colors =
+                            ButtonDefaults.outlinedButtonColors(
+                                contentColor = MaterialTheme.colorScheme.onSurface
+                            ),
+                    ) {
+                        Text("Отмена")
+                    }
                     Button(
-                        onClick = onConfirm, modifier = Modifier.fillMaxWidth().heightIn(min = CsqttSizes.ControlHeight),
-                        shape = CsqttShapes.Control, enabled = isConfirmed,
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = MaterialTheme.colorScheme.error,
-                            contentColor = MaterialTheme.colorScheme.onError
-                        )
+                        onClick = onConfirm,
+                        modifier = Modifier.weight(1f).heightIn(min = CsqttSizes.ControlHeight),
+                        shape = CsqttShapes.Control,
+                        enabled = isConfirmed,
+                        colors =
+                            ButtonDefaults.buttonColors(
+                                containerColor = MaterialTheme.colorScheme.error,
+                                contentColor = MaterialTheme.colorScheme.onError,
+                            ),
                     ) {
                         Icon(Icons.Default.Delete, null, Modifier.size(18.dp))
                         Spacer(Modifier.width(6.dp))

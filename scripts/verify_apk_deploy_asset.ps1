@@ -26,6 +26,9 @@ function Get-Sha256([byte[]]$Bytes) {
 $resolvedApk = (Resolve-Path -LiteralPath $ApkPath).Path
 $resolvedSource = (Resolve-Path -LiteralPath $SourcePath).Path
 $sourceBytes = [System.IO.File]::ReadAllBytes($resolvedSource)
+if ($sourceBytes -contains [byte]13) {
+    throw "deploy.sh contains CR characters; save the script with Unix LF line endings before building the APK"
+}
 $assetDirectory = Split-Path -Parent $resolvedSource
 $serverAssetNames = @("csqtt-linux-amd64", "csqtt-linux-arm64", "csqtt-linux-armv7")
 $serverProvenancePath = Join-Path $assetDirectory "csqtt.server-provenance.json"

@@ -126,10 +126,10 @@ class TunnelService : Service() {
         when (intent.action) {
             "START" -> {
                 autoPauseRequested = true
-                TunnelManager.starting.value = true
+                TunnelManager.prepareConnection()
                 val notification = createNotification("Запуск...")
                 if (!tryStartPersistentForeground(notification, "запуск VPN")) {
-                    TunnelManager.starting.value = false
+                    TunnelManager.connectionPreparationFailed()
                     stopSelf()
                     return START_NOT_STICKY
                 }
@@ -278,7 +278,7 @@ class TunnelService : Service() {
                 if (!TunnelManager.running.value) {
                     stopTunnel()
                 } else {
-                    updateNotification("Туннель активен")
+                    updateNotification(buildTunnelNotificationText())
                 }
             }
             "RESTORE_NOTIFICATION" -> {
@@ -293,10 +293,10 @@ class TunnelService : Service() {
     }
 
     private fun restoreTunnel(): Boolean {
-        TunnelManager.starting.value = true
+        TunnelManager.prepareConnection()
         val notification = createNotification("Восстановление соединения...")
         if (!tryStartPersistentForeground(notification, "восстановление VPN")) {
-            TunnelManager.starting.value = false
+            TunnelManager.connectionPreparationFailed()
             stopSelf()
             return false
         }
@@ -831,7 +831,6 @@ class TunnelService : Service() {
         autoPauseRequested = false
         autoPausedForWifi = false
         TunnelManager.leaveWifiAutoPause()
-        TunnelManager.starting.value = false
         updateJob?.cancel()
         // Сохраняем: пользователь явно остановил CSQTT — авторестарт при холодном старте запрещён
         serviceScope.launch {
@@ -921,7 +920,7 @@ class TunnelService : Service() {
         if (!autoPausedForWifi || !autoPauseRequested) return
         autoPausedForWifi = false
         stopWifiAutoPauseWatch()
-        TunnelManager.leaveWifiAutoPause()
+        TunnelManager.prepareConnection()
         acquireWakeLock()
         TunnelManager.updateLog(
             "wifi_auto_resume",
@@ -1097,6 +1096,8 @@ class TunnelService : Service() {
     }
 
     private fun buildTunnelNotificationText(): String {
+        val connection = TunnelManager.connection.value
+        if (!connection.connected) return connection.phase.label
         val statsText = TunnelManager.stats.value.trim()
         return when {
             statsText.isEmpty() -> "Туннель активен"

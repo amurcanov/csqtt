@@ -66,7 +66,7 @@ internal fun deployFailureMessage(exitStatus: Int, output: String): String {
         exitStatus == 20 ->
             withDetail("Кандидат не прошёл предзапусковую проверку; работающий сервер не останавливался")
         exitStatus == 2 ->
-            withDetail("Установщик отклонил параметры развёртывания")
+            withDetail("Установщик завершился с ошибкой (код 2)")
         else ->
             detail ?: "Установщик завершился с кодом $exitStatus; подробности сохранены в errors.log"
     }
@@ -233,10 +233,10 @@ private class DeploySSHClient(
     private fun ensureConnected(stage: String): Boolean =
         ssh.isConnected || reconnectFor(stage)
 
-    fun exec(command: String, timeout: Long = CMD_TIMEOUT): String =
-        execResult(command, timeout).output
+    fun execRoot(command: String, timeout: Long = CMD_TIMEOUT): SSHExecResult =
+        execResult(rootCommand(command), timeout, "$sudoPass\n")
 
-    fun execResult(command: String, timeout: Long = CMD_TIMEOUT): SSHExecResult {
+    fun execResult(command: String, timeout: Long = CMD_TIMEOUT, stdin: String? = null): SSHExecResult {
         if (!ensureConnected("команда")) {
             DeployManager.writeError("SSH exec: клиент отключён перед командой: ${command.take(80)}")
             return SSHExecResult("error: session is down", -1)
@@ -244,18 +244,16 @@ private class DeploySSHClient(
 
         val result = StringBuilder()
         val progressRegex = Regex("^CSQTT_PROGRESS\\|(\\d+\\.?\\d*)\\|(.+)$")
-        val cmdAdjusted = if (command.contains("sudo") && !command.contains("sudo -S")) {
-            command.replace("sudo ", "sudo -S ")
-        } else command
-
         val sshSession = ssh.startSession()
         return try {
-            val remoteCmd = sshSession.exec(cmdAdjusted)
+            val remoteCmd = sshSession.exec(command)
 
-            if (cmdAdjusted.contains("sudo -S")) {
+            if (stdin != null) {
                 runCatching {
-                    remoteCmd.outputStream.write("$sudoPass\n".toByteArray())
-                    remoteCmd.outputStream.flush()
+                    remoteCmd.outputStream.use { input ->
+                        input.write(stdin.toByteArray(Charsets.UTF_8))
+                        input.flush()
+                    }
                 }
             }
 
@@ -383,7 +381,7 @@ private class DeploySSHClient(
             try {
                 DeployManager.writeError("Falling back to chunked stream upload for ${localFile.name}...")
                 val tempRemote = "$remotePath.tmp"
-                execResult(rootCommand("rm -f '$tempRemote'"), 30000L)
+                execRoot("rm -f '$tempRemote'", 30000L)
                 localFile.inputStream().buffered(64 * 1024).use { inputStream ->
                     val buffer = ByteArray(64 * 1024)
                     var bytesRead: Int
@@ -393,7 +391,7 @@ private class DeploySSHClient(
                         val chunk = if (bytesRead == buffer.size) buffer else buffer.copyOf(bytesRead)
                         val base64 = android.util.Base64.encodeToString(chunk, android.util.Base64.NO_WRAP)
                         val cmd = "printf '%s' '$base64' | base64 -d >> '$tempRemote'"
-                        val res = execResult(rootCommand(cmd), 60000L)
+                        val res = execRoot(cmd, 60000L)
                         if (res.exitStatus != 0) {
                             throw IOException("Chunk upload failed at offset $totalUploaded")
                         }
@@ -402,7 +400,7 @@ private class DeploySSHClient(
                         DeployManager.updateProgress(percent * 0.5f, "Загрузка: $label (${(percent * 100).toInt()}%)")
                     }
                 }
-                val moveRes = execResult(rootCommand("mv -f '$tempRemote' '$remotePath' && chmod 0755 '$remotePath'"), 30000L)
+                val moveRes = execRoot("mv -f '$tempRemote' '$remotePath' && chmod 0755 '$remotePath'", 30000L)
                 if (moveRes.exitStatus == 0) {
                     TunnelManager.addDeploySuccessLog("Загружено (Stream): $label")
                     return
@@ -540,7 +538,7 @@ internal fun deployMode(installInDocker: Boolean): String =
 private fun rootCommand(command: String): String {
     val quoted = shellQuote(command)
     return "if [ \"\$(id -u)\" = \"0\" ]; then bash -c $quoted; " +
-        "elif command -v sudo >/dev/null 2>&1; then sudo bash -c $quoted; " +
+        "elif command -v sudo >/dev/null 2>&1; then sudo -S -p '' -- bash -c $quoted; " +
         "else echo 'error: root privileges required and sudo not found'; exit 1; fi"
 }
 
@@ -555,7 +553,7 @@ private fun isBenignStderr(line: String): Boolean = BENIGN_STDERR.containsMatchI
 
 internal suspend fun performDeploy(
     context: Context,
-    host: String, user: String, pass: String, port: Int,
+    host: String, user: String, pass: String, sudoPass: String, port: Int,
     mainPass: String, webLogin: String, webPass: String,
     peerPort: Int, webPort: Int,
     onProgress: (Float, String) -> Unit,
@@ -575,7 +573,7 @@ internal suspend fun performDeploy(
         val initialSsh = createSSHClient(host, user, pass, port, privateKey, keyPassphrase)
         ssh = initialSsh
         DeployManager.activeSession = initialSsh
-        val sshClient = DeploySSHClient(initialSsh, pass) { stage ->
+        val sshClient = DeploySSHClient(initialSsh, sudoPass) { stage ->
             TunnelManager.addDeployInfoLog("Повторное SSH-подключение: $stage")
             createSSHClient(host, user, pass, port, privateKey, keyPassphrase).also {
                 ssh = it
@@ -643,8 +641,8 @@ internal suspend fun performDeploy(
 
         onProgress(0.18f, "Установка нового сервера...")
         TunnelManager.addDeployInfoLog("Запуск установщика на VPS")
-        val deployResult = sshClient.execResult(
-            rootCommand("$deployEnvironment bash /tmp/deploy.sh install"),
+        val deployResult = sshClient.execRoot(
+            "$deployEnvironment bash /tmp/deploy.sh install",
             timeout = CMD_TIMEOUT
         )
         val output = deployResult.output
@@ -692,7 +690,7 @@ internal suspend fun performDeploy(
 
 internal suspend fun performUninstall(
     context: Context,
-    host: String, user: String, pass: String, port: Int,
+    host: String, user: String, pass: String, sudoPass: String, port: Int,
     peerPort: Int,
     onProgress: (Float, String) -> Unit,
     privateKey: String = "",
@@ -708,7 +706,7 @@ internal suspend fun performUninstall(
         TunnelManager.addDeployInfoLog("Подключение к VPS по SSH")
         ssh = createSSHClient(host, user, pass, port, privateKey, keyPassphrase)
         DeployManager.activeSession = ssh
-        val sshClient = DeploySSHClient(ssh, pass)
+        val sshClient = DeploySSHClient(ssh, sudoPass)
         TunnelManager.addDeploySuccessLog("SSH-соединение установлено")
 
         onProgress(0.15f, "Подготовка штатного удаления...")
@@ -724,10 +722,15 @@ internal suspend fun performUninstall(
 
         onProgress(0.30f, "Удаление через deploy.sh...")
         TunnelManager.addDeployInfoLog("Запуск серверного удаления")
-        sshClient.exec(
-            rootCommand("env CSQTT_PEER_PORT=$peerPort CSQTT_SSH_PORT=$port bash /tmp/deploy.sh uninstall"),
+        val uninstallResult = sshClient.execRoot(
+            "env CSQTT_PEER_PORT=$peerPort CSQTT_SSH_PORT=$port bash /tmp/deploy.sh uninstall",
             timeout = 30000L,
         )
+        if (uninstallResult.exitStatus != 0) {
+            throw IOException(
+                "Удаление завершилось с кодом ${uninstallResult.exitStatus}: ${uninstallResult.output.trim().take(500)}",
+            )
+        }
 
         onProgress(1.0f, "Готово!")
         TunnelManager.addDeploySuccessLog("Удаление CSQTT завершено")

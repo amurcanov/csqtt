@@ -43,9 +43,9 @@ class VpnWidgetProvider : AppWidgetProvider() {
     }
 
     override fun onUpdate(context: Context, appWidgetManager: AppWidgetManager, appWidgetIds: IntArray) {
-        val running = TunnelManager.running.value
+        val connection = TunnelManager.connection.value
         for (appWidgetId in appWidgetIds) {
-            updateWidgetState(context, appWidgetManager, appWidgetId, running)
+            updateWidgetState(context, appWidgetManager, appWidgetId, connection)
         }
     }
 
@@ -53,7 +53,8 @@ class VpnWidgetProvider : AppWidgetProvider() {
         super.onReceive(context, intent)
         if (intent.action == ACTION_WIDGET_TOGGLE) {
             runCatching {
-                if (TunnelManager.running.value) {
+                if (TunnelManager.connection.value.phase == TunnelConnectionPhase.Stopping) return
+                if (TunnelManager.connection.value.canStop) {
                     val stopIntent = Intent(context, TunnelService::class.java).apply { action = "STOP" }
                     context.startService(stopIntent)
                     updateAllWidgets(context)
@@ -91,16 +92,15 @@ class VpnWidgetProvider : AppWidgetProvider() {
         context: Context,
         appWidgetManager: AppWidgetManager,
         appWidgetId: Int,
-        running: Boolean
+        connection: TunnelConnectionSnapshot
     ) {
         val views = RemoteViews(context.packageName, R.layout.vpn_widget)
 
-        if (running) {
-            views.setTextViewText(R.id.widget_status, "Подключено")
+        views.setTextViewText(R.id.widget_status, connection.phase.label)
+        if (connection.connected) {
             views.setTextColor(R.id.widget_status, 0xFF00E5FF.toInt()) 
             views.setInt(R.id.widget_toggle_btn, "setBackgroundResource", R.drawable.bg_widget_button_active)
         } else {
-            views.setTextViewText(R.id.widget_status, "Отключено")
             views.setTextColor(R.id.widget_status, 0xFF888888.toInt()) 
             views.setInt(R.id.widget_toggle_btn, "setBackgroundResource", R.drawable.bg_widget_button_inactive)
         }

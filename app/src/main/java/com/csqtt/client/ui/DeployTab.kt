@@ -5,66 +5,33 @@ package com.csqtt.client.ui
 
 import com.csqtt.client.showRaisedToast
 import android.content.Intent
-import android.content.res.Configuration
 import android.os.Handler
 import android.os.Looper
 import android.widget.Toast
 import androidx.core.net.toUri
-import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.core.animateFloatAsState
-import androidx.compose.animation.core.tween
-import androidx.compose.animation.core.snap
-import androidx.compose.animation.core.FastOutSlowInEasing
-import androidx.compose.foundation.BorderStroke
-import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.text.KeyboardOptions
-import androidx.compose.foundation.verticalScroll
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Delete
-import androidx.compose.material.icons.outlined.Visibility
-import androidx.compose.material.icons.outlined.VisibilityOff
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import com.csqtt.client.TunnelService
-import androidx.compose.ui.Alignment
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.res.stringResource
-import androidx.compose.ui.text.input.ImeAction
-import androidx.compose.ui.text.input.KeyboardType
-import androidx.compose.ui.text.input.PasswordVisualTransformation
-import androidx.compose.ui.text.input.VisualTransformation
-import androidx.compose.ui.text.style.TextOverflow
-import androidx.compose.ui.tooling.preview.Preview
-import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.csqtt.client.DeployManager
 import com.csqtt.client.DeploySettingsSnapshot
 import com.csqtt.client.SettingsStore
 import com.csqtt.client.TunnelManager
 import com.csqtt.client.CsqttConstants
-import com.csqtt.client.R
 import com.csqtt.client.ui.dialogs.DeploySecretsDialog
 import com.csqtt.client.ui.dialogs.SshKeysDialog
 import com.csqtt.client.ui.dialogs.UninstallConfirmDialog
-import com.csqtt.client.ui.components.CsqttBanner
-import com.csqtt.client.ui.components.CsqttScreen
-import com.csqtt.client.ui.components.CsqttSettingRow
-import com.csqtt.client.ui.design.CsqttShapes
-import com.csqtt.client.ui.design.CsqttSizes
-import com.csqtt.client.ui.design.CsqttSpacing
-import com.csqtt.client.ui.design.CsqttTheme
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
 
 @Immutable
 internal data class DeployUiState(
     val host: String = "",
-    val sshLogin: String = "",
+    val sshLogin: String = "root",
     val sshPassword: String = "",
+    val sudoPassword: String = "",
     val manualPorts: Boolean = false,
     val sshPort: String = CsqttConstants.Network.DEFAULT_SSH_PORT.toString(),
     val peerPort: String = CsqttConstants.Network.DEFAULT_SERVER_PEER_PORT.toString(),
@@ -88,6 +55,9 @@ internal data class DeployUiState(
     val sshAuthReady: Boolean
         get() = sshLogin.isNotBlank() && if (sshKeysMode) sshKeysFilled == 1 else sshPassword.isNotBlank()
 
+    val showSudoPassword: Boolean
+        get() = sshLogin != "root"
+
     val canInstall: Boolean
         get() = host.isNotBlank() && sshAuthReady && authorizationConfigured && portsValid
 
@@ -99,6 +69,7 @@ internal sealed interface DeployAction {
     data class HostChanged(val value: String) : DeployAction
     data class LoginChanged(val value: String) : DeployAction
     data class PasswordChanged(val value: String) : DeployAction
+    data class SudoPasswordChanged(val value: String) : DeployAction
     data class ManualPortsChanged(val enabled: Boolean) : DeployAction
     data class SshKeysModeChanged(val enabled: Boolean) : DeployAction
     data class DockerInstallChanged(val enabled: Boolean) : DeployAction
@@ -172,8 +143,9 @@ internal fun DeployTab(
     if (!savedSettings.isLoaded) return
 
     val savedIp = savedSettings.ip
-    val savedLogin = savedSettings.sshLogin
+    val savedLogin = savedSettings.sshLogin.ifBlank { "root" }
     val savedPassword = savedSettings.sshPassword
+    val savedSudoPassword = savedSettings.sudoPassword
     val savedWebLogin = savedSettings.webLogin
     val savedWebPassword = savedSettings.webPassword
     val savedMainPass = savedSettings.mainPassword
@@ -193,6 +165,7 @@ internal fun DeployTab(
     var host by rememberSaveable(savedSettings.profile) { mutableStateOf(savedIp) }
     var sshLogin by rememberSaveable(savedSettings.profile) { mutableStateOf(savedLogin) }
     var sshPassword by rememberSaveable(savedSettings.profile) { mutableStateOf(savedPassword) }
+    var sudoPassword by rememberSaveable(savedSettings.profile) { mutableStateOf(savedSudoPassword) }
     var sshPort by rememberSaveable(savedSettings.profile) {
         mutableStateOf(savedSshPort.ifBlank { CsqttConstants.Network.DEFAULT_SSH_PORT.toString() })
     }
@@ -201,6 +174,7 @@ internal fun DeployTab(
     var dockerInstall by rememberSaveable(savedSettings.profile) { mutableStateOf(savedDockerInstall) }
     var generalEdited by rememberSaveable(savedSettings.profile) { mutableStateOf(false) }
     var credentialsEdited by rememberSaveable(savedSettings.profile) { mutableStateOf(false) }
+    var sudoPasswordEdited by rememberSaveable(savedSettings.profile) { mutableStateOf(false) }
     var portsEdited by rememberSaveable(savedSettings.profile) { mutableStateOf(false) }
     var showValidation by rememberSaveable(savedSettings.profile) { mutableStateOf(false) }
     var showSecretsDialog by rememberSaveable(savedSettings.profile) { mutableStateOf(false) }
@@ -219,6 +193,9 @@ internal fun DeployTab(
             sshLogin = savedLogin
             sshPassword = savedPassword
         }
+    }
+    LaunchedEffect(savedSettings.profile, savedSudoPassword) {
+        if (!sudoPasswordEdited) sudoPassword = savedSudoPassword
     }
     LaunchedEffect(savedSettings.profile, savedSshPort, savedServerPeerPort, savedServerWebPort) {
         if (!portsEdited) {
@@ -241,6 +218,11 @@ internal fun DeployTab(
         kotlinx.coroutines.delay(450)
         settingsStore.saveDeploySecrets(savedMainPass, sshLogin, sshPassword, savedWebLogin, savedWebPassword)
     }
+    LaunchedEffect(savedSettings.profile, sudoPassword, sudoPasswordEdited) {
+        if (!sudoPasswordEdited) return@LaunchedEffect
+        kotlinx.coroutines.delay(450)
+        settingsStore.saveDeploySudoPassword(sudoPassword)
+    }
     LaunchedEffect(savedSettings.profile, sshPort, peerPort, webPort, portsEdited) {
         if (!portsEdited) return@LaunchedEffect
         kotlinx.coroutines.delay(450)
@@ -256,6 +238,7 @@ internal fun DeployTab(
         host = host,
         sshLogin = sshLogin,
         sshPassword = sshPassword,
+        sudoPassword = sudoPassword,
         manualPorts = savedManualPorts,
         sshPort = sshPort,
         peerPort = peerPort,
@@ -280,10 +263,10 @@ internal fun DeployTab(
         val deployPrivateKey = if (savedSshKeysMode) savedSshPrivateKey else ""
         val deployKeyPassphrase = if (savedSshKeysMode) savedSshKeyPassphrase else ""
         val deployCertificate = if (savedSshKeysMode) savedSshCertificate else ""
-        val deployPassword = if (savedSshKeysMode) "" else sshPassword
         scope.launch {
             settingsStore.saveDeploy(host)
             settingsStore.saveDeploySecrets(savedMainPass, sshLogin, sshPassword, savedWebLogin, savedWebPassword)
+            settingsStore.saveDeploySudoPassword(sudoPassword)
             settingsStore.savePorts(effectivePeerPort, effectiveWebPort, effectiveSshPort.toString())
         }
         DeployManager.startDeploy()
@@ -294,7 +277,8 @@ internal fun DeployTab(
                     context = context,
                     host = host,
                     user = sshLogin,
-                    pass = deployPassword,
+                    pass = sshPassword,
+                    sudoPass = if (state.showSudoPassword) sudoPassword else "",
                     port = effectiveSshPort,
                     mainPass = savedMainPass,
                     webLogin = savedWebLogin,
@@ -345,7 +329,6 @@ internal fun DeployTab(
         val uninstallPrivateKey = if (savedSshKeysMode) savedSshPrivateKey else ""
         val uninstallKeyPassphrase = if (savedSshKeysMode) savedSshKeyPassphrase else ""
         val uninstallCertificate = if (savedSshKeysMode) savedSshCertificate else ""
-        val uninstallPassword = if (savedSshKeysMode) "" else sshPassword
         DeployManager.startDeploy()
         DeployManager.scope.launch {
             try {
@@ -354,7 +337,8 @@ internal fun DeployTab(
                     context = context,
                     host = host,
                     user = sshLogin,
-                    pass = uninstallPassword,
+                    pass = sshPassword,
+                    sudoPass = if (state.showSudoPassword) sudoPassword else "",
                     port = effectiveSshPort,
                     peerPort = effectivePeerPort,
                     onProgress = DeployManager::updateProgress,
@@ -405,6 +389,10 @@ internal fun DeployTab(
                     sshPassword = sanitizeSshPassword(action.value)
                     credentialsEdited = true
                 }
+                is DeployAction.SudoPasswordChanged -> {
+                    sudoPassword = sanitizeSshPassword(action.value)
+                    sudoPasswordEdited = true
+                }
                 is DeployAction.ManualPortsChanged -> {
                     if (!action.enabled) {
                         sshPort = CsqttConstants.Network.DEFAULT_SSH_PORT.toString()
@@ -414,8 +402,12 @@ internal fun DeployTab(
                     }
                     scope.launch { settingsStore.saveManualPortsEnabled(action.enabled) }
                 }
-                is DeployAction.SshKeysModeChanged -> scope.launch {
-                    settingsStore.saveSshKeysMode(action.enabled)
+                is DeployAction.SshKeysModeChanged -> {
+                    if (action.enabled && sshLogin.isBlank()) {
+                        sshLogin = "root"
+                        credentialsEdited = true
+                    }
+                    scope.launch { settingsStore.saveSshKeysMode(action.enabled) }
                 }
                 is DeployAction.DockerInstallChanged -> {
                     dockerInstall = action.enabled

@@ -4,11 +4,6 @@
 package com.csqtt.client.ui
 
 import android.content.res.Configuration
-import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.expandVertically
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
-import androidx.compose.animation.shrinkVertically
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.snap
@@ -16,40 +11,28 @@ import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.text.KeyboardOptions
-import androidx.compose.foundation.verticalScroll
+import com.csqtt.client.ui.components.fadingVerticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Key
-import androidx.compose.material.icons.outlined.Visibility
-import androidx.compose.material.icons.outlined.VisibilityOff
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.saveable.rememberSaveable
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
-import androidx.compose.ui.text.input.PasswordVisualTransformation
-import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
-import com.csqtt.client.CSQTTTheme
 import com.csqtt.client.CsqttConstants
-import com.csqtt.client.R
 import com.csqtt.client.ui.components.CsqttScreen
 import com.csqtt.client.ui.components.CsqttSettingRow
+import com.csqtt.client.ui.components.ExpandableContent
 import com.csqtt.client.ui.design.CsqttShapes
-import com.csqtt.client.ui.design.CsqttSizes
 import com.csqtt.client.ui.design.CsqttSpacing
-import com.csqtt.client.ui.design.CsqttTheme
 
 @Composable
 internal fun DeployScreen(
@@ -58,7 +41,6 @@ internal fun DeployScreen(
     modifier: Modifier = Modifier,
     snackbarHostState: SnackbarHostState = remember { SnackbarHostState() },
 ) {
-    var passwordVisible by rememberSaveable { mutableStateOf(false) }
     val scrollState = rememberScrollState()
 
     CsqttScreen(
@@ -68,45 +50,29 @@ internal fun DeployScreen(
             Column(
                 modifier = Modifier
                     .fillMaxSize()
-                    .verticalScroll(scrollState),
-                verticalArrangement = Arrangement.spacedBy(CsqttSpacing.Md),
+                    .fadingVerticalScroll(scrollState),
             ) {
-                AppSectionCard {
+                AppSectionCard(verticalArrangement = Arrangement.spacedBy(0.dp)) {
                     Text("Деплой и SSH", style = MaterialTheme.typography.titleMedium, fontWeight = androidx.compose.ui.text.font.FontWeight.SemiBold)
-                    if (state.sshKeysMode) {
-                        AdaptiveFieldPair(
-                            first = {
-                                DeployTextField(
-                                    value = state.host,
-                                    onValueChange = { onAction(DeployAction.HostChanged(it)) },
-                                    label = "IP сервера или домен",
-                                    placeholder = "1.2.3.4",
-                                    enabled = !state.isDeploying,
-                                    isError = state.host.isBlank(),
-                                    keyboardType = KeyboardType.Uri,
-                                )
-                            },
-                            second = {
-                                DeployTextField(
-                                    value = state.sshLogin,
-                                    onValueChange = { onAction(DeployAction.LoginChanged(it)) },
-                                    label = "Логин SSH",
-                                    enabled = !state.isDeploying,
-                                    isError = state.sshLogin.isBlank(),
-                                    imeAction = ImeAction.Next,
-                                )
-                            },
-                        )
-                        AnimatedVisibility(
-                            visible = state.manualPorts,
-                            enter = fadeIn() + expandVertically(expandFrom = Alignment.Top),
-                            exit = fadeOut() + shrinkVertically(shrinkTowards = Alignment.Top),
-                        ) {
-                            ManualPortFields(state = state, onAction = onAction)
-                        }
+                    Spacer(Modifier.height(16.dp))
+                    DeployTextField(
+                        value = state.host,
+                        onValueChange = { onAction(DeployAction.HostChanged(it)) },
+                        label = "IP сервера или домен",
+                        placeholder = "1.2.3.4",
+                        enabled = !state.isDeploying,
+                        isError = state.host.isBlank(),
+                        keyboardType = KeyboardType.Uri,
+                    )
+                    Spacer(Modifier.height(16.dp))
+                    DeployCredentialsFields(state = state, onAction = onAction)
+                    ExpandableContent(
+                        visible = state.sshKeysMode,
+                        spacing = CsqttSpacing.Md,
+                    ) {
                         OutlinedButton(
                             onClick = { onAction(DeployAction.EditSshKeys) },
-                            enabled = !state.isDeploying,
+                            enabled = !state.isDeploying && state.sshKeysMode,
                             modifier = Modifier.fillMaxWidth().height(52.dp),
                             shape = CsqttShapes.Pill,
                             colors = ButtonDefaults.outlinedButtonColors(
@@ -123,55 +89,14 @@ internal fun DeployScreen(
                             Spacer(Modifier.width(8.dp))
                             Text("Ключи SSH ${state.sshKeysFilled}/1", fontWeight = androidx.compose.ui.text.font.FontWeight.SemiBold, maxLines = 1)
                         }
-                    } else {
-                        DeployTextField(
-                            value = state.host,
-                            onValueChange = { onAction(DeployAction.HostChanged(it)) },
-                            label = "IP сервера или домен",
-                            placeholder = "1.2.3.4",
-                            enabled = !state.isDeploying,
-                            isError = state.host.isBlank(),
-                            keyboardType = KeyboardType.Uri,
-                        )
-                        AnimatedVisibility(
-                            visible = state.manualPorts,
-                            enter = fadeIn() + expandVertically(expandFrom = Alignment.Top),
-                            exit = fadeOut() + shrinkVertically(shrinkTowards = Alignment.Top),
-                        ) {
-                            ManualPortFields(state = state, onAction = onAction)
-                        }
-                        AdaptiveFieldPair(
-                            first = {
-                                DeployTextField(
-                                    value = state.sshLogin,
-                                    onValueChange = { onAction(DeployAction.LoginChanged(it)) },
-                                    label = "Логин SSH",
-                                    enabled = !state.isDeploying,
-                                    isError = state.sshLogin.isBlank(),
-                                    imeAction = ImeAction.Next,
-                                )
-                            },
-                            second = {
-                                DeployTextField(
-                                    value = state.sshPassword,
-                                    onValueChange = { onAction(DeployAction.PasswordChanged(it)) },
-                                    label = "Пароль SSH",
-                                    enabled = !state.isDeploying,
-                                    isError = state.sshPassword.isBlank(),
-                                    keyboardType = KeyboardType.Password,
-                                    visualTransformation = if (passwordVisible) VisualTransformation.None else PasswordVisualTransformation(),
-                                    trailingContent = {
-                                        IconButton(onClick = { passwordVisible = !passwordVisible }) {
-                                             Icon(
-                                                imageVector = if (passwordVisible) Icons.Outlined.VisibilityOff else Icons.Outlined.Visibility,
-                                                contentDescription = if (passwordVisible) "Скрыть пароль" else "Показать пароль",
-                                            )
-                                        }
-                                    },
-                                )
-                            },
-                        )
                     }
+                    ExpandableContent(
+                        visible = state.manualPorts,
+                        spacing = CsqttSpacing.Md,
+                    ) {
+                        ManualPortFields(state = state, onAction = onAction)
+                    }
+                    Spacer(Modifier.height(16.dp))
                     Column {
                         CsqttSettingRow(
                             title = "Ключи SSH",
@@ -196,7 +121,10 @@ internal fun DeployScreen(
                     }
                 }
 
-                if (state.isDeploying) {
+                ExpandableContent(
+                    visible = state.isDeploying,
+                    spacing = CsqttSpacing.Md,
+                ) {
                     DeployProgressCard(
                         progress = state.progress,
                         currentStep = state.currentStep,
@@ -206,7 +134,7 @@ internal fun DeployScreen(
                 ServerActionBar(
                     state = state,
                     onAction = onAction,
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier.fillMaxWidth().padding(top = CsqttSpacing.Md),
                 )
             }
 
@@ -219,10 +147,65 @@ internal fun DeployScreen(
 }
 
 @Composable
+private fun DeployCredentialsFields(
+    state: DeployUiState,
+    onAction: (DeployAction) -> Unit,
+) {
+    Column {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(CsqttSpacing.Sm),
+        ) {
+            DeployTextField(
+                value = state.sshLogin,
+                onValueChange = { onAction(DeployAction.LoginChanged(it)) },
+                label = "Логин SSH",
+                enabled = !state.isDeploying,
+                isError = state.sshLogin.isBlank(),
+                imeAction = ImeAction.Next,
+                modifier = Modifier.weight(1f),
+            )
+            if (!state.sshKeysMode) {
+                DeployPasswordField(
+                    value = state.sshPassword,
+                    onValueChange = { onAction(DeployAction.PasswordChanged(it)) },
+                    label = "Пароль SSH",
+                    enabled = !state.isDeploying,
+                    isError = state.sshPassword.isBlank(),
+                    modifier = Modifier.weight(1f),
+                )
+            }
+        }
+        ExpandableContent(visible = state.showSudoPassword, spacing = CsqttSpacing.Md) {
+            DeployPasswordField(
+                value = state.sudoPassword,
+                onValueChange = { onAction(DeployAction.SudoPasswordChanged(it)) },
+                label = "Пароль sudo",
+                placeholder = "необязательно",
+                enabled = !state.isDeploying && state.showSudoPassword,
+            )
+        }
+    }
+}
+
+@Composable
 private fun ManualPortFields(
     state: DeployUiState,
     onAction: (DeployAction) -> Unit,
 ) {
+    val textMeasurer = rememberTextMeasurer()
+    val density = LocalDensity.current
+    val labelStyle = MaterialTheme.typography.bodySmall
+    val sshLabel = "SSH-порт"
+    val peerLabel = "Порт туннеля"
+    val webLabel = "Порт WEB-панели"
+    val portValueWidth = textMeasurer.measure("65535", MaterialTheme.typography.bodyLarge).size.width
+    fun fieldWidth(label: String) = with(density) {
+        maxOf(textMeasurer.measure(label, labelStyle).size.width, portValueWidth).toDp()
+    } + 24.dp
+    val sshPortWidth = fieldWidth(sshLabel)
+    val peerPortWidth = fieldWidth(peerLabel)
+    val webPortWidth = fieldWidth(webLabel)
     Row(
         modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.spacedBy(CsqttSpacing.Sm),
@@ -230,32 +213,35 @@ private fun ManualPortFields(
         DeployTextField(
             value = state.sshPort,
             onValueChange = { onAction(DeployAction.SshPortChanged(it)) },
-            label = "SSH-порт",
+            label = sshLabel,
+            labelStyle = labelStyle,
             placeholder = "22",
-            enabled = !state.isDeploying,
+            enabled = !state.isDeploying && state.manualPorts,
             isError = state.showValidation && !isValidPort(state.sshPort),
             keyboardType = KeyboardType.Number,
-            modifier = Modifier.weight(1f),
+            modifier = Modifier.width(sshPortWidth),
         )
         DeployTextField(
             value = state.peerPort,
             onValueChange = { onAction(DeployAction.PeerPortChanged(it)) },
-            label = "Порт туннеля",
+            label = peerLabel,
+            labelStyle = labelStyle,
             placeholder = "46000",
-            enabled = !state.isDeploying,
+            enabled = !state.isDeploying && state.manualPorts,
             isError = state.showValidation && !isValidPort(state.peerPort),
             keyboardType = KeyboardType.Number,
-            modifier = Modifier.weight(1f),
+            modifier = Modifier.weight(peerPortWidth.value),
         )
         DeployTextField(
             value = state.webPort,
             onValueChange = { onAction(DeployAction.WebPortChanged(it)) },
-            label = "Порт WEB-панели",
+            label = webLabel,
+            labelStyle = labelStyle,
             placeholder = "46002",
-            enabled = !state.isDeploying,
+            enabled = !state.isDeploying && state.manualPorts,
             isError = state.showValidation && !isValidPort(state.webPort),
             keyboardType = KeyboardType.Number,
-            modifier = Modifier.weight(1f),
+            modifier = Modifier.weight(webPortWidth.value),
         )
     }
 }
@@ -266,7 +252,7 @@ private fun DeployProgressCard(
     currentStep: String,
 ) {
     val animatedProgress by animateFloatAsState(
-        targetValue = progress,
+        targetValue = progress.coerceIn(0f, 1f),
         animationSpec = if (progress <= 0.01f) snap() else tween(durationMillis = 320, easing = FastOutSlowInEasing),
         label = "deploy_progress",
     )
@@ -296,8 +282,6 @@ private fun DeployProgressCard(
         )
     }
 }
-
-
 
 @Preview(name = "Deploy compact", widthDp = 360, heightDp = 800, showBackground = true)
 @Preview(name = "Deploy dark", widthDp = 720, heightDp = 900, uiMode = Configuration.UI_MODE_NIGHT_YES)

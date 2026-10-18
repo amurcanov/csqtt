@@ -4,32 +4,25 @@
 package com.csqtt.client.ui
 
 import android.content.pm.PackageManager
-import androidx.compose.foundation.Image
-import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
-import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Apps
 import androidx.compose.material.icons.outlined.Search
-import androidx.compose.material3.Checkbox
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -42,15 +35,12 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.res.stringResource
-import androidx.compose.ui.semantics.Role
-import androidx.compose.ui.semantics.clearAndSetSemantics
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -61,8 +51,8 @@ import com.csqtt.client.TunnelManager
 import com.csqtt.client.ui.components.CsqttEmptyState
 import com.csqtt.client.ui.components.CsqttLoadingState
 import com.csqtt.client.ui.components.CsqttScreen
-import com.csqtt.client.ui.components.CsqttSegmentedControl
 import com.csqtt.client.ui.components.CsqttSettingRow
+import com.csqtt.client.ui.components.verticalScrollEdgeFade
 import com.csqtt.client.ui.design.CsqttShapes
 import com.csqtt.client.ui.design.CsqttSizes
 import com.csqtt.client.ui.design.CsqttSpacing
@@ -74,13 +64,14 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
-
 private object AppCache {
-    @Volatile
-    var cachedList: List<AppItem>? = null
+    @Volatile var cachedList: List<AppItem>? = null
 }
 
-private enum class RoutingMode { ExcludeSelected, IncludeSelected }
+private enum class RoutingMode {
+    ExcludeSelected,
+    IncludeSelected,
+}
 
 @Composable
 fun ExceptionsTab(
@@ -94,9 +85,10 @@ fun ExceptionsTab(
     val scope = rememberCoroutineScope()
     // Taps edit a local draft; the DataStore write (and VPN reload) is
     // debounced so a burst of toggles costs one persist instead of one per tap.
-    val persistedSelection = remember(savedExcluded) {
-        savedExcluded.split(',').filter(String::isNotBlank).toSet()
-    }
+    val persistedSelection =
+        remember(savedExcluded) {
+            savedExcluded.split(',').filter(String::isNotBlank).toSet()
+        }
     var selectedPackages by remember { mutableStateOf(persistedSelection) }
     var lastSavedSelection by remember { mutableStateOf(persistedSelection) }
     var saveJob by remember { mutableStateOf<Job?>(null) }
@@ -126,49 +118,59 @@ fun ExceptionsTab(
         }
 
         isLoading = true
-        val loadedApps = withContext(Dispatchers.IO) {
-            val packageManager = context.packageManager
-            packageManager
-                .getInstalledApplications(PackageManager.GET_META_DATA)
-                .asSequence()
-                .filter { app ->
-                    app.packageName != context.packageName &&
-                        !app.packageName.contains("vkontakte") &&
-                        !app.packageName.contains("vk.calls")
-                }
-                .map { app ->
-                    AppItem(
-                        name = app.loadLabel(packageManager).toString(),
-                        packageName = app.packageName,
-                        icon = runCatching { app.loadIcon(packageManager).toBitmap().asImageBitmap() }.getOrNull(),
-                        isSystem = (app.flags and android.content.pm.ApplicationInfo.FLAG_SYSTEM) != 0,
-                    )
-                }
-                .sortedBy { it.name.lowercase() }
-                .toList()
-        }
+        val loadedApps =
+            withContext(Dispatchers.IO) {
+                val packageManager = context.packageManager
+                packageManager
+                    .getInstalledApplications(PackageManager.GET_META_DATA)
+                    .asSequence()
+                    .filter { app ->
+                        app.packageName != context.packageName &&
+                            !app.packageName.contains("vkontakte") &&
+                            !app.packageName.contains("vk.calls")
+                    }
+                    .map { app ->
+                        AppItem(
+                            name = app.loadLabel(packageManager).toString(),
+                            packageName = app.packageName,
+                            icon =
+                                runCatching {
+                                        app.loadIcon(packageManager).toBitmap().asImageBitmap()
+                                    }
+                                    .getOrNull(),
+                            isSystem =
+                                (app.flags and android.content.pm.ApplicationInfo.FLAG_SYSTEM) != 0,
+                        )
+                    }
+                    .sortedBy { it.name.lowercase() }
+                    .toList()
+            }
         AppCache.cachedList = loadedApps
         appsList = loadedApps
         isLoading = false
     }
 
-    val filteredApps = remember(appsList, showSystemApps, searchQuery) {
-        val visibleApps = if (showSystemApps) {
-            appsList
-        } else {
-            appsList.filter {
-                !it.isSystem || it.packageName == "com.google.android.youtube" || it.packageName == "com.android.vending"
+    val filteredApps =
+        remember(appsList, showSystemApps, searchQuery) {
+            val visibleApps =
+                if (showSystemApps) {
+                    appsList
+                } else {
+                    appsList.filter {
+                        !it.isSystem ||
+                            it.packageName == "com.google.android.youtube" ||
+                            it.packageName == "com.android.vending"
+                    }
+                }
+            if (searchQuery.isBlank()) {
+                visibleApps
+            } else {
+                visibleApps.filter {
+                    it.name.contains(searchQuery, ignoreCase = true) ||
+                        it.packageName.contains(searchQuery, ignoreCase = true)
+                }
             }
         }
-        if (searchQuery.isBlank()) {
-            visibleApps
-        } else {
-            visibleApps.filter {
-                it.name.contains(searchQuery, ignoreCase = true) ||
-                    it.packageName.contains(searchQuery, ignoreCase = true)
-            }
-        }
-    }
     val listState = rememberLazyListState()
     val routingMode = if (isWhitelist) RoutingMode.IncludeSelected else RoutingMode.ExcludeSelected
 
@@ -226,28 +228,56 @@ fun ExceptionsTab(
         )
 
         AppSectionCard(
-            contentPadding = PaddingValues(horizontal = CsqttSpacing.Md, vertical = CsqttSpacing.Sm),
+            contentPadding =
+                PaddingValues(horizontal = CsqttSpacing.Md, vertical = CsqttSpacing.Sm),
             verticalArrangement = Arrangement.spacedBy(CsqttSpacing.Sm),
         ) {
-            CsqttSegmentedControl(
-                options = listOf(
-                    RoutingMode.ExcludeSelected to stringResource(R.string.exceptions_mode_exclude),
-                    RoutingMode.IncludeSelected to stringResource(R.string.exceptions_mode_include),
-                ),
-                selected = routingMode,
-                enabled = isMigrationReady,
-                onSelected = { mode ->
-                    if (mode == routingMode) return@CsqttSegmentedControl
-                    scope.launch {
-                        settingsStore.saveExceptionsMode(
-                            selectedPackages.sorted().joinToString(","),
-                            mode == RoutingMode.IncludeSelected,
-                        )
-                        delay(300)
-                        TunnelManager.reloadVpn()
-                    }
-                },
-            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                androidx.compose.foundation.layout.Column(
+                    modifier = Modifier.weight(1f).padding(end = 12.dp)
+                ) {
+                    Text(
+                        "Режим исключений",
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = androidx.compose.ui.text.font.FontWeight.Medium,
+                    )
+                    Text(
+                        if (isWhitelist) "Выбранные приложения добавляются в туннель"
+                        else "Выбранные приложения исключаются из туннеля",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    listOf(RoutingMode.ExcludeSelected to "ЧС", RoutingMode.IncludeSelected to "БС")
+                        .forEach { (mode, label) ->
+                            val description = stringResource(
+                                if (mode == RoutingMode.ExcludeSelected) R.string.exceptions_mode_exclude
+                                else R.string.exceptions_mode_include
+                            )
+                            ProtocolChip(
+                                label,
+                                selected = routingMode == mode,
+                                modifier = Modifier.semantics { contentDescription = description },
+                                enabled = isMigrationReady,
+                            ) {
+                                if (mode == routingMode) return@ProtocolChip
+                                scope.launch {
+                                    settingsStore.saveExceptionsMode(
+                                        selectedPackages.sorted().joinToString(","),
+                                        mode == RoutingMode.IncludeSelected,
+                                    )
+                                    delay(300)
+                                    TunnelManager.reloadVpn()
+                                }
+                            }
+                        }
+                }
+            }
             HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
             CsqttSettingRow(
                 title = stringResource(R.string.exceptions_system_apps),
@@ -266,13 +296,19 @@ fun ExceptionsTab(
 
         when {
             !isMigrationReady || isLoading -> {
-                Box(modifier = Modifier.fillMaxWidth().weight(1f), contentAlignment = Alignment.Center) {
+                Box(
+                    modifier = Modifier.fillMaxWidth().weight(1f),
+                    contentAlignment = Alignment.Center,
+                ) {
                     CsqttLoadingState(label = stringResource(R.string.exceptions_loading))
                 }
             }
 
             filteredApps.isEmpty() -> {
-                Box(modifier = Modifier.fillMaxWidth().weight(1f), contentAlignment = Alignment.Center) {
+                Box(
+                    modifier = Modifier.fillMaxWidth().weight(1f),
+                    contentAlignment = Alignment.Center,
+                ) {
                     CsqttEmptyState(
                         title = stringResource(R.string.exceptions_empty_title),
                         description = stringResource(R.string.exceptions_empty_description),
@@ -284,7 +320,12 @@ fun ExceptionsTab(
             else -> {
                 LazyColumn(
                     state = listState,
-                    modifier = Modifier.fillMaxWidth().weight(1f),
+                    modifier =
+                        Modifier.fillMaxWidth()
+                            .weight(1f)
+                            .verticalScrollEdgeFade(
+                                state = listState,
+                            ),
                     contentPadding = PaddingValues(bottom = CsqttSizes.ScreenBottomPadding),
                     verticalArrangement = Arrangement.spacedBy(CsqttSpacing.Xs),
                 ) {
@@ -298,11 +339,12 @@ fun ExceptionsTab(
                             app = app,
                             isSelected = isSelected,
                             onClick = {
-                                val newSelection = if (isSelected) {
-                                    selectedPackages - app.packageName
-                                } else {
-                                    selectedPackages + app.packageName
-                                }
+                                val newSelection =
+                                    if (isSelected) {
+                                        selectedPackages - app.packageName
+                                    } else {
+                                        selectedPackages + app.packageName
+                                    }
                                 selectedPackages = newSelection
                                 persistSelection(newSelection)
                             },

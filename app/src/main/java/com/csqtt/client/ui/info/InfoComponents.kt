@@ -3,132 +3,178 @@
 
 package com.csqtt.client.ui
 
-import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.core.animateFloatAsState
-import androidx.compose.animation.expandVertically
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
-import androidx.compose.animation.shrinkVertically
-import androidx.compose.foundation.clickable
-import androidx.compose.foundation.text.TextAutoSize
-import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.ColumnScope
-import androidx.compose.foundation.layout.PaddingValues
-import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.defaultMinSize
-import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.heightIn
-import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.*
+import androidx.compose.foundation.*
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.*
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.material.icons.filled.KeyboardArrowDown
-import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.HorizontalDivider
-import androidx.compose.material3.Icon
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Surface
-import androidx.compose.material3.Text
-import androidx.compose.runtime.Composable
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.remember
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.rotate
-import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.draw.*
+import androidx.compose.ui.graphics.*
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.csqtt.client.CSQTTColors
+import com.csqtt.client.ui.components.ExpandableContent
+import com.csqtt.client.ui.components.ExpansionDuration
 import com.csqtt.client.R
-import com.csqtt.client.ui.design.CsqttShapes
-import com.csqtt.client.ui.design.CsqttSpacing
 
-import androidx.compose.foundation.background
-import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.ui.graphics.Brush
+@Composable
+private fun infoTileColor(): Color {
+    val palette = MaterialTheme.colorScheme
+    val isDark = palette.background.luminance() < 0.22f
+    return if (isDark) {
+        lerp(palette.surface, palette.surfaceVariant, 0.22f)
+    } else {
+        lerp(palette.surface, palette.surfaceVariant, 0.42f)
+    }
+}
 
-import androidx.compose.material.icons.filled.Favorite
+@Composable
+private fun infoTileBorder(): Color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f)
+
+@Composable
+private fun InfoIconTile(
+    accent: Color = MaterialTheme.colorScheme.primary,
+    size: androidx.compose.ui.unit.Dp = 40.dp,
+    content: @Composable () -> Unit,
+) {
+    Surface(
+        shape = RoundedCornerShape(size * 0.4f),
+        color = accent.copy(alpha = 0.12f),
+        border = BorderStroke(1.dp, accent.copy(alpha = 0.22f)),
+    ) {
+        Box(modifier = Modifier.size(size), contentAlignment = Alignment.Center) { content() }
+    }
+}
 
 @Composable
 internal fun InfoHeroCard(
     currentVersion: String,
-    onSupportClick: () -> Unit,
+    hasUpdate: Boolean,
+    updateStatus: String,
     onCryptoClick: () -> Unit,
+    onSupportClick: () -> Unit,
 ) {
-    val colors = MaterialTheme.colorScheme
+    val palette = MaterialTheme.colorScheme
+    val versionColor by
+        animateColorAsState(
+            targetValue = if (hasUpdate) palette.primary else palette.onSurfaceVariant,
+            animationSpec = tween(400),
+            label = "hero_version_color",
+        )
 
     AppSectionCard(
-        contentPadding = PaddingValues(20.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp),
+        contentPadding = PaddingValues(horizontal = 18.dp, vertical = 18.dp),
+        verticalArrangement = Arrangement.spacedBy(16.dp),
     ) {
-        Column(
+        Row(
             modifier = Modifier.fillMaxWidth(),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
+            horizontalArrangement = Arrangement.spacedBy(14.dp),
+            verticalAlignment = Alignment.CenterVertically,
         ) {
+            Surface(
+                shape = RoundedCornerShape(22.dp),
+                color = palette.primary.copy(alpha = 0.10f),
+                border = BorderStroke(1.dp, palette.primary.copy(alpha = 0.20f)),
+                modifier = Modifier.size(62.dp),
+            ) {
+                Box(contentAlignment = Alignment.Center) {
+                    Icon(
+                        painter = painterResource(id = R.drawable.ic_c_logo),
+                        contentDescription = null,
+                        tint = palette.primary,
+                        modifier = Modifier.size(34.dp),
+                    )
+                }
+            }
+
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(3.dp),
+            ) {
+                Text(
+                    text = "CSQTT",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold,
+                    color = palette.onSurface,
+                )
+                Text(
+                    text = "QUIC · TURN",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = palette.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+
+            Surface(
+                shape = RoundedCornerShape(12.dp),
+                color = versionColor.copy(alpha = 0.10f),
+                border = BorderStroke(1.dp, versionColor.copy(alpha = 0.22f)),
+            ) {
+                Text(
+                    text = currentVersion,
+                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.Bold,
+                    color = versionColor,
+                )
+            }
+        }
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(7.dp),
+        ) {
+            Box(modifier = Modifier.size(7.dp).clip(CircleShape).background(versionColor))
             Text(
-                text = "Поддержать разработчика Amurcanov",
-                style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.Bold,
-                color = colors.onSurface,
-                textAlign = androidx.compose.ui.text.style.TextAlign.Center,
-                maxLines = 1,
-                softWrap = false,
-                overflow = TextOverflow.Clip,
-                autoSize = TextAutoSize.StepBased(
-                    minFontSize = 12.sp,
-                    maxFontSize = MaterialTheme.typography.titleMedium.fontSize,
-                    stepSize = 0.5.sp,
-                ),
-                modifier = Modifier.fillMaxWidth(),
+                text = updateStatus,
+                style = MaterialTheme.typography.labelMedium,
+                color = versionColor,
             )
+        }
 
-            Button(
-                onClick = onSupportClick,
-                modifier = Modifier.fillMaxWidth().height(52.dp),
-                shape = CsqttShapes.Pill,
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = CSQTTColors.donate,
-                    contentColor = Color.White,
+        Button(
+            onClick = onSupportClick,
+            shape = RoundedCornerShape(18.dp),
+            colors =
+                ButtonDefaults.buttonColors(
+                    containerColor = palette.primary,
+                    contentColor = palette.onPrimary,
                 ),
-                contentPadding = PaddingValues(horizontal = 16.dp)
-            ) {
-                Icon(
-                    painter = painterResource(R.drawable.ic_yoomoney),
-                    contentDescription = "ЮMoney",
-                    tint = Color.Unspecified,
-                    modifier = Modifier.height(26.dp)
-                )
-            }
-
-            Button(
-                onClick = onCryptoClick,
-                modifier = Modifier.fillMaxWidth().height(52.dp),
-                shape = CsqttShapes.Pill,
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = Color(0xFF1E293B),
-                    contentColor = Color.White,
-                ),
-                contentPadding = PaddingValues(horizontal = 16.dp)
-            ) {
-                Icon(
-                    painter = painterResource(R.drawable.ic_crypto_logo),
-                    contentDescription = "CRYPTO",
-                    tint = Color.White,
-                    modifier = Modifier.height(28.dp)
-                )
-            }
+            modifier = Modifier.fillMaxWidth().height(50.dp),
+        ) {
+            Icon(
+                painterResource(R.drawable.ic_yoomoney),
+                contentDescription = null,
+                modifier = Modifier.height(24.dp),
+                tint = Color.Unspecified,
+            )
+            Spacer(modifier = Modifier.width(8.dp))
+            Text("Поддержать", fontWeight = FontWeight.Bold, fontSize = 15.sp, maxLines = 1)
+        }
+        OutlinedButton(
+            onClick = onCryptoClick,
+            shape = RoundedCornerShape(18.dp),
+            colors = ButtonDefaults.outlinedButtonColors(contentColor = palette.primary),
+            border = BorderStroke(1.dp, palette.primary.copy(alpha = 0.5f)),
+            modifier = Modifier.fillMaxWidth().height(50.dp),
+        ) {
+            Icon(
+                painterResource(R.drawable.ic_crypto_logo),
+                contentDescription = "CRYPTO",
+                tint = palette.primary,
+                modifier = Modifier.height(24.dp),
+            )
         }
     }
 }
@@ -141,34 +187,37 @@ internal fun ExpandableSectionCard(
     icon: @Composable () -> Unit,
     content: @Composable ColumnScope.() -> Unit,
 ) {
-    val arrowRotation by animateFloatAsState(
-        targetValue = if (expanded) 180f else 0f,
-        label = "section_arrow_rotation",
-    )
+    val arrowRotation by
+        animateFloatAsState(
+            targetValue = if (expanded) 180f else 0f,
+            animationSpec = tween(ExpansionDuration, easing = FastOutSlowInEasing),
+            label = "section_arrow_rotation",
+        )
 
     AppSectionCard(
-        contentPadding = PaddingValues(horizontal = 18.dp, vertical = 18.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp),
+        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 14.dp),
+        verticalArrangement = Arrangement.spacedBy(0.dp),
     ) {
         Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .clip(CsqttShapes.Control)
-                .clickable(onClick = onToggle)
-                .padding(vertical = 2.dp),
+            modifier =
+                Modifier.fillMaxWidth()
+                    .clip(RoundedCornerShape(20.dp))
+                    .clickable(onClick = onToggle)
+                    .padding(vertical = 2.dp),
             horizontalArrangement = Arrangement.spacedBy(12.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            Surface(shape = CsqttShapes.Pill, color = MaterialTheme.colorScheme.primaryContainer) {
-                Box(modifier = Modifier.size(40.dp), contentAlignment = Alignment.Center) { icon() }
+            InfoIconTile { icon() }
+
+            Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.Center) {
+                Text(
+                    text = title,
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onSurface,
+                )
             }
-            Text(
-                text = title,
-                style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.Bold,
-                color = MaterialTheme.colorScheme.onSurface,
-                modifier = Modifier.weight(1f),
-            )
+
             Icon(
                 imageVector = Icons.Default.KeyboardArrowDown,
                 contentDescription = null,
@@ -177,13 +226,14 @@ internal fun ExpandableSectionCard(
             )
         }
 
-        AnimatedVisibility(
+        ExpandableContent(
             visible = expanded,
-            enter = expandVertically() + fadeIn(),
-            exit = shrinkVertically() + fadeOut(),
+            spacing = 12.dp,
         ) {
             Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.30f))
+                HorizontalDivider(
+                    color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.30f)
+                )
                 content()
             }
         }
@@ -194,25 +244,35 @@ internal fun ExpandableSectionCard(
 internal fun WideActionTile(
     title: String,
     subtitle: String,
+    accent: Color = MaterialTheme.colorScheme.primary,
     onClick: () -> Unit,
     icon: @Composable () -> Unit,
 ) {
     Surface(
-        shape = CsqttShapes.Card,
-        color = MaterialTheme.colorScheme.surface.copy(alpha = 0.70f),
+        shape = RoundedCornerShape(20.dp),
+        color = infoTileColor(),
         contentColor = MaterialTheme.colorScheme.onSurface,
-        modifier = Modifier.fillMaxWidth().clip(CsqttShapes.Card).clickable(onClick = onClick),
+        border = BorderStroke(1.dp, infoTileBorder()),
+        modifier =
+            Modifier.fillMaxWidth().clip(RoundedCornerShape(20.dp)).clickable(onClick = onClick),
     ) {
         Row(
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 15.dp),
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 14.dp),
             horizontalArrangement = Arrangement.spacedBy(12.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            Surface(shape = CsqttShapes.Pill, color = MaterialTheme.colorScheme.primaryContainer) {
-                Box(modifier = Modifier.size(40.dp), contentAlignment = Alignment.Center) { icon() }
-            }
-            Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
-                Text(title, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold)
+            InfoIconTile(accent = accent) { icon() }
+
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(3.dp),
+            ) {
+                Text(
+                    title,
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onSurface,
+                )
                 Text(
                     text = subtitle,
                     style = MaterialTheme.typography.bodySmall,
@@ -220,6 +280,7 @@ internal fun WideActionTile(
                     lineHeight = 18.sp,
                 )
             }
+
             Icon(
                 imageVector = Icons.AutoMirrored.Filled.ArrowForward,
                 contentDescription = null,
@@ -238,26 +299,30 @@ internal fun ProjectLinkRow(
     icon: @Composable () -> Unit,
 ) {
     Surface(
-        shape = CsqttShapes.Card,
-        color = MaterialTheme.colorScheme.surface.copy(alpha = 0.64f),
+        shape = RoundedCornerShape(20.dp),
+        color = infoTileColor(),
         contentColor = MaterialTheme.colorScheme.onSurface,
-        modifier = Modifier.fillMaxWidth().clip(CsqttShapes.Card).clickable(onClick = onClick),
+        border = BorderStroke(1.dp, infoTileBorder()),
+        modifier =
+            Modifier.fillMaxWidth().clip(RoundedCornerShape(20.dp)).clickable(onClick = onClick),
     ) {
         Row(
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 14.dp),
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 13.dp),
             horizontalArrangement = Arrangement.spacedBy(12.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            Surface(shape = CsqttShapes.Pill, color = MaterialTheme.colorScheme.primaryContainer) {
-                Box(
-                    modifier = Modifier.defaultMinSize(minWidth = 40.dp, minHeight = 40.dp),
-                    contentAlignment = Alignment.Center,
-                ) {
-                    icon()
-                }
-            }
-            Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                Text(title, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold)
+            InfoIconTile(accent = MaterialTheme.colorScheme.primary) { icon() }
+
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(2.dp),
+            ) {
+                Text(
+                    title,
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onSurface,
+                )
                 Text(
                     text = subtitle,
                     style = MaterialTheme.typography.bodySmall,
@@ -265,6 +330,7 @@ internal fun ProjectLinkRow(
                     lineHeight = 18.sp,
                 )
             }
+
             Icon(
                 imageVector = Icons.AutoMirrored.Filled.ArrowForward,
                 contentDescription = null,

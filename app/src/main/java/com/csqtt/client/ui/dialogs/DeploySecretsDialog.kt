@@ -5,13 +5,13 @@ package com.csqtt.client.ui.dialogs
 
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.text.KeyboardOptions
+import com.csqtt.client.ui.components.fadingVerticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Key
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
@@ -21,10 +21,9 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import com.csqtt.client.SettingsStore
-import kotlinx.coroutines.launch
-import androidx.compose.foundation.text.KeyboardOptions
 import com.csqtt.client.ui.design.CsqttShapes
 import com.csqtt.client.ui.design.CsqttSizes
+import kotlinx.coroutines.launch
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -36,7 +35,7 @@ fun DeploySecretsDialog(
     initialWebLogin: String,
     initialWebPass: String,
     onSaved: () -> Unit,
-    onDismiss: () -> Unit
+    onDismiss: () -> Unit,
 ) {
     val scope = rememberCoroutineScope()
     var passInput by rememberSaveable { mutableStateOf(initialMainPass) }
@@ -45,28 +44,29 @@ fun DeploySecretsDialog(
     var passwordsVisible by rememberSaveable { mutableStateOf(false) }
 
     Dialog(onDismissRequest = onDismiss) {
-        Surface(
-            shape = CsqttShapes.Dialog,
-            color = MaterialTheme.colorScheme.surface,
-            contentColor = MaterialTheme.colorScheme.onSurface,
-            tonalElevation = 8.dp
-        ) {
-            Column(modifier = Modifier.padding(24.dp).fillMaxWidth().verticalScroll(rememberScrollState())) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text("Авторизация", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-                    IconButton(onClick = onDismiss) {
-                        Icon(Icons.Default.Close, contentDescription = "Закрыть")
-                    }
-                }
+        AppDialogSurface {
+            Column(
+                modifier =
+                    Modifier.padding(20.dp).fillMaxWidth().fadingVerticalScroll(rememberScrollState())
+            ) {
+                AppDialogHeader(
+                    title = "Авторизация",
+                    onClose = onDismiss,
+                    icon = {
+                        Icon(
+                            Icons.Default.Key,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.size(20.dp),
+                        )
+                    },
+                )
 
                 Spacer(Modifier.height(16.dp))
 
                 Text(
-                    text = "Придумайте свои данные — латиница и цифры. Они будут созданы на сервере при установке, искать ничего не нужно.",
+                    text =
+                        "Придумайте свои данные — латиница и цифры. Они будут созданы на сервере при установке, искать ничего не нужно.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -77,24 +77,46 @@ fun DeploySecretsDialog(
                     Text("Разрешена «Латиница» и «Цифры»", color = MaterialTheme.colorScheme.error)
                 }
                 val isPasswordValid = passInput.isNotEmpty() && passInput.matches(allowedChars)
-                val isWebLoginValid = webLoginInput.isNotEmpty() && webLoginInput.matches(allowedChars)
+                val isWebLoginValid =
+                    webLoginInput.isNotEmpty() && webLoginInput.matches(allowedChars)
                 val isWebPassValid = webPassInput.isNotEmpty() && webPassInput.matches(allowedChars)
 
-                Text("Подключение", color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.SemiBold)
+                Text(
+                    "Подключение",
+                    color = MaterialTheme.colorScheme.primary,
+                    fontWeight = FontWeight.SemiBold,
+                )
                 Spacer(Modifier.height(8.dp))
                 OutlinedTextField(
                     value = passInput,
-                    onValueChange = { 
+                    onValueChange = {
                         passInput = it.filter { c -> !c.isWhitespace() }
                     },
-                    label = { Text("Пароль туннеля (придумайте)", maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis) },
-                    placeholder = { Text("придумайте пароль", maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis) },
+                    label = {
+                        Text(
+                            "Пароль туннеля (придумайте)",
+                            maxLines = 1,
+                            softWrap = false,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    },
+                    placeholder = {
+                        Text(
+                            "придумайте пароль",
+                            maxLines = 1,
+                            softWrap = false,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth(),
                     shape = CsqttShapes.Control,
                     isError = !isPasswordValid,
-                    supportingText = if (passInput.isNotEmpty() && !isPasswordValid) invalidHint else null,
-                    visualTransformation = if (passwordsVisible) VisualTransformation.None else PasswordVisualTransformation(),
+                    supportingText =
+                        if (passInput.isNotEmpty() && !isPasswordValid) invalidHint else null,
+                    visualTransformation =
+                        if (passwordsVisible) VisualTransformation.None
+                        else PasswordVisualTransformation(),
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
                     trailingIcon = {
                         TextButton(onClick = { passwordsVisible = !passwordsVisible }) {
@@ -106,38 +128,74 @@ fun DeploySecretsDialog(
                 Spacer(Modifier.height(16.dp))
                 HorizontalDivider()
                 Spacer(Modifier.height(8.dp))
-                Text("Данные доступа к web панели", color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.SemiBold)
+                Text(
+                    "Данные доступа к web панели",
+                    color = MaterialTheme.colorScheme.primary,
+                    fontWeight = FontWeight.SemiBold,
+                )
                 Spacer(Modifier.height(8.dp))
 
                 OutlinedTextField(
                     value = webLoginInput,
-                    onValueChange = { 
+                    onValueChange = {
                         webLoginInput = it.filter { c -> !c.isWhitespace() }
                     },
-                    label = { Text("Логин WEB (придумайте)", maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis) },
-                    placeholder = { Text("придумайте логин", maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis) },
+                    label = {
+                        Text(
+                            "Логин WEB (придумайте)",
+                            maxLines = 1,
+                            softWrap = false,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    },
+                    placeholder = {
+                        Text(
+                            "придумайте логин",
+                            maxLines = 1,
+                            softWrap = false,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth(),
                     shape = CsqttShapes.Control,
                     isError = !isWebLoginValid,
-                    supportingText = if (webLoginInput.isNotEmpty() && !isWebLoginValid) invalidHint else null
+                    supportingText =
+                        if (webLoginInput.isNotEmpty() && !isWebLoginValid) invalidHint else null,
                 )
 
                 Spacer(Modifier.height(8.dp))
 
                 OutlinedTextField(
                     value = webPassInput,
-                    onValueChange = { 
+                    onValueChange = {
                         webPassInput = it.filter { c -> !c.isWhitespace() }
                     },
-                    label = { Text("Пароль WEB (придумайте)", maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis) },
-                    placeholder = { Text("придумайте пароль", maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis) },
+                    label = {
+                        Text(
+                            "Пароль WEB (придумайте)",
+                            maxLines = 1,
+                            softWrap = false,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    },
+                    placeholder = {
+                        Text(
+                            "придумайте пароль",
+                            maxLines = 1,
+                            softWrap = false,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth(),
                     shape = CsqttShapes.Control,
                     isError = !isWebPassValid,
-                    supportingText = if (webPassInput.isNotEmpty() && !isWebPassValid) invalidHint else null,
-                    visualTransformation = if (passwordsVisible) VisualTransformation.None else PasswordVisualTransformation(),
+                    supportingText =
+                        if (webPassInput.isNotEmpty() && !isWebPassValid) invalidHint else null,
+                    visualTransformation =
+                        if (passwordsVisible) VisualTransformation.None
+                        else PasswordVisualTransformation(),
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
                 )
 
@@ -146,7 +204,13 @@ fun DeploySecretsDialog(
                 Button(
                     onClick = {
                         scope.launch {
-                            settingsStore.saveDeploySecrets(passInput, initialSshLogin, initialSshPass, webLoginInput, webPassInput)
+                            settingsStore.saveDeploySecrets(
+                                passInput,
+                                initialSshLogin,
+                                initialSshPass,
+                                webLoginInput,
+                                webPassInput,
+                            )
                             onSaved()
                             onDismiss()
                         }
@@ -154,7 +218,10 @@ fun DeploySecretsDialog(
                     modifier = Modifier.fillMaxWidth().heightIn(min = CsqttSizes.ControlHeight),
                     shape = CsqttShapes.Control,
                     enabled = isPasswordValid && isWebLoginValid && isWebPassValid,
-                    colors = ButtonDefaults.buttonColors(contentColor = MaterialTheme.colorScheme.onPrimary)
+                    colors =
+                        ButtonDefaults.buttonColors(
+                            contentColor = MaterialTheme.colorScheme.onPrimary
+                        ),
                 ) {
                     Text("Сохранить", fontWeight = FontWeight.SemiBold)
                 }

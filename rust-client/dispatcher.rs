@@ -39,6 +39,7 @@ const RETURN_LATENCY_CAPACITY: usize = 128;
 const RETURN_PRIORITY_CAPACITY: usize = 384;
 const RETURN_BULK_CAPACITY: usize =
     RETURN_CAPACITY - RETURN_LATENCY_CAPACITY - RETURN_PRIORITY_CAPACITY;
+#[cfg(test)]
 pub(crate) const CLIENT_WORKER_PACKET_CHUNK: usize =
     crate::striped_scheduler::BULK_STREAM_STRIPE_PACKET_CHUNK;
 
@@ -129,6 +130,7 @@ impl FastPathScheduler {
         self.begin_for_class(self.worker_count, class)
     }
 
+    #[cfg(test)]
     #[inline(always)]
     fn begin_with_count(&mut self, worker_count: usize, packet: &[u8]) -> Option<DispatchTicket> {
         self.begin_for_class(worker_count, packet_class(packet))
@@ -302,6 +304,7 @@ impl PacketReceiver {
         self.shared.notify.notify_waiters();
     }
 
+    #[cfg(test)]
     fn suspend(&self) {
         let state = self.shared.state.load(Ordering::Acquire);
         self.shared
@@ -614,6 +617,7 @@ impl Dispatcher {
     }
 
     #[cfg(unix)]
+    #[expect(clippy::too_many_arguments)]
     async fn run_tun(
         self: &Arc<Self>,
         initial_file: File,
@@ -657,6 +661,7 @@ impl Dispatcher {
     }
 
     #[cfg(not(unix))]
+    #[expect(clippy::too_many_arguments)]
     async fn run_tun(
         self: &Arc<Self>,
         _file: File,

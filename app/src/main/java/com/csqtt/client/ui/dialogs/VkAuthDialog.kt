@@ -29,7 +29,6 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -52,6 +51,8 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.csqtt.client.VkAuthPayload
 import com.csqtt.client.VkAuthPhase
 import com.csqtt.client.VkAuthSession
+import androidx.compose.foundation.rememberScrollState
+import com.csqtt.client.ui.components.fadingVerticalScroll
 import com.csqtt.client.VkAuthWebViewManager
 import com.csqtt.client.ui.design.CsqttShapes
 
@@ -93,27 +94,24 @@ internal fun VkAuthDialog(
         }
     }
 
-    val webAlpha by animateFloatAsState(
-        targetValue = if (uiReady && errorMessage == null) 1f else 0f,
-        label = "vk_auth_web_alpha",
-    )
+    val webAlpha by
+        animateFloatAsState(
+            targetValue = if (uiReady && errorMessage == null) 1f else 0f,
+            animationSpec = androidx.compose.animation.core.tween(280),
+            label = "vk_auth_web_alpha",
+        )
 
-    val title = when (phase) {
-        VkAuthPhase.LOGIN -> "Войдите в аккаунт ВК"
-        VkAuthPhase.TOKEN -> "Получение токена"
-    }
+    val title =
+        when (phase) {
+            VkAuthPhase.LOGIN -> "Войдите в аккаунт ВК"
+            VkAuthPhase.TOKEN -> "Получение токена"
+        }
 
     Dialog(
         onDismissRequest = onDismiss,
         properties = DialogProperties(usePlatformDefaultWidth = false),
     ) {
-        Surface(
-            shape = CsqttShapes.Dialog,
-            color = MaterialTheme.colorScheme.surface,
-            contentColor = MaterialTheme.colorScheme.onSurface,
-            tonalElevation = 8.dp,
-            modifier = Modifier.fillMaxWidth(0.95f),
-        ) {
+        AppDialogSurface(modifier = Modifier.fillMaxWidth(0.95f)) {
             Column(
                 modifier = Modifier.padding(16.dp).fillMaxWidth(),
                 verticalArrangement = Arrangement.spacedBy(12.dp),
@@ -162,12 +160,21 @@ internal fun VkAuthDialog(
                                 isFocusableInTouchMode = false
                                 descendantFocusability = ViewGroup.FOCUS_AFTER_DESCENDANTS
                                 val radius = 32f * ctx.resources.displayMetrics.density
-                                outlineProvider = object : ViewOutlineProvider() {
-                                    override fun getOutline(view: View, outline: Outline) {
-                                        outline.setRoundRect(0, 0, view.width, view.height, radius)
+                                outlineProvider =
+                                    object : ViewOutlineProvider() {
+                                        override fun getOutline(view: View, outline: Outline) {
+                                            outline.setRoundRect(
+                                                0,
+                                                0,
+                                                view.width,
+                                                view.height,
+                                                radius,
+                                            )
+                                        }
                                     }
-                                }
                                 clipToOutline = true
+                                webView.isVerticalFadingEdgeEnabled = true
+                                webView.setFadingEdgeLength((24 * resources.displayMetrics.density).toInt())
                                 addView(
                                     webView,
                                     FrameLayout.LayoutParams(
@@ -189,7 +196,7 @@ internal fun VkAuthDialog(
                         Column(
                             horizontalAlignment = Alignment.CenterHorizontally,
                             verticalArrangement = Arrangement.spacedBy(12.dp),
-                            modifier = Modifier.padding(16.dp),
+                            modifier = Modifier.padding(16.dp).fadingVerticalScroll(rememberScrollState()),
                         ) {
                             Text(
                                 text = message,
@@ -199,9 +206,10 @@ internal fun VkAuthDialog(
                             Button(
                                 onClick = onDismiss,
                                 shape = CsqttShapes.Pill,
-                                colors = ButtonDefaults.buttonColors(
-                                    contentColor = MaterialTheme.colorScheme.onPrimary,
-                                ),
+                                colors =
+                                    ButtonDefaults.buttonColors(
+                                        contentColor = MaterialTheme.colorScheme.onPrimary
+                                    ),
                             ) {
                                 Text("Закрыть", fontWeight = FontWeight.SemiBold)
                             }

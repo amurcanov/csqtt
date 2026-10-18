@@ -7,14 +7,12 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
+import com.csqtt.client.ui.components.fadingVerticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Tag
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
@@ -23,9 +21,9 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import com.csqtt.client.VkHashValidationCodec
 import com.csqtt.client.VkHashValidationStatus
-import com.csqtt.client.ui.utils.stripVkUrlStatic
 import com.csqtt.client.ui.design.CsqttShapes
 import com.csqtt.client.ui.design.CsqttSizes
+import com.csqtt.client.ui.utils.stripVkUrlStatic
 import kotlinx.coroutines.launch
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -41,7 +39,7 @@ fun HashesDialog(
     onValidationResultsChange: (Map<String, VkHashValidationStatus>) -> Unit,
     onCheck: suspend (List<String>) -> Map<String, VkHashValidationStatus>,
     onSave: (String, String, String, String, String, String) -> Unit,
-    onDismiss: () -> Unit
+    onDismiss: () -> Unit,
 ) {
     var h1 by remember { mutableStateOf(hash1) }
     var h2 by remember { mutableStateOf(hash2) }
@@ -77,36 +75,30 @@ fun HashesDialog(
     }
 
     Dialog(onDismissRequest = onDismiss) {
-        Surface(
-            shape = CsqttShapes.Dialog,
-            color = MaterialTheme.colorScheme.surface,
-            contentColor = MaterialTheme.colorScheme.onSurface,
-            tonalElevation = 8.dp
-        ) {
+        AppDialogSurface {
             Column(
-                modifier = Modifier.padding(24.dp).fillMaxWidth().verticalScroll(rememberScrollState()),
-                verticalArrangement = Arrangement.spacedBy(12.dp)
+                modifier =
+                    Modifier.padding(20.dp).fillMaxWidth().fadingVerticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
             ) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Icon(Icons.Default.Tag, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(24.dp))
-                        Spacer(Modifier.width(8.dp))
-                        Text("VK Хеши", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-                    }
-                    IconButton(onClick = onDismiss) {
-                        Icon(Icons.Default.Close, contentDescription = "Закрыть")
-                    }
-                }
+                AppDialogHeader(
+                    title = "VK Хеши",
+                    onClose = onDismiss,
+                    icon = {
+                        Icon(
+                            Icons.Default.Tag,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.size(20.dp),
+                        )
+                    },
+                )
 
                 Text(
                     text = "Больше хешей — выше лимит потоков и лучшее распределение нагрузки.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(bottom = 4.dp)
+                    modifier = Modifier.padding(bottom = 4.dp),
                 )
 
                 hashes.forEachIndexed { idx, value ->
@@ -114,18 +106,26 @@ fun HashesDialog(
                     val isShort = value.isNotBlank() && value.length < 16
                     val status = results[value]
                     val isInvalid = status == VkHashValidationStatus.Invalid
-                    val fieldColors = if (status == VkHashValidationStatus.Valid) {
-                        OutlinedTextFieldDefaults.colors(
-                            focusedBorderColor = validBorder,
-                            unfocusedBorderColor = validBorder,
-                        )
-                    } else {
-                        OutlinedTextFieldDefaults.colors()
-                    }
+                    val fieldColors =
+                        if (status == VkHashValidationStatus.Valid) {
+                            OutlinedTextFieldDefaults.colors(
+                                focusedBorderColor = validBorder,
+                                unfocusedBorderColor = validBorder,
+                            )
+                        } else {
+                            OutlinedTextFieldDefaults.colors()
+                        }
                     OutlinedTextField(
                         value = value,
                         onValueChange = { updateHash(idx, it) },
-                        label = { Text(label, maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis) },
+                        label = {
+                            Text(
+                                label,
+                                maxLines = 1,
+                                softWrap = false,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        },
                         placeholder = {
                             Text(
                                 "Ссылка звонка или хеш",
@@ -137,9 +137,15 @@ fun HashesDialog(
                         singleLine = true,
                         enabled = !isChecking,
                         isError = isShort || isInvalid,
-                        supportingText = if (isShort) {
-                            { Text("Хеш ${idx + 1} — короткий (мин. 16)", color = MaterialTheme.colorScheme.error) }
-                        } else null,
+                        supportingText =
+                            if (isShort) {
+                                {
+                                    Text(
+                                        "Хеш ${idx + 1} — короткий (мин. 16)",
+                                        color = MaterialTheme.colorScheme.error,
+                                    )
+                                }
+                            } else null,
                         trailingIcon = {
                             IconButton(
                                 onClick = { updateHash(idx, "") },
@@ -148,9 +154,10 @@ fun HashesDialog(
                                 Icon(
                                     imageVector = Icons.Default.Delete,
                                     contentDescription = "Удалить хеш ${idx + 1}",
-                                    tint = MaterialTheme.colorScheme.error.copy(
-                                        alpha = if (value.isNotEmpty()) 1f else 0.38f,
-                                    ),
+                                    tint =
+                                        MaterialTheme.colorScheme.error.copy(
+                                            alpha = if (value.isNotEmpty()) 1f else 0.38f
+                                        ),
                                 )
                             }
                         },
@@ -178,7 +185,10 @@ fun HashesDialog(
                     enabled = !isChecking && pendingHashes.isNotEmpty(),
                     shape = CsqttShapes.Control,
                     border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary),
-                    colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.primary),
+                    colors =
+                        ButtonDefaults.outlinedButtonColors(
+                            contentColor = MaterialTheme.colorScheme.primary
+                        ),
                 ) {
                     Text(
                         if (isChecking) "Проверяем..." else "Проверить актив",
@@ -200,7 +210,10 @@ fun HashesDialog(
                     },
                     modifier = Modifier.fillMaxWidth().heightIn(min = CsqttSizes.ControlHeight),
                     shape = CsqttShapes.Control,
-                    colors = ButtonDefaults.buttonColors(contentColor = MaterialTheme.colorScheme.onPrimary)
+                    colors =
+                        ButtonDefaults.buttonColors(
+                            contentColor = MaterialTheme.colorScheme.onPrimary
+                        ),
                 ) {
                     Text("Сохранить", fontWeight = FontWeight.SemiBold)
                 }

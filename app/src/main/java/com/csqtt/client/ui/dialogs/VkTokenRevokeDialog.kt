@@ -20,7 +20,6 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
-import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
@@ -42,15 +41,9 @@ internal fun VkTokenRevokeDialog(
         onDismissRequest = onCancel,
         properties = DialogProperties(usePlatformDefaultWidth = false),
     ) {
-        Surface(
-            shape = CsqttShapes.Dialog,
-            color = MaterialTheme.colorScheme.surface,
-            contentColor = MaterialTheme.colorScheme.onSurface,
-            tonalElevation = 8.dp,
-            modifier = Modifier.fillMaxWidth(0.9f),
-        ) {
+        AppDialogSurface(modifier = Modifier.fillMaxWidth(0.9f)) {
             Column(
-                modifier = Modifier.padding(24.dp).fillMaxWidth(),
+                modifier = Modifier.padding(20.dp).fillMaxWidth(),
                 verticalArrangement = Arrangement.spacedBy(12.dp),
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -70,7 +63,8 @@ internal fun VkTokenRevokeDialog(
                 }
 
                 Text(
-                    text = "При удалении токена сессия VK сохраняется настолько, насколько это возможно: токен можно будет быстро получить заново, либо вы сможете сменить аккаунт самостоятельно.",
+                    text =
+                        "При удалении токена сессия VK сохраняется настолько, насколько это возможно: токен можно будет быстро получить заново, либо вы сможете сменить аккаунт самостоятельно.",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     lineHeight = 20.sp,
@@ -80,11 +74,16 @@ internal fun VkTokenRevokeDialog(
                     onClick = onCancel,
                     modifier = Modifier.fillMaxWidth().height(48.dp),
                     shape = CsqttShapes.Pill,
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = MaterialTheme.colorScheme.primary,
-                        contentColor = MaterialTheme.colorScheme.onPrimary,
-                    ),
-                    elevation = ButtonDefaults.buttonElevation(defaultElevation = 0.dp, pressedElevation = 0.dp),
+                    colors =
+                        ButtonDefaults.buttonColors(
+                            containerColor = MaterialTheme.colorScheme.primary,
+                            contentColor = MaterialTheme.colorScheme.onPrimary,
+                        ),
+                    elevation =
+                        ButtonDefaults.buttonElevation(
+                            defaultElevation = 0.dp,
+                            pressedElevation = 0.dp,
+                        ),
                 ) {
                     Text("Отмена", fontWeight = FontWeight.Bold, maxLines = 1)
                 }
@@ -93,10 +92,11 @@ internal fun VkTokenRevokeDialog(
                     onClick = onRevokeToken,
                     modifier = Modifier.fillMaxWidth().height(48.dp),
                     shape = CsqttShapes.Pill,
-                    colors = ButtonDefaults.outlinedButtonColors(
-                        containerColor = Color.Transparent,
-                        contentColor = MaterialTheme.colorScheme.error,
-                    ),
+                    colors =
+                        ButtonDefaults.outlinedButtonColors(
+                            containerColor = Color.Transparent,
+                            contentColor = MaterialTheme.colorScheme.error,
+                        ),
                     border = BorderStroke(1.dp, MaterialTheme.colorScheme.error),
                 ) {
                     Text("Удалить токен", fontWeight = FontWeight.SemiBold, maxLines = 1)

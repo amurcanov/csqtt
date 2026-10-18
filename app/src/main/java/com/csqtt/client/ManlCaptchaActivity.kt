@@ -162,6 +162,8 @@ class ManlCaptchaActivity : ComponentActivity() {
                                         WebView(ctx).apply {
                                             captchaWebView = this
                                             setBackgroundColor(android.graphics.Color.TRANSPARENT)
+                                            isVerticalFadingEdgeEnabled = true
+                                            setFadingEdgeLength((24 * resources.displayMetrics.density).toInt())
                                             layoutParams = ViewGroup.LayoutParams(
                                                 ViewGroup.LayoutParams.MATCH_PARENT,
                                                 ViewGroup.LayoutParams.MATCH_PARENT

@@ -3,185 +3,154 @@
 
 package com.csqtt.client.ui
 
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.*
 import androidx.compose.foundation.BorderStroke
-import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.defaultMinSize
-import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.padding
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Surface
-import androidx.compose.material3.Text
-import androidx.compose.runtime.Composable
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.csqtt.client.LogEntry
 import com.csqtt.client.LogLevel
-import com.csqtt.client.ui.design.CsqttShapes
-import com.csqtt.client.ui.design.CsqttSpacing
-import com.csqtt.client.ui.design.CsqttTheme
 
-private data class TagColors(
-    val background: Color,
-    val text: Color,
-    val border: Color = Color.Transparent,
+private data class LogLineStyle(
+    val tag: String?,
+    val body: String,
+    val accent: Color,
+    val isError: Boolean,
+    val isSuccess: Boolean,
 )
 
-private fun isErrorLog(tag: String, level: LogLevel, isError: Boolean): Boolean {
-    return isError || level == LogLevel.ERR ||
-        tag.contains("ОШИБКА", ignoreCase = true) ||
-        tag.contains("ФАТАЛ", ignoreCase = true) ||
-        tag.contains("ERR", ignoreCase = true)
-}
+private val tagRegex = Regex("^\\[([^\\]]+)\\]\\s*")
 
-private fun isGreenLog(tag: String, level: LogLevel, isError: Boolean): Boolean {
-    if (isErrorLog(tag, level, isError)) return false
-    return level == LogLevel.OK ||
-        level == LogLevel.NET ||
-        tag.contains("OK", ignoreCase = true) ||
-        tag.contains("NET", ignoreCase = true) ||
-        tag.contains("СЕТЬ", ignoreCase = true) ||
-        tag.contains("WRAP", ignoreCase = true) ||
-        tag.contains("ВОРКЕР", ignoreCase = true) ||
-        (tag.contains("ДЕПЛОЙ", ignoreCase = true) && (level == LogLevel.OK || level == LogLevel.NET))
-}
-
-private fun resolveTagColors(isGreen: Boolean, isError: Boolean): TagColors {
-    if (isError) {
-        return TagColors(
-            background = Color(0xFF3E1218),
-            text = Color(0xFFFF897D),
-            border = Color(0xFF681D26),
-        )
+@Composable
+private fun resolveLogStyle(entry: LogEntry): LogLineStyle {
+    val palette = MaterialTheme.colorScheme
+    val match = tagRegex.find(entry.message)
+    val tag = match?.groupValues?.get(1)
+    val body = if (match != null) entry.message.substring(match.value.length) else entry.message
+    val isError = entry.isError || entry.level == LogLevel.ERR
+    val isSuccess = !isError && when (entry.level) {
+        LogLevel.OK, LogLevel.NET -> true
+        null -> body.contains("✓") || tag == "READY"
+        else -> false
     }
-    if (isGreen) {
-        return TagColors(
-            background = Color(0xFF052E16),
-            text = Color(0xFF4ADE80),
-            border = Color(0xFF14532D),
-        )
-    }
-    return TagColors(
-        background = Color(0xFF0A223D),
-        text = Color(0xFF3DBFFD),
-        border = Color(0xFF1475FD),
-    )
-}
 
-private fun parseMessageTag(rawMessage: String, level: LogLevel): Pair<String, String> {
-    val trimmed = rawMessage.trim()
-    if (trimmed.startsWith("[")) {
-        val closeIndex = trimmed.indexOf(']')
-        if (closeIndex in 1..24) {
-            val tag = trimmed.substring(1, closeIndex).trim()
-            val body = trimmed.substring(closeIndex + 1).trim()
-            if (tag.isNotEmpty() && body.isNotEmpty()) {
-                return tag to body
-            }
+    val accent =
+        when {
+            isError -> palette.error
+            isSuccess -> palette.primary
+            tag == null -> palette.onSurfaceVariant
+            tag.startsWith("КАПЧА") -> palette.tertiary
+            tag == "СТАТИСТИКА" -> palette.secondary
+            tag == "СЕТЬ" || tag == "СТОП" -> palette.error
+            else -> palette.primary
         }
-    }
-    return level.name to trimmed
+    return LogLineStyle(tag, body, accent, isError, isSuccess)
 }
 
 @Composable
-internal fun LogLine(
-    entry: LogEntry,
-    modifier: Modifier = Modifier,
-) {
-    val terminalColors = CsqttTheme.extendedColors
-    val level = entry.level ?: when {
-        entry.isError -> LogLevel.ERR
-        entry.priority <= 2 -> LogLevel.OK
-        entry.priority <= 4 -> LogLevel.DBG
-        entry.priority <= 6 -> LogLevel.NET
-        else -> LogLevel.LOG
-    }
+internal fun LogLine(entry: LogEntry) {
+    val palette = MaterialTheme.colorScheme
+    val style = resolveLogStyle(entry)
 
-    val (rawTag, body) = parseMessageTag(entry.message, level)
-    val isError = isErrorLog(rawTag, level, entry.isError)
-    val isGreen = isGreenLog(rawTag, level, isError)
+    val rowBg by
+        animateColorAsState(
+            targetValue =
+                if (style.isError) palette.errorContainer.copy(alpha = 0.30f)
+                else Color.Transparent,
+            animationSpec = tween(400),
+            label = "log_row_bg",
+        )
 
-    val displayTag = if (isGreen) "OK" else rawTag
-    val tagColors = resolveTagColors(isGreen = isGreen, isError = isError)
-
-    val bodyColor = when {
-        isError -> terminalColors.terminalError
-        isGreen -> terminalColors.terminalSuccess
-        else -> terminalColors.terminalText
+    val counterScale = remember { Animatable(1f) }
+    var seenCount by rememberSaveable { mutableIntStateOf(entry.count) }
+    LaunchedEffect(entry.count) {
+        if (entry.count != seenCount) {
+            seenCount = entry.count
+            counterScale.animateTo(1.15f, tween(100))
+            counterScale.animateTo(1f, spring(dampingRatio = Spring.DampingRatioNoBouncy))
+        }
     }
 
     Row(
-        modifier = modifier
-            .fillMaxWidth()
-            .padding(vertical = 2.dp),
-        horizontalArrangement = Arrangement.spacedBy(CsqttSpacing.Sm),
+        modifier =
+            Modifier.fillMaxWidth()
+                .clip(RoundedCornerShape(12.dp))
+                .background(rowBg)
+                .padding(horizontal = 8.dp, vertical = 6.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Surface(
-            shape = CsqttShapes.Pill,
-            color = tagColors.background,
-            contentColor = tagColors.text,
-            border = BorderStroke(1.dp, tagColors.border),
-            modifier = Modifier.defaultMinSize(minHeight = 22.dp),
+            color = style.accent.copy(alpha = 0.14f),
+            shape = RoundedCornerShape(10.dp),
+            border = BorderStroke(1.dp, style.accent.copy(alpha = 0.25f)),
+            modifier =
+                Modifier.defaultMinSize(minWidth = 26.dp, minHeight = 22.dp)
+                    .graphicsLayer { scaleX = counterScale.value; scaleY = counterScale.value },
         ) {
             Box(
                 contentAlignment = Alignment.Center,
-                modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp),
+                modifier = Modifier.padding(horizontal = 6.dp),
             ) {
                 Text(
-                    text = displayTag,
-                    style = MaterialTheme.typography.labelSmall.copy(
-                        fontSize = 10.sp,
-                        fontWeight = FontWeight.Bold,
-                        letterSpacing = 0.5.sp,
-                    ),
-                    fontFamily = FontFamily.Monospace,
+                    text = "${entry.count}",
+                    color = style.accent,
+                    fontSize = 10.sp,
+                    fontWeight = FontWeight.Bold,
                     maxLines = 1,
                 )
             }
         }
+        Spacer(modifier = Modifier.width(8.dp))
 
-        Text(
-            text = body,
-            color = bodyColor,
-            style = MaterialTheme.typography.bodySmall.copy(
-                fontSize = 12.sp,
-                lineHeight = 16.sp,
-            ),
-            fontFamily = FontFamily.Monospace,
-            fontWeight = if (entry.isError || level == LogLevel.ERR) FontWeight.SemiBold else FontWeight.Normal,
-            modifier = Modifier.weight(1f),
-        )
-
-        if (entry.count > 1) {
-            Surface(
-                shape = CsqttShapes.Pill,
-                color = Color(0xFF142438),
-                contentColor = Color(0xFF3DBFFD),
-                border = BorderStroke(1.dp, Color(0xFF1E4976)),
-                modifier = Modifier.defaultMinSize(minHeight = 18.dp),
-            ) {
-                Box(
-                    contentAlignment = Alignment.Center,
-                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 1.dp),
-                ) {
-                    Text(
-                        text = "x${entry.count}",
-                        style = MaterialTheme.typography.labelSmall.copy(
-                            fontSize = 10.sp,
-                            fontWeight = FontWeight.Medium,
-                        ),
-                        fontFamily = FontFamily.Monospace,
-                        maxLines = 1,
-                    )
+        Column(modifier = Modifier.weight(1f)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                if (style.tag != null) {
+                    Surface(
+                        color = style.accent.copy(alpha = 0.12f),
+                        shape = RoundedCornerShape(8.dp),
+                    ) {
+                        Text(
+                            text = style.tag,
+                            color = style.accent,
+                            fontSize = 9.5.sp,
+                            fontWeight = FontWeight.Bold,
+                            letterSpacing = 0.4.sp,
+                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+                            maxLines = 1,
+                        )
+                    }
+                    Spacer(modifier = Modifier.width(8.dp))
                 }
             }
+            Spacer(modifier = Modifier.height(2.dp))
+            Text(
+                text = style.body,
+                color =
+                    when {
+                        style.isError -> palette.error
+                        style.isSuccess -> palette.primary
+                        else -> palette.onSurface
+                    },
+                fontSize = 12.5.sp,
+                fontFamily = FontFamily.Monospace,
+                fontWeight =
+                    if (style.isError || style.isSuccess) FontWeight.SemiBold
+                    else FontWeight.Normal,
+                lineHeight = 17.sp,
+            )
         }
     }
 }

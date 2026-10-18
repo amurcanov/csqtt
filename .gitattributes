@@ -1,0 +1,26 @@
+* text=auto eol=lf
+
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=lf
+*.sh text eol=lf
+gradlew text eol=lf
+
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.gif binary
+*.ico binary
+*.ttf binary
+*.woff2 binary
+*.jar binary
+*.zip binary
+*.apk binary
+*.aab binary
+*.so binary
+*.exe binary
+*.dll binary
+*.keystore binary
+*.jks binary
+app/src/main/assets/csqtt-linux-* binary

@@ -17,6 +17,37 @@ class DeployUiStateTest {
     )
 
     @Test
+    fun `key login allows an empty sudo password for a non-root user`() {
+        val state = completeState.copy(
+            sshLogin = "deploy",
+            sshPassword = "",
+            sshKeysMode = true,
+            sshKeysFilled = 1,
+        )
+
+        assertTrue(state.showSudoPassword)
+        assertTrue(state.canInstall)
+        assertTrue(state.canUninstall)
+        assertFalse(state.copy(sshKeysFilled = 0).canInstall)
+        assertFalse(state.copy(sshLogin = "").canInstall)
+        assertFalse(state.copy(sshLogin = "root").showSudoPassword)
+        assertTrue(state.copy(sshKeysMode = false).showSudoPassword)
+        assertFalse(state.copy(sshKeysMode = false).canInstall)
+    }
+
+    @Test
+    fun `password login requires SSH credentials independently of sudo`() {
+        val state = completeState.copy(sshLogin = "deploy", sudoPassword = "sudo-password")
+
+        assertTrue(state.showSudoPassword)
+        assertTrue(state.canInstall)
+        assertTrue(state.copy(sudoPassword = "").canInstall)
+        assertFalse(state.copy(sshPassword = "").canInstall)
+        assertFalse(state.copy(sshPassword = "").canUninstall)
+        assertFalse(completeState.showSudoPassword)
+    }
+
+    @Test
     fun `install requires tunnel and web authorization`() {
         assertTrue(completeState.canInstall)
         assertFalse(completeState.copy(mainPasswordConfigured = false).canInstall)

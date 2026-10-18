@@ -3,20 +3,18 @@
 
 package com.csqtt.client.ui.dialogs
 
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
-import androidx.compose.foundation.verticalScroll
+import com.csqtt.client.ui.components.fadingVerticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.outlined.Visibility
 import androidx.compose.material.icons.outlined.VisibilityOff
@@ -25,16 +23,21 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.LocalMinimumInteractiveComponentSize
 import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalViewConfiguration
+import androidx.compose.ui.platform.ViewConfiguration
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
@@ -42,8 +45,8 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.DpSize
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import com.csqtt.client.ui.design.CsqttShapes
@@ -55,15 +58,16 @@ private const val PRIVATE_KEY_PLACEHOLDER =
 private const val CERTIFICATE_PLACEHOLDER =
     "ssh-ed25519-cert-v01@openssh.com AAAAIHNzaC1lZDI1NTE5...\nuser-cert"
 
-private val SshKeyFieldShape = RoundedCornerShape(8.dp)
+private val SshKeyFieldShape = CsqttShapes.Control
 
-private val PRIVATE_KEY_HEADERS = listOf(
-    "BEGIN OPENSSH PRIVATE KEY",
-    "BEGIN RSA PRIVATE KEY",
-    "BEGIN EC PRIVATE KEY",
-    "BEGIN DSA PRIVATE KEY",
-    "BEGIN PRIVATE KEY",
-)
+private val PRIVATE_KEY_HEADERS =
+    listOf(
+        "BEGIN OPENSSH PRIVATE KEY",
+        "BEGIN RSA PRIVATE KEY",
+        "BEGIN EC PRIVATE KEY",
+        "BEGIN DSA PRIVATE KEY",
+        "BEGIN PRIVATE KEY",
+    )
 
 internal fun validateSshPrivateKey(value: String, passphrase: String): String? {
     val trimmed = value.trim()
@@ -107,86 +111,83 @@ internal fun SshKeysDialog(
     var privateKey by rememberSaveable { mutableStateOf(initialPrivateKey) }
     var passphrase by rememberSaveable { mutableStateOf(initialPassphrase) }
     var certificate by rememberSaveable { mutableStateOf(initialCertificate) }
+    var privateKeyVisible by rememberSaveable { mutableStateOf(false) }
     var passphraseVisible by rememberSaveable { mutableStateOf(false) }
     var privateKeyError by rememberSaveable { mutableStateOf<String?>(null) }
     var certificateError by rememberSaveable { mutableStateOf<String?>(null) }
 
     Dialog(onDismissRequest = onDismiss) {
-        Surface(
-            shape = CsqttShapes.Dialog,
-            color = MaterialTheme.colorScheme.surface,
-            contentColor = MaterialTheme.colorScheme.onSurface,
-            tonalElevation = 8.dp,
-        ) {
+        AppDialogSurface {
             Column(
-                modifier = Modifier
-                    .padding(24.dp)
-                    .fillMaxWidth()
-                    .verticalScroll(rememberScrollState()),
+                modifier =
+                    Modifier.padding(20.dp).fillMaxWidth().fadingVerticalScroll(rememberScrollState()),
                 verticalArrangement = Arrangement.spacedBy(12.dp),
             ) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
+                AppDialogHeader(
+                    title = "Ключи SSH",
+                    onClose = onDismiss,
+                    icon = {
                         Icon(
                             Icons.Default.Key,
                             contentDescription = null,
                             tint = MaterialTheme.colorScheme.primary,
-                            modifier = Modifier.size(24.dp),
+                            modifier = Modifier.size(20.dp),
                         )
-                        Spacer(Modifier.width(8.dp))
-                        Text("Ключи SSH", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-                    }
-                    IconButton(onClick = onDismiss) {
-                        Icon(Icons.Default.Close, contentDescription = "Закрыть")
-                    }
-                }
+                    },
+                )
 
                 Text(
-                    text = "Для входа достаточно одного приватного ключа — приложение само определит его формат. Пароль и сертификат нужны только если ключ зашифрован или используется сертификат OpenSSH.",
+                    text =
+                        "Для входа достаточно одного приватного ключа — приложение само определит его формат. Пароль и сертификат нужны только если ключ зашифрован или используется сертификат OpenSSH.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
 
-                OutlinedTextField(
+                SshPrivateKeyField(
                     value = privateKey,
                     onValueChange = {
                         privateKey = it
                         privateKeyError = null
                     },
-                    label = { Text("Приватный SSH-ключ *", maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis) },
-                    placeholder = { Text(PRIVATE_KEY_PLACEHOLDER, fontFamily = FontFamily.Monospace, fontSize = 12.sp) },
-                    supportingText = {
-                        Text(
-                            text = privateKeyError ?: "Поддерживаются OpenSSH, RSA PEM, EC и PKCS#8",
-                            color = if (privateKeyError != null) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    },
-                    isError = privateKeyError != null,
-                    modifier = Modifier.fillMaxWidth().heightIn(min = 140.dp),
-                    shape = SshKeyFieldShape,
-                    textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
-                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Default),
+                    visible = privateKeyVisible,
+                    onVisibilityChange = { privateKeyVisible = !privateKeyVisible },
+                    errorMessage = privateKeyError,
                 )
 
                 OutlinedTextField(
                     value = passphrase,
                     onValueChange = { passphrase = it.filter { c -> !c.isWhitespace() } },
-                    label = { Text("Пароль ключа (необязательно)", maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis) },
-                    placeholder = { Text("если приватный ключ зашифрован", maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis) },
+                    label = {
+                        Text(
+                            "Пароль ключа (необязательно)",
+                            maxLines = 1,
+                            softWrap = false,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    },
+                    placeholder = {
+                        Text(
+                            "если приватный ключ зашифрован",
+                            maxLines = 1,
+                            softWrap = false,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth(),
                     shape = SshKeyFieldShape,
-                    visualTransformation = if (passphraseVisible) VisualTransformation.None else PasswordVisualTransformation(),
+                    visualTransformation =
+                        if (passphraseVisible) VisualTransformation.None
+                        else PasswordVisualTransformation(),
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
                     trailingIcon = {
                         IconButton(onClick = { passphraseVisible = !passphraseVisible }) {
                             Icon(
-                                imageVector = if (passphraseVisible) Icons.Outlined.VisibilityOff else Icons.Outlined.Visibility,
-                                contentDescription = if (passphraseVisible) "Скрыть пароль" else "Показать пароль",
+                                imageVector =
+                                    if (passphraseVisible) Icons.Outlined.VisibilityOff
+                                    else Icons.Outlined.Visibility,
+                                contentDescription =
+                                    if (passphraseVisible) "Скрыть пароль" else "Показать пароль",
                             )
                         }
                     },
@@ -198,15 +199,30 @@ internal fun SshKeysDialog(
                         certificate = it
                         certificateError = null
                     },
-                    label = { Text("SSH-сертификат OpenSSH (необязательно)", maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis) },
-                    placeholder = { Text(CERTIFICATE_PLACEHOLDER, fontFamily = FontFamily.Monospace, fontSize = 12.sp) },
-                    supportingText = if (certificateError != null) {
-                        { Text(certificateError!!, color = MaterialTheme.colorScheme.error) }
-                    } else null,
+                    label = {
+                        Text(
+                            "SSH-сертификат OpenSSH (необязательно)",
+                            maxLines = 1,
+                            softWrap = false,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    },
+                    placeholder = {
+                        Text(
+                            CERTIFICATE_PLACEHOLDER,
+                            fontFamily = FontFamily.Monospace,
+                            fontSize = 12.sp,
+                        )
+                    },
+                    supportingText =
+                        if (certificateError != null) {
+                            { Text(certificateError!!, color = MaterialTheme.colorScheme.error) }
+                        } else null,
                     isError = certificateError != null,
                     modifier = Modifier.fillMaxWidth().heightIn(min = 90.dp),
                     shape = SshKeyFieldShape,
-                    textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+                    textStyle =
+                        MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
                     keyboardOptions = KeyboardOptions(imeAction = ImeAction.Default),
                 )
 
@@ -222,10 +238,91 @@ internal fun SshKeysDialog(
                     },
                     modifier = Modifier.fillMaxWidth().heightIn(min = CsqttSizes.ControlHeight),
                     shape = CsqttShapes.Control,
-                    colors = ButtonDefaults.buttonColors(contentColor = MaterialTheme.colorScheme.onPrimary),
+                    colors =
+                        ButtonDefaults.buttonColors(
+                            contentColor = MaterialTheme.colorScheme.onPrimary
+                        ),
                 ) {
                     Text("Сохранить", fontWeight = FontWeight.SemiBold)
                 }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SshPrivateKeyField(
+    value: String,
+    onValueChange: (String) -> Unit,
+    visible: Boolean,
+    onVisibilityChange: () -> Unit,
+    errorMessage: String?,
+) {
+    val labelTopPadding = with(LocalDensity.current) {
+        MaterialTheme.typography.bodySmall.lineHeight.toDp() / 2
+    }
+    val viewConfiguration = LocalViewConfiguration.current
+    val buttonViewConfiguration = remember(viewConfiguration) {
+        object : ViewConfiguration by viewConfiguration {
+            override val minimumTouchTargetSize = DpSize(28.dp, 28.dp)
+        }
+    }
+
+    Box(modifier = Modifier.fillMaxWidth()) {
+        OutlinedTextField(
+            value = value,
+            onValueChange = onValueChange,
+            modifier = Modifier.fillMaxWidth()
+                .padding(top = 24.dp - labelTopPadding)
+                .heightIn(min = 140.dp),
+            label = {
+                Text(
+                    "Приватный SSH-ключ *",
+                    maxLines = 1,
+                    softWrap = false,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            },
+            placeholder = {
+                Text(PRIVATE_KEY_PLACEHOLDER, fontFamily = FontFamily.Monospace, fontSize = 12.sp)
+            },
+            supportingText = {
+                Text(
+                    text = errorMessage ?: "Поддерживаются OpenSSH, RSA PEM, EC и PKCS#8",
+                    color = if (errorMessage != null) MaterialTheme.colorScheme.error
+                        else MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            },
+            isError = errorMessage != null,
+            shape = SshKeyFieldShape,
+            textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+            visualTransformation = if (visible) VisualTransformation.None
+                else PasswordVisualTransformation(),
+            keyboardOptions = KeyboardOptions(
+                keyboardType = KeyboardType.Password,
+                imeAction = ImeAction.Default,
+            ),
+        )
+        CompositionLocalProvider(
+            LocalViewConfiguration provides buttonViewConfiguration,
+            LocalMinimumInteractiveComponentSize provides 28.dp,
+        ) {
+            IconButton(
+                onClick = onVisibilityChange,
+                modifier = Modifier.align(Alignment.TopEnd)
+                    .padding(top = 10.dp, end = 18.dp)
+                    .size(28.dp),
+            ) {
+                Icon(
+                    imageVector = if (visible) Icons.Outlined.VisibilityOff
+                        else Icons.Outlined.Visibility,
+                    contentDescription = if (visible) "Скрыть приватный ключ"
+                        else "Показать приватный ключ",
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.background(appDialogContainerColor())
+                        .padding(horizontal = 4.dp)
+                        .size(18.dp),
+                )
             }
         }
     }

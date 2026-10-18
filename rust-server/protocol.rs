@@ -4767,22 +4767,22 @@ async fn handle_getconf(
                         db.main_device_id = device_id.to_owned();
                         changed = true;
                     }
-                    if !db.devices.contains_key(device_id) {
-                        if let Some(ip) = get_next_ip(&db) {
-                            let (private, public) = generate_key_pair();
-                            db.devices.insert(
-                                device_id.to_owned(),
-                                ClientDevice {
-                                    device_id: device_id.to_owned(),
-                                    ip,
-                                    priv_key: private,
-                                    pub_key: public,
-                                    up_bytes: 0,
-                                    down_bytes: 0,
-                                },
-                            );
-                            changed = true;
-                        }
+                    if !db.devices.contains_key(device_id)
+                        && let Some(ip) = get_next_ip(&db)
+                    {
+                        let (private, public) = generate_key_pair();
+                        db.devices.insert(
+                            device_id.to_owned(),
+                            ClientDevice {
+                                device_id: device_id.to_owned(),
+                                ip,
+                                priv_key: private,
+                                pub_key: public,
+                                up_bytes: 0,
+                                down_bytes: 0,
+                            },
+                        );
+                        changed = true;
                     }
                     if let Some(device) = db.devices.get(device_id).cloned() {
                         tunnel_ip = crate::tun_device::parse_ipv4(&device.ip);

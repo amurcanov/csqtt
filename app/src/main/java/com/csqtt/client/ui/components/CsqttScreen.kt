@@ -3,38 +3,21 @@
 
 package com.csqtt.client.ui.components
 
-import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.ColumnScope
-import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.RowScope
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.widthIn
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Text
-import androidx.compose.runtime.Composable
-import androidx.compose.runtime.staticCompositionLocalOf
+import androidx.compose.foundation.layout.*
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.semantics
-import com.csqtt.client.ui.design.CsqttSizes
-import com.csqtt.client.ui.design.CsqttSpacing
-
-import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.size
-import androidx.compose.material3.Icon
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
-import com.csqtt.client.R
+import com.csqtt.client.ui.design.CsqttSizes
 
-internal val LocalCsqttHeaderActions = staticCompositionLocalOf<(@Composable RowScope.() -> Unit)?> { null }
+internal val LocalCsqttScreenTitle = staticCompositionLocalOf<String?> { null }
+internal val LocalCsqttOnBack = staticCompositionLocalOf<(() -> Unit)?> { null }
 
 @Composable
 fun CsqttScreen(
@@ -44,69 +27,39 @@ fun CsqttScreen(
     actions: (@Composable RowScope.() -> Unit)? = null,
     content: @Composable ColumnScope.() -> Unit,
 ) {
-    val headerActions = LocalCsqttHeaderActions.current
-
+    val screenTitle = title ?: LocalCsqttScreenTitle.current
+    val onBack = LocalCsqttOnBack.current
     Column(
-        modifier = modifier
-            .fillMaxSize()
-            .padding(horizontal = CsqttSizes.ScreenHorizontalPadding)
-            .padding(top = CsqttSizes.ScreenTopPadding),
+        modifier = modifier.fillMaxSize().padding(horizontal = CsqttSizes.ScreenHorizontalPadding),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
         Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .widthIn(max = CsqttSizes.ContentMaxWidth),
-            verticalArrangement = Arrangement.spacedBy(CsqttSpacing.Md),
+            modifier = Modifier.fillMaxWidth().widthIn(max = CsqttSizes.ContentMaxWidth),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(bottom = 2.dp),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Icon(
-                    painter = painterResource(id = R.drawable.ic_csqtt_logo),
-                    contentDescription = "CSQTT",
-                    tint = Color.Unspecified,
-                    modifier = Modifier.height(26.dp)
-                )
-
+            if (screenTitle != null || actions != null) {
                 Row(
-                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.fillMaxWidth().padding(top = 16.dp, bottom = 8.dp),
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    Icon(
-                        painter = painterResource(id = R.drawable.ic_v219_by_amurcanov),
-                        contentDescription = "v2.1.9 by amurcanov",
-                        tint = Color.Unspecified,
-                        modifier = Modifier.height(19.dp)
-                    )
-                    headerActions?.let { Row(content = it) }
-                }
-            }
-            if (!title.isNullOrBlank() || actions != null) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(CsqttSpacing.Md),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    Column(
-                        modifier = Modifier.weight(1f),
-                        verticalArrangement = Arrangement.spacedBy(CsqttSpacing.Xxs),
-                    ) {
-                        if (!title.isNullOrBlank()) {
+                    onBack?.let { back ->
+                        IconButton(onClick = back) {
+                            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Назад")
+                        }
+                    }
+                    Column(modifier = Modifier.weight(1f)) {
+                        screenTitle?.let {
                             Text(
-                                text = title,
-                                style = MaterialTheme.typography.headlineSmall,
-                                color = MaterialTheme.colorScheme.onBackground,
+                                it,
+                                style = MaterialTheme.typography.titleLarge,
+                                fontWeight = FontWeight.Bold,
                                 modifier = Modifier.semantics { heading() },
                             )
                         }
                         subtitle?.let {
                             Text(
-                                text = it,
+                                it,
                                 style = MaterialTheme.typography.bodyMedium,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )

@@ -1,0 +1,36 @@
+# Gradle, Kotlin and native build outputs
+.gradle/
+.kotlin/
+build/
+target/
+.cxx/
+.externalNativeBuild/
+/app/release/
+
+# Native artifacts produced by the documented build scripts
+/app/src/main/jniLibs/*/libclient.so
+/app/src/main/libclient.provenance.json
+/app/src/main/assets/csqtt-linux-amd64
+/app/src/main/assets/csqtt-linux-arm64
+/app/src/main/assets/csqtt-linux-armv7
+/app/src/main/assets/csqtt.server-provenance.json
+
+# Local SDK paths and signing credentials
+/local.properties
+*.keystore
+*.jks
+*.keystore.properties
+.env
+.env.*
+!.env.example
+
+# IDE and diagnostic files
+.idea/
+*.iml
+captures/
+*.hprof
+hs_err_pid*.log
+replay_pid*.log
+/rust-server/check.json
+.DS_Store
+Thumbs.db

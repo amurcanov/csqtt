@@ -14,16 +14,7 @@ class CsqttApplication : Application() {
     override fun onCreate() {
         super.onCreate()
         DeployManager.init(this)
-
-        CoroutineScope(SupervisorJob() + Dispatchers.Main).launch {
-            try {
-                TunnelManager.running.collect {
-                    VpnWidgetProvider.updateAllWidgets(this@CsqttApplication)
-                }
-            } catch (e: Exception) {
-                Log.e("CsqttApp", "Не удалось обновить виджеты: ${e.message}")
-            }
-        }
+        TunnelManager.initObservers(this)
 
         val settingsStore = SettingsStore(this)
         CoroutineScope(SupervisorJob() + Dispatchers.Main).launch {

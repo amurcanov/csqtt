@@ -8,10 +8,13 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.AlertDialog
+import com.csqtt.client.ui.components.fadingVerticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.WarningAmber
 import androidx.compose.material3.Button
+import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
@@ -26,7 +29,10 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.Hyphens
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import com.csqtt.client.ui.dialogs.AppDialogHeader
+import com.csqtt.client.ui.dialogs.AppDialogSurface
 import kotlinx.coroutines.delay
 
 @Composable
@@ -37,10 +43,11 @@ internal fun AutoVkRiskDialog(
 ) {
     TimedWarningDialog(
         title = "Внимание!",
-        paragraphs = listOf(
-            "«Авто ВК» использует неофициальные браузерные методы VK API для создания звонка и получения TURN credentials без анонимных звонков. Сетевой стек PRIMP маскирует HTTP/TLS-профиль под обычный браузер.",
-            "Разработчик не может исключить блокировку VK-аккаунта и честно оценить её вероятность. Используйте режим на свой риск; если важен основной аккаунт, выбирайте второстепенный. Рекомендуется включать «Авто ВК», когда «Авто» и «Авто API» не работают.",
-        ),
+        paragraphs =
+            listOf(
+                "«Авто ВК» использует неофициальные браузерные методы VK API для создания звонка и получения TURN credentials без анонимных звонков. Сетевой стек PRIMP маскирует HTTP/TLS-профиль под обычный браузер.",
+                "Разработчик не может исключить блокировку VK-аккаунта и честно оценить её вероятность. Используйте режим на свой риск; если важен основной аккаунт, выбирайте второстепенный. Рекомендуется включать «Авто ВК», когда «Авто» и «Авто API» не работают.",
+            ),
         requireAcknowledgement = requireAcknowledgement,
         onAcknowledge = onAcknowledge,
         onDoNotRemind = onDoNotRemind,
@@ -54,10 +61,11 @@ internal fun TcpTransportRiskDialog(
 ) {
     TimedWarningDialog(
         title = "Внимание!",
-        paragraphs = listOf(
-            "TCP — экспериментальный режим для сетей, в которых провайдер ограничивает UDP-трафик. TCP используется только между вашим устройством и серверами VK TURN; между VK TURN и вашим VPS трафик всегда идёт по UDP.",
-            "Если UDP работает без ограничений, используйте его: UDP стабильнее, быстрее и по своей природе ближе к настоящим звонкам.",
-        ),
+        paragraphs =
+            listOf(
+                "TCP — экспериментальный режим для сетей, в которых провайдер ограничивает UDP-трафик. TCP используется только между вашим устройством и серверами VK TURN; между VK TURN и вашим VPS трафик всегда идёт по UDP.",
+                "Если UDP работает без ограничений, используйте его: UDP стабильнее, быстрее и по своей природе ближе к настоящим звонкам.",
+            ),
         requireAcknowledgement = true,
         onAcknowledge = onAcknowledge,
         onDoNotRemind = onDoNotRemind,
@@ -72,9 +80,10 @@ private fun TimedWarningDialog(
     onAcknowledge: () -> Unit,
     onDoNotRemind: (() -> Unit)?,
 ) {
-    var secondsLeft by rememberSaveable(requireAcknowledgement) {
-        mutableIntStateOf(if (requireAcknowledgement) 8 else 0)
-    }
+    var secondsLeft by
+        rememberSaveable(requireAcknowledgement) {
+            mutableIntStateOf(if (requireAcknowledgement) 8 else 0)
+        }
     if (requireAcknowledgement) {
         LaunchedEffect(Unit) {
             while (secondsLeft > 0) {
@@ -85,65 +94,76 @@ private fun TimedWarningDialog(
     }
     val actionsEnabled = secondsLeft == 0
 
-    AlertDialog(
+    Dialog(
         onDismissRequest = {},
-        properties = DialogProperties(
-            dismissOnBackPress = false,
-            dismissOnClickOutside = false,
-        ),
-        title = {
-            Text(
-                text = title,
-                style = MaterialTheme.typography.titleLarge,
-                fontWeight = FontWeight.Bold,
-            )
-        },
-        text = {
+        properties =
+            DialogProperties(
+                usePlatformDefaultWidth = false,
+                dismissOnBackPress = false,
+                dismissOnClickOutside = false,
+            ),
+    ) {
+        AppDialogSurface(modifier = Modifier.fillMaxWidth(0.9f)) {
             Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .verticalScroll(rememberScrollState()),
-                verticalArrangement = Arrangement.spacedBy(10.dp),
+                modifier = Modifier.padding(20.dp).fadingVerticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(16.dp),
             ) {
-                paragraphs.forEach { paragraph ->
-                    Text(
-                        text = paragraph,
-                        style = MaterialTheme.typography.bodyMedium.copy(hyphens = Hyphens.Auto),
-                        color = MaterialTheme.colorScheme.onSurface,
-                        textAlign = TextAlign.Start,
-                        modifier = Modifier.fillMaxWidth(),
-                    )
+                AppDialogHeader(
+                    title = title,
+                    icon = {
+                        Icon(
+                            Icons.Outlined.WarningAmber,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.tertiary,
+                            modifier = Modifier.size(20.dp),
+                        )
+                    },
+                )
+
+                Column(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    paragraphs.forEach { paragraph ->
+                        Text(
+                            text = paragraph,
+                            style =
+                                MaterialTheme.typography.bodyMedium.copy(hyphens = Hyphens.Auto),
+                            color = MaterialTheme.colorScheme.onSurface,
+                            textAlign = TextAlign.Start,
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    }
                 }
-            }
-        },
-        confirmButton = {
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                if (onDoNotRemind != null) {
-                    OutlinedButton(
-                        onClick = onDoNotRemind,
+
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    if (onDoNotRemind != null) {
+                        OutlinedButton(
+                            onClick = onDoNotRemind,
+                            enabled = actionsEnabled,
+                            modifier = Modifier.fillMaxWidth().height(48.dp),
+                        ) {
+                            Text("Не напоминать")
+                        }
+                    }
+                    Button(
+                        onClick = onAcknowledge,
                         enabled = actionsEnabled,
                         modifier = Modifier.fillMaxWidth().height(48.dp),
                     ) {
-                        Text("Не напоминать")
+                        Text("Понятно")
+                    }
+                    if (!actionsEnabled) {
+                        Text(
+                            text = secondsLeft.toString(),
+                            style = MaterialTheme.typography.labelLarge,
+                            fontWeight = FontWeight.Bold,
+                            textAlign = TextAlign.Center,
+                            modifier = Modifier.fillMaxWidth().padding(top = 2.dp),
+                        )
                     }
                 }
-                Button(
-                    onClick = onAcknowledge,
-                    enabled = actionsEnabled,
-                    modifier = Modifier.fillMaxWidth().height(48.dp),
-                ) {
-                    Text("Понятно")
-                }
-                if (!actionsEnabled) {
-                    Text(
-                        text = secondsLeft.toString(),
-                        style = MaterialTheme.typography.labelLarge,
-                        fontWeight = FontWeight.Bold,
-                        textAlign = TextAlign.Center,
-                        modifier = Modifier.fillMaxWidth().padding(top = 2.dp),
-                    )
-                }
             }
-        },
-    )
+        }
+    }
 }
